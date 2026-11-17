@@ -1,7 +1,8 @@
 name: ci
 
-# Small extra gate on pushes to main and on pull requests. The full set of gates is scripts/ci-local.sh,
-# run on Linux.
+# The gate of scripts/ci-local.sh, on every push to main and every pull request.
+# The kernel verifier tests need root and are not run here: ebpf-vm.yml loads the
+# objects into real kernels.
 
 on:
   push:
@@ -17,9 +18,9 @@ permissions:
   contents: read
 
 jobs:
-  go:
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -27,5 +28,14 @@ jobs:
           go-version: '1.26'
           cache: true
           cache-dependency-path: go.sum
-      - run: go vet ./...
-      - run: go test ./...
+      - name: Install gitleaks 8.30.1 and golangci-lint 2.13.1
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
+          curl -fsSL -o /tmp/golangci-lint.tgz https://github.com/golangci/golangci-lint/releases/download/v2.13.1/golangci-lint-2.13.1-linux-amd64.tar.gz
+          echo "b17bfbc9d4aaa48be7f4f1ce3240bc3d8200c870c072bacf15c26219e2cfb9cc  /tmp/golangci-lint.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/golangci-lint.tgz -C /usr/local/bin --strip-components=1 golangci-lint-2.13.1-linux-amd64/golangci-lint
+      # scripts/build-ebpf.sh builds with the clang of the runner when the libbpf headers are there.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm libbpf-dev
+      - run: scripts/ci-local.sh
