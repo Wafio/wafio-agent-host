@@ -132,7 +132,7 @@ type TraceManager struct {
 	// BPF-LSM proactive blocking
 	lsmColl       *ebpf.Collection
 	lsmLink       link.Link
-	lsmExtraLinks []link.Link // file_open / socket_connect hook links
+	lsmExtraLinks []link.Link // socket_connect / socket_sendmsg hook links
 	lsmConfigMap  *ebpf.Map
 	lsmBlockMap   *ebpf.Map
 	lsmIPBlockMap *ebpf.Map
@@ -143,7 +143,6 @@ type TraceManager struct {
 	lsmReader        *ringbuf.Reader
 	lsmActive        bool
 	lsmState         string // LSMState* value reported in the trace status
-	lsmFileOpen      string // LSMFileOpen* variant of the loaded file_open program
 
 	// events: the newest-5000 query ring, per-category rings (1000 each, so
 	// low-frequency categories are not drowned out by file/openat) and the
@@ -519,7 +518,6 @@ func (tm *TraceManager) Stop() error {
 	}
 	tm.lsmActive = false
 	tm.lsmState = ""
-	tm.lsmFileOpen = ""
 
 	if tm.coll != nil {
 		tm.coll.Close()
@@ -556,36 +554,15 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 		return fmt.Errorf("load LSM spec from %s: %w", lsmPath, err)
 	}
 
-	// socket_sendmsg is optional: a kernel that rejects it
-	// keeps exec/file/connect blocking. file_open comes in two variants
-	// (full path via bpf_d_path, or basename when the kernel refuses that
-	// helper for the hook, e.g. 5.10): exactly one is loaded.
-	coll, dropped, fileOpen, err := createLSMCollection(spec.Programs,
-		func() (*ebpf.Collection, error) { return ebpf.NewCollection(spec) },
-		func(c *ebpf.Collection) { c.Close() })
+	// socket_sendmsg is optional: a kernel that rejects it keeps exec and
+	// connect blocking.
+	coll, dropped, err := createDroppingOptional(spec.Programs, []string{lsmProgSendmsg},
+		func() (*ebpf.Collection, error) { return ebpf.NewCollection(spec) })
 	if err != nil {
 		return fmt.Errorf("create LSM collection: %w", err)
 	}
-	for name, why := range dropped {
-		switch name {
-		case lsmProgSendmsg:
-			tm.log.Printf("LSM program %s not loaded (%v) — addressed sends to blocklisted IPs enforced from userspace", name, why)
-		default:
-			tm.log.Printf("LSM program %s not loaded (%v)", name, why)
-		}
-	}
-	if fileOpen == LSMFileOpenDPath {
-		// Only the full variant's report depends on the kernel BTF.
-		fileOpen = reportedFileOpenVariant(fileOpen, kernelHasDPath())
-	}
-	tm.lsmFileOpen = fileOpen
-	switch fileOpen {
-	case LSMFileOpenBasename:
-		tm.log.Printf("LSM file_open: no usable bpf_d_path for this hook — file names only, absolute-path blocklist entries never match")
-	case LSMFileOpenDPath:
-		tm.log.Printf("LSM file_open: full path matching (%s)", lsmProgFileOpen)
-	default:
-		tm.log.Printf("LSM file_open: no program loaded — file blocking unavailable")
+	if why, ok := dropped[lsmProgSendmsg]; ok {
+		tm.log.Printf("LSM program %s not loaded (%v) — addressed sends to blocklisted IPs enforced from userspace", lsmProgSendmsg, why)
 	}
 	tm.lsmColl = coll
 	tm.lsmConfigMap = coll.Maps[lsmMapConfig]
@@ -595,9 +572,8 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 	tm.lsmSuppressedMap = coll.Maps["wafio_lsm_reports_suppressed"]
 
 	// Attach every LSM program present in the object; the bprm hook is the
-	// historical minimum, file_open and socket_connect are newer,
-	// socket_sendmsg newer still.
-	progNames := []string{"wafio_bprm_check_security", lsmProgFileOpen, lsmProgFileOpenBasename, "wafio_socket_connect", lsmProgSendmsg}
+	// historical minimum, socket_connect is newer, socket_sendmsg newer still.
+	progNames := []string{"wafio_bprm_check_security", "wafio_socket_connect", lsmProgSendmsg}
 	var attached []string
 	for _, name := range progNames {
 		prog := coll.Programs[name]
@@ -606,7 +582,7 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 		}
 		lsmLink, err := link.AttachLSM(link.LSMOptions{Program: prog})
 		if err != nil {
-			// file_open/socket_connect need kernel ≥ 5.7 hook support —
+			// socket_connect needs kernel ≥ 5.7 hook support —
 			// non-fatal when the kernel lacks the hook.
 			tm.log.Printf("LSM attach %s skipped: %v", name, err)
 			continue
@@ -620,13 +596,9 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 	}
 	if tm.lsmLink == nil {
 		coll.Close()
-		tm.lsmFileOpen = ""
 		return fmt.Errorf("no LSM program could be attached")
 	}
 	tm.log.Printf("BPF-LSM hooks attached: %v", attached)
-	if !slices.Contains(attached, lsmProgFileOpen) && !slices.Contains(attached, lsmProgFileOpenBasename) {
-		tm.lsmFileOpen = LSMFileOpenNone
-	}
 
 	// Set initial LSM config. Without it lsm_gate() allows everything, so a
 	// failed write must keep dest-IP policies out of the connect blocklist.
@@ -636,7 +608,6 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 		cfg := LSMConfig{
 			Enabled:      1,
 			BlockExec:    1,
-			BlockFile:    boolToU32(tm.cfg.LSMBlockFile),
 			BlockConnect: boolToU32(tm.cfg.LSMBlockConnect),
 			AgentPID:     agentPID(),
 		}
@@ -722,14 +693,11 @@ func (tm *TraceManager) lsmRingbufLoop(ctx context.Context, reader *ringbuf.Read
 		pathStr := strings.TrimRight(string(evt.Path[:]), "\x00")
 		commStr := strings.TrimRight(string(evt.Comm[:]), "\x00")
 
-		// Hook-specific presentation: exec/file carry a path, connect an IP.
+		// Hook-specific presentation: exec carries a path, connect and send an IP.
 		eventType, eventName, category := TraceExecve, "execve", "process"
 		subject := pathStr
 		description := "blocked unauthorized execution"
 		switch evt.Hook {
-		case LSMHookFileOpen:
-			eventType, eventName, category = TraceOpen, "file_open", "file"
-			description = "BPF-LSM blocked file open"
 		case LSMHookConnect:
 			eventType, eventName, category = TraceConnect, "socket_connect", "network"
 			subject = net.IP(evt.Addr[:4]).String()
@@ -1141,7 +1109,6 @@ func (tm *TraceManager) Status() TraceStatus {
 		LSMReportsSuppressed:   sumPerCPU(tm.lsmSuppressedMap, 0),
 		LSMActive:              tm.lsmActive,
 		LSMState:               tm.lsmState,
-		LSMFileOpen:            tm.lsmFileOpen,
 		KprobeProbes:           slices.Clone(tm.kprobeNames),
 		OpenResult:             tm.openResultArmed,
 	}

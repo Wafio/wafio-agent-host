@@ -5,7 +5,6 @@ package ebpf
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	cebpf "github.com/cilium/ebpf"
@@ -60,26 +59,7 @@ func TestBPFObjectsPassVerifier(t *testing.T) {
 					Programs: cebpf.ProgramOptions{LogSizeStart: 1 << 20},
 				})
 			}
-			var coll *cebpf.Collection
-			if obj.name == "wafio_lsm.o" {
-				// Same selection the tracer makes: on a kernel that refuses
-				// bpf_d_path in file_open (5.10) the basename variant loads.
-				// The basename-only copy is taken first (the selection edits
-				// spec.Programs), so both variants are verifier-checked on
-				// every kernel.
-				basenameOnly := spec.Copy()
-				_, hadFileOpen := spec.Programs[lsmProgFileOpen]
-				var variant string
-				var dropped map[string]error
-				coll, dropped, variant, err = createLSMCollection(spec.Programs, create, func(c *cebpf.Collection) { c.Close() })
-				if err == nil {
-					t.Logf("wafio_lsm.o: file_open variant %s, dropped %v", variant, dropped)
-					requireLSMSelection(t, variant, dropped, hadFileOpen)
-					requireLSMBasenameOnly(t, basenameOnly)
-				}
-			} else {
-				coll, err = create()
-			}
+			coll, err := create()
 			if err != nil {
 				// %+v includes the full verifier log of a rejected program.
 				if obj.optional {
@@ -95,54 +75,5 @@ func TestBPFObjectsPassVerifier(t *testing.T) {
 				t.Logf("%s: %s verified", obj.name, name)
 			}
 		})
-	}
-}
-
-// requireLSMSelection fails unless wafio_lsm.o loaded the way the tracer
-// relies on: a file_open variant is present, and the only program that may
-// have been dropped is the full-path wafio_file_open, refused by the verifier
-// with "helper call is not allowed in probe" (kernel 5.10). A rejected
-// socket_sendmsg or basename program, or a full variant refused for another
-// reason, is a failure on every kernel.
-func requireLSMSelection(t *testing.T, variant string, dropped map[string]error, hadFileOpen bool) {
-	t.Helper()
-	if hadFileOpen && variant == LSMFileOpenNone {
-		t.Errorf("no file_open variant loaded (dropped %v)", dropped)
-	}
-	for name, why := range dropped {
-		switch {
-		case name != lsmProgFileOpen:
-			t.Errorf("program %s dropped by the loader: %+v", name, why)
-		case !strings.Contains(why.Error(), "helper call is not allowed in probe"):
-			t.Errorf("%s dropped for a reason other than the bpf_d_path refusal: %+v", name, why)
-		}
-	}
-}
-
-// requireLSMBasenameOnly loads a copy of the object holding only the basename
-// file_open variant and requires it to pass the verifier with every other
-// program, so the fallback is checked on kernels that accept the full variant
-// too.
-func requireLSMBasenameOnly(t *testing.T, spec *cebpf.CollectionSpec) {
-	t.Helper()
-	if _, ok := spec.Programs[lsmProgFileOpenBasename]; !ok {
-		t.Errorf("wafio_lsm.o has no %s", lsmProgFileOpenBasename)
-		return
-	}
-	delete(spec.Programs, lsmProgFileOpen)
-	coll, dropped, variant, err := createLSMCollection(spec.Programs,
-		func() (*cebpf.Collection, error) {
-			return cebpf.NewCollectionWithOptions(spec, cebpf.CollectionOptions{
-				Programs: cebpf.ProgramOptions{LogSizeStart: 1 << 20},
-			})
-		},
-		func(c *cebpf.Collection) { c.Close() })
-	if err != nil {
-		t.Errorf("basename-only object rejected: %+v", err)
-		return
-	}
-	defer coll.Close()
-	if variant != LSMFileOpenBasename || len(dropped) != 0 || coll.Programs[lsmProgFileOpenBasename] == nil {
-		t.Errorf("basename-only object: variant %q, dropped %v, basename loaded %v", variant, dropped, coll.Programs[lsmProgFileOpenBasename] != nil)
 	}
 }

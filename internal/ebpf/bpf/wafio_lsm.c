@@ -3,11 +3,6 @@
 //
 // Hooks:
 //   - lsm/bprm_check_security: block unauthorized binary executions (-EPERM)
-//   - lsm/file_open:           block opens of blocklisted paths (-EACCES);
-//                              wafio_file_open resolves full paths with
-//                              bpf_d_path, wafio_file_open_basename (loaded
-//                              only when the kernel refuses that helper here,
-//                              e.g. 5.10) matches the file name alone
 //   - lsm/socket_connect:      block outbound connects to blocklisted IPv4
 //                              addresses (-EPERM), including an AF_INET6
 //                              connect to the IPv4-mapped form
@@ -18,10 +13,7 @@
 //
 // Synchronous in-kernel denial: the harmful operation never takes
 // effect, unlike the async userspace kill path. Requires kernel >= 5.7 with
-// BPF-LSM enabled; bpf_d_path (full file paths) is usable in LSM hooks only
-// from kernel 5.11 (5.10 has the helper but refuses it here): 5.8/5.9 (no
-// helper) take the basename branch of wafio_file_open, 5.10 (helper refused
-// here) loads wafio_file_open_basename.
+// BPF-LSM enabled.
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -40,7 +32,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define TRACE_ACTION_BLOCK    4
 
 #define LSM_HOOK_EXEC   0
-#define LSM_HOOK_FOPEN  1
 #define LSM_HOOK_CONNECT 2
 #define LSM_HOOK_SENDMSG 3
 
@@ -50,9 +41,8 @@ char LICENSE[] SEC("license") = "GPL";
 /* SIN6_LEN_RFC2133: the shortest sockaddr_in6 inet6 connect accepts. */
 #define LSM_SIN6_LEN_RFC2133 24
 #define EPERM 1
-#define EACCES 13
 
-/* LSM blocklist rule (path or IP keyed) */
+/* LSM blocklist rule (executable path or IP keyed) */
 struct lsm_rule {
     __u32 action;       /* TRACE_ACTION_* */
     __u32 policy_id;
@@ -69,7 +59,6 @@ struct lsm_rule {
 struct lsm_config {
     __u32 enabled;        /* 1 = LSM enabled */
     __u32 block_exec;     /* 1 = -EPERM on exec match, 0 = alert only */
-    __u32 block_file;     /* 1 = -EACCES on file_open match, 0 = alert only */
     __u32 block_connect;  /* 1 = -EPERM on socket_connect match, 0 = alert only */
     __u32 agent_pid;      /* never block Wafio control plane or agent */
     __u32 pad;
@@ -87,7 +76,7 @@ struct wafio_lsm_event {
     __s32 ret_code;
     __u32 hook;           /* LSM_HOOK_* */
     char  comm[TRACE_COMM_LEN];
-    char  path[LSM_PATH_LEN];   /* exec/file path; empty for connect */
+    char  path[LSM_PATH_LEN];   /* exec path; empty for connect */
     __u8  addr[16];             /* connect destination (IPv4 in [0..3]) */
     __u16 port;                 /* connect destination port (host order) */
     __u16 family;               /* connect: socket address family; 0 otherwise */
@@ -102,7 +91,7 @@ struct {
     __uint(max_entries, 1);
 } wafio_lsm_config SEC(".maps");
 
-/* Blocklist map: executable/file path (e.g. "/bin/nc", "/etc/shadow") -> rule */
+/* Blocklist map: executable path (e.g. "/bin/nc") -> rule */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, char[LSM_PATH_LEN]);
@@ -138,7 +127,7 @@ struct {
 
 /* Network deny reports (connect, sendmsg) are rate-limited per CPU: a
  * process looping sendto() at a blocklisted IP must not flood the ring and
- * crowd out exec/file reports. The denial itself and the
+ * crowd out exec reports. The denial itself and the
  * rule's hit_count are never limited. LSM_NET_REPORTS_PER_SEC reports per
  * CPU per second pass; the rest are counted in wafio_lsm_reports_suppressed
  * (per CPU, read by the agent). Per-CPU values need no atomics; a program
@@ -224,9 +213,6 @@ lsm_report(struct lsm_config *cfg, struct lsm_rule *rule, __u32 hook,
         evt->policy_id = rule->policy_id;
         evt->hook = hook;
         switch (hook) {
-        case LSM_HOOK_FOPEN:
-            evt->ret_code = cfg->block_file ? -EACCES : 0;
-            break;
         case LSM_HOOK_CONNECT:
         case LSM_HOOK_SENDMSG:
             evt->ret_code = cfg->block_connect ? -EPERM : 0;
@@ -251,7 +237,6 @@ lsm_report(struct lsm_config *cfg, struct lsm_rule *rule, __u32 hook,
  * producing an R0 exit the verifier cannot prove lies in [-4095, 0]). Each
  * subprogram returns a constant, verified independently. */
 static __noinline int deny_perm(void)   { return -EPERM; }
-static __noinline int deny_eacces(void) { return -EACCES; }
 static __noinline int lsm_allow(void)   { return 0; }
 
 SEC("lsm/bprm_check_security")
@@ -288,66 +273,6 @@ int BPF_PROG(wafio_bprm_check_security, struct linux_binprm *bprm, int ret)
     if (cfg->block_exec && action == TRACE_ACTION_BLOCK)
         return deny_perm();
     return lsm_allow();
-}
-
-/* file_open body shared by both variants. `full` is a literal at every call
- * site and the function is always inlined, so the variant that passes 0 carries
- * no bpf_d_path call at all: kernel 5.10 rejects that helper for this hook
- * ("helper call is not allowed in probe") and would take the whole object
- * with it. */
-static __always_inline int file_open_check(struct file *file, int ret, int full)
-{
-    if (ret != 0) {
-        if (ret < -4095 || ret > 0)
-            return 0;
-        return ret;
-    }
-
-    struct lsm_config *cfg = lsm_gate();
-    if (!cfg)
-        return 0;
-
-    char path[LSM_PATH_LEN] = {};
-    if (full && bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_d_path)) {
-        /* Full path resolution (kernel where the helper is allowed for this
-         * hook; resolved at load time). */
-        bpf_d_path(&file->f_path, path, sizeof(path));
-    } else {
-        /* Basename only: kernel 5.7-5.9 (no helper), or the
-         * wafio_file_open_basename variant the loader picks when the kernel
-         * refuses bpf_d_path here (5.10). */
-        struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
-        const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
-        if (name)
-            bpf_core_read_str(path, sizeof(path), name);
-    }
-    if (path[0] == 0)
-        return 0;
-
-    struct lsm_rule *rule = bpf_map_lookup_elem(&wafio_lsm_blocklist, path);
-    if (!rule || !rule->enabled)
-        return 0;
-
-    __u32 action = lsm_report(cfg, rule, LSM_HOOK_FOPEN, path, 0, 0, 0);
-
-    if (cfg->block_file && action == TRACE_ACTION_BLOCK)
-        return deny_eacces();
-    return lsm_allow();
-}
-
-SEC("lsm/file_open")
-int BPF_PROG(wafio_file_open, struct file *file, int ret)
-{
-    return file_open_check(file, ret, 1);
-}
-
-/* Fallback variant, attached instead of wafio_file_open when the kernel's
- * verifier refuses bpf_d_path in the file_open hook. Never attached together
- * with it. */
-SEC("lsm/file_open")
-int BPF_PROG(wafio_file_open_basename, struct file *file, int ret)
-{
-    return file_open_check(file, ret, 0);
 }
 
 /* The IPv4 peer a connect reaches. An AF_INET destination, or an

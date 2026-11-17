@@ -21,8 +21,8 @@ func TestLSMStructSizes(t *testing.T) {
 	if sz := unsafe.Sizeof(LSMRule{}); sz != 24 {
 		t.Errorf("LSMRule size = %d; want 24", sz)
 	}
-	if sz := unsafe.Sizeof(LSMConfig{}); sz != 24 {
-		t.Errorf("LSMConfig size = %d; want 24", sz)
+	if sz := unsafe.Sizeof(LSMConfig{}); sz != 20 {
+		t.Errorf("LSMConfig size = %d; want 20", sz)
 	}
 	if sz := unsafe.Sizeof(WafioLSMEvent{}); sz != 344 {
 		t.Errorf("WafioLSMEvent size = %d; want 344", sz)

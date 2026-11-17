@@ -29,8 +29,7 @@ type HostConfig struct {
 	// eBPF runtime security tracing (Linux only)
 	TraceEnabled    bool
 	TraceObjectPath string
-	LSMEnabled      bool // proactive BPF-LSM blocking (exec/file/connect)
-	LSMBlockFile    bool // LSM: deny file_open on blocklisted paths
+	LSMEnabled      bool // proactive BPF-LSM blocking (exec/connect)
 	LSMBlockConnect bool // LSM: deny socket_connect to blocklisted IPs
 	// Protected processes: never targeted by Kill enforcement. Added
 	// to the built-in list unless ProtectedReplaceDefaults; see
@@ -172,7 +171,6 @@ func RunHost(ctx context.Context, cfg HostConfig) error {
 		tmgr := wafebpf.NewTraceManager(wafebpf.TraceManagerConfig{
 			ObjectPath:      cfg.TraceObjectPath,
 			LSMEnabled:      cfg.LSMEnabled,
-			LSMBlockFile:    cfg.LSMBlockFile,
 			LSMBlockConnect: cfg.LSMBlockConnect,
 
 			ProtectedProcessNames:    cfg.ProtectedProcessNames,

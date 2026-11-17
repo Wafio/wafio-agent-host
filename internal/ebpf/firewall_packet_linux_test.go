@@ -41,21 +41,7 @@ func packetObjectCollection(t *testing.T, object string) *cebpf.Collection {
 			m.MaxEntries = 4096
 		}
 	}
-	var coll *cebpf.Collection
-	if object == "wafio_lsm.o" {
-		// The tracer's own selection: kernel 5.10 loads the basename file_open.
-		_, hadFileOpen := spec.Programs[lsmProgFileOpen]
-		var dropped map[string]error
-		var variant string
-		coll, dropped, variant, err = createLSMCollection(spec.Programs,
-			func() (*cebpf.Collection, error) { return cebpf.NewCollection(spec) },
-			func(c *cebpf.Collection) { c.Close() })
-		if err == nil {
-			requireLSMSelection(t, variant, dropped, hadFileOpen)
-		}
-	} else {
-		coll, err = cebpf.NewCollection(spec)
-	}
+	coll, err := cebpf.NewCollection(spec)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}

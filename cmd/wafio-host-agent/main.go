@@ -64,7 +64,6 @@ func init() {
 	rootCmd.Flags().BoolVar(&cfg.TraceEnabled, "trace", false, "enable eBPF runtime security tracing")
 	rootCmd.Flags().StringVar(&cfg.TraceObjectPath, "trace-obj", "internal/ebpf/bpf/wafio_trace.o", "path to compiled trace BPF object")
 	rootCmd.Flags().BoolVar(&cfg.LSMEnabled, "lsm", true, "enable BPF-LSM proactive blocking (requires kernel BPF-LSM hooks)")
-	rootCmd.Flags().BoolVar(&cfg.LSMBlockFile, "lsm-block-file", false, "LSM: deny file_open on blocklisted paths (-EACCES)")
 	rootCmd.Flags().BoolVar(&cfg.LSMBlockConnect, "lsm-block-connect", false, "LSM: deny socket_connect, and addressed sends (sendto, MSG_FASTOPEN), to blocklisted IPs (-EPERM)")
 
 	// Protected processes: never killed by runtime-security Kill enforcement.

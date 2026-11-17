@@ -17,7 +17,6 @@ type TraceManagerConfig struct {
 	ObjectPath      string // path to compiled wafio_trace.o
 	LSMObjectPath   string // path to compiled wafio_lsm.o (optional; auto-detected if empty)
 	LSMEnabled      bool   // enable proactive BPF-LSM blocking if supported by kernel
-	LSMBlockFile    bool   // LSM: -EACCES on blocklisted file_open (kernel ≥ 5.7 hook)
 	LSMBlockConnect bool   // LSM: -EPERM on blocklisted socket_connect (kernel ≥ 5.7 hook)
 
 	// Protected processes are never killed by enforcement. Names are added to
@@ -53,11 +52,10 @@ type LSMRule struct {
 // addressed sends to the IP too.
 const LSMRuleSend uint32 = 1 << 0
 
-// LSMConfig mirrors struct lsm_config in wafio_lsm.c (24 bytes).
+// LSMConfig mirrors struct lsm_config in wafio_lsm.c (20 bytes).
 type LSMConfig struct {
 	Enabled      uint32
 	BlockExec    uint32
-	BlockFile    uint32 // -EACCES on blocklisted file_open matches
 	BlockConnect uint32 // -EPERM on blocklisted socket_connect matches
 	AgentPID     uint32
 	Pad          uint32
@@ -65,10 +63,9 @@ type LSMConfig struct {
 
 // LSM hook IDs (must match LSM_HOOK_* in wafio_lsm.c).
 const (
-	LSMHookExec     uint32 = 0
-	LSMHookFileOpen uint32 = 1
-	LSMHookConnect  uint32 = 2
-	LSMHookSendmsg  uint32 = 3
+	LSMHookExec    uint32 = 0
+	LSMHookConnect uint32 = 2
+	LSMHookSendmsg uint32 = 3
 )
 
 // WafioLSMEvent mirrors struct wafio_lsm_event in wafio_lsm.c (344 bytes).
@@ -762,12 +759,6 @@ type TraceStatus struct {
 	// ("active", "unverified" when the kernel's list could not be read).
 	LSMActive bool   `json:"lsm_active"`
 	LSMState  string `json:"lsm_state,omitempty"`
-	// LSMFileOpen: how the BPF-LSM file_open hook matches paths: "dpath"
-	// (full path; only when the kernel BTF has BPF_FUNC_d_path and the
-	// verifier accepted it), "basename" (dentry name only; kernels 5.8-5.9
-	// lack the helper, 5.10 refuses it for the hook; absolute-path blocklist
-	// entries do not match) or "none"; empty when the LSM is not loaded.
-	LSMFileOpen string `json:"lsm_file_open,omitempty"`
 	// OpenResult: file open events leave the kernel with the result of the
 	// open (the exit probes of openat, openat2, open and creat are attached
 	// and armed), so a failed open reads as failure and a successful one as
@@ -789,7 +780,7 @@ type TraceStatus struct {
 // ActionPriority returns the ordering used to pick the "best" matching policy
 // action when multiple policies fire on the same event: kill trumps block
 // trumps alert trumps simulate trumps monitor. Block acts only through the
-// BPF-LSM hooks before the event (exec, file_open, connect blocklists); from a
+// BPF-LSM hooks before the event (exec and connect blocklists); from a
 // traced event neither trace_enforce_map nor userspace can block, so a Block
 // match must never suppress a Kill that can still act (it used to rank first).
 // The raw uint32 constants cannot be used directly because ActionSimulate=3
