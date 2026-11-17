@@ -11,6 +11,16 @@ import (
 	"time"
 )
 
+// EnrichByShortID returns ContainerInfo by short container ID (12 hex chars).
+func (e *ContainerEnricher) EnrichByShortID(id string) *ContainerInfo {
+	if len(id) < 12 {
+		return nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.byShortID[id[:12]]
+}
+
 // fakeDockerRuntime serves the subset of the Docker HTTP API the enricher
 // consumes: a streaming /events NDJSON feed and /containers/{id}/json.
 func fakeDockerRuntime(t *testing.T, events <-chan string) (*ContainerEnricher, *map[string]bool) {

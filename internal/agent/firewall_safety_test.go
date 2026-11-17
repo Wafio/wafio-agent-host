@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	wafebpf "github.com/wafio/wafio-agent-host/internal/ebpf"
+	"github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 )
 
 func tracked() *wafebpf.FullConfigAPI {
@@ -38,7 +39,7 @@ func TestHostSnapshotEgressDenyNeedsExemptingDataplane(t *testing.T) {
 		}
 	}
 	warnings, _ := validateEBPFStateWith(egressDeny, firewallEnv{exemptions: true, controlPlanePort: 9443})
-	if len(warnings) != 1 || warnings[0].Code != wafebpf.WarnEgressControlPlaneRuleMissing || !strings.Contains(warnings[0].Message, "9443/tcp") {
+	if len(warnings) != 1 || warnings[0].Code != hostpolicy.WarnEgressControlPlaneRuleMissing || !strings.Contains(warnings[0].Message, "9443/tcp") {
 		t.Fatalf("egress deny without the control-plane rule must warn with the configured port: %+v", warnings)
 	}
 	// Ingress Deny All alone never depended on the new objects.
@@ -58,7 +59,7 @@ func TestHostSnapshotSSHGuardUsesDetectedPort(t *testing.T) {
 		PortPolicyConfig: &wafebpf.PortPolicyConfigAPI{Enabled: true, DefaultIngress: "deny", DefaultEgress: "allow"},
 		PortPolicies:     []wafebpf.PortPolicyAPI{{Port: 22, Proto: "tcp", Direction: "ingress", Action: "allow"}},
 	}
-	if _, err := validateEBPFStateWith(state, firewallEnv{sshPorts: []uint16{2222}, exemptions: true}); !errors.Is(err, wafebpf.ErrIngressDenyNeedsAllow) {
+	if _, err := validateEBPFStateWith(state, firewallEnv{sshPorts: []uint16{2222}, exemptions: true}); !errors.Is(err, hostpolicy.ErrIngressDenyNeedsAllow) {
 		t.Fatalf("22 accepted while sshd listens on 2222: %v", err)
 	}
 	if _, err := validateEBPFStateWith(state, firewallEnv{sshPorts: []uint16{22, 2222}, exemptions: true}); err != nil {
@@ -86,7 +87,7 @@ func TestHostSnapshotNormalisesPortScanThreshold(t *testing.T) {
 // "Allow" used to reach the map as DROP.
 func TestHostSnapshotRejectsUnknownPortAction(t *testing.T) {
 	state := &ebpfDesiredState{PortPolicies: []wafebpf.PortPolicyAPI{{Port: 22, Proto: "tcp", Direction: "ingress", Action: "Allow"}}}
-	if err := validateEBPFState(state); !errors.Is(err, wafebpf.ErrInvalidPortPolicy) {
+	if err := validateEBPFState(state); !errors.Is(err, hostpolicy.ErrInvalidPortPolicy) {
 		t.Fatalf("unknown action accepted: %v", err)
 	}
 }

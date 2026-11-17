@@ -162,3 +162,13 @@ int main(void) {
 		t.Fatalf("C layout\n%s\nwant\n%s", got, want)
 	}
 }
+
+func TestWildcardPreservesAddressFamily(t *testing.T) {
+	v4, v6 := IPKeyWildcard("0.0.0.0/0"), IPKeyWildcard("::/0")
+	if v4 == v6 {
+		t.Fatal("IPv4 wildcard also matches IPv6")
+	}
+	if !v4.IsWildcard() || !v6.IsWildcard() {
+		t.Fatal("wildcard unrecognized")
+	}
+}

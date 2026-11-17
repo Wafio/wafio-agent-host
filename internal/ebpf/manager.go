@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1600,7 +1599,7 @@ func (m *Manager) LoadGeoIPEntry(ip net.IP, countryCode string) error {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  Geo CIDR LPM trie methods
+//  Geo CIDR LPM trie keys
 // ────────────────────────────────────────────────────────────────────────────
 
 // geoCIDRv4Key mirrors struct geo_cidr_v4_key in wafio_xdp.c.
@@ -1614,40 +1613,6 @@ type geoCIDRv4Key struct {
 type geoCIDRv6Key struct {
 	Prefixlen uint32
 	Addr      [16]byte
-}
-
-// LoadGeoCIDR inserts a CIDR network into the geo-block LPM trie.
-// network must be either an IPv4 or IPv6 CIDR.
-func (m *Manager) LoadGeoCIDR(network *net.IPNet) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	ones, _ := network.Mask.Size()
-	blocked := uint8(1)
-
-	if ip4 := network.IP.To4(); ip4 != nil {
-		if m.geoCIDR4Map == nil {
-			return nil // map not available (e.g. mock env)
-		}
-		key := geoCIDRv4Key{Prefixlen: u32FromInt(ones)}
-		copy(key.Addr[:], ip4)
-		return m.geoCIDR4Map.Update(key, &blocked, ebpf.UpdateAny)
-	}
-
-	// IPv6
-	if m.geoCIDR6Map == nil {
-		return nil
-	}
-	key := geoCIDRv6Key{Prefixlen: u32FromInt(ones)}
-	copy(key.Addr[:], network.IP.To16())
-	return m.geoCIDR6Map.Update(key, &blocked, ebpf.UpdateAny)
-}
-
-// ClearGeoCIDRs removes all entries from both geo CIDR LPM trie maps.
-func (m *Manager) ClearGeoCIDRs() error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return errors.Join(clearMap(m.geoCIDR4Map), clearMap(m.geoCIDR6Map))
 }
 
 // AllowlistPortsSupported reports whether the loaded XDP object matches
@@ -1928,43 +1893,6 @@ func (m *Manager) liveGeoMode() string {
 		return GeoModeBlock
 	}
 	return geoModeName(cfg.Mode)
-}
-
-func clearMap(m *ebpf.Map) error {
-	if m == nil {
-		return nil
-	}
-	// Collect keys first, then delete (cannot delete during iteration).
-	var keys [][]byte
-	iter := m.Iterate()
-	for {
-		var k []byte
-		var v []byte
-		if !iter.Next(&k, &v) {
-			break
-		}
-		kCopy := make([]byte, len(k))
-		copy(kCopy, k)
-		keys = append(keys, kCopy)
-	}
-	if err := iter.Err(); err != nil {
-		return err
-	}
-	for _, k := range keys {
-		if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return err
-		}
-	}
-	return nil
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-//  Pinned map paths (for debugging / bpftool inspection)
-// ────────────────────────────────────────────────────────────────────────────
-
-// PinnedMapPath returns the filesystem path of a pinned BPF map.
-func (m *Manager) PinnedMapPath(mapName string) string {
-	return filepath.Join(m.cfg.PinPath, mapName)
 }
 
 // Reclaim a bounded batch of idle entries. A deletion can race a first packet

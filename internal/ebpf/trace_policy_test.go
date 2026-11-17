@@ -12,6 +12,13 @@ import (
 
 func uidPtr(u uint32) *uint32 { return &u }
 
+// EnforcementLogCount is the number of entries in the enforcement log.
+func (pe *PolicyEngine) EnforcementLogCount() int {
+	pe.mu.RLock()
+	defer pe.mu.RUnlock()
+	return len(pe.enforcementLog)
+}
+
 func addPolicy(t *testing.T, pe *PolicyEngine, p EnforcementPolicy) *EnforcementPolicy {
 	t.Helper()
 	out, err := pe.AddPolicy(p)

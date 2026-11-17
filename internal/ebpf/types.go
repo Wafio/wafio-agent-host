@@ -158,15 +158,6 @@ type BlockVal struct {
 	Pad       uint32
 }
 
-// SubnetEntry represents a decoded CIDR rule for API/UI reporting.
-type SubnetEntry struct {
-	CIDR      string     `json:"cidr"`
-	RuleType  string     `json:"rule_type"` // "block" or "allow"
-	AddedAt   time.Time  `json:"added_at"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	HitCount  uint32     `json:"hit_count"`
-}
-
 // ParseCIDR parses an IPv4 or IPv6 CIDR (or bare IP) into SubnetV4Key or SubnetV6Key.
 // If a bare IP is provided (without '/'), it assumes /32 for IPv4 and /128 for IPv6.
 func ParseCIDR(cidrStr string) (isV6 bool, v4Key SubnetV4Key, v6Key SubnetV6Key, err error) {
@@ -202,17 +193,6 @@ func ParseCIDR(cidrStr string) (isV6 bool, v4Key SubnetV4Key, v6Key SubnetV6Key,
 	v6Key.PrefixLen = u32FromInt(ones)
 	copy(v6Key.Addr[:], ipNet.IP.To16())
 	return true, v4Key, v6Key, nil
-}
-
-// RateState mirrors struct rate_state (40 bytes).
-type RateState struct {
-	WindowStartNs uint64
-	PktCount      uint64
-	ByteCount     uint64
-	SynCount      uint32
-	Action        uint32
-	Lock          uint32
-	Pad           uint32
 }
 
 // RateConfig mirrors struct rate_config (40 bytes: 8 + 7×u32 + 4B tail pad
@@ -258,17 +238,6 @@ const (
 	// RST on the inbound connection (the rate-limit exemption).
 	ConnHostAcked uint32 = 1 << 28
 )
-
-// SynState mirrors struct syn_state (48 bytes).
-type SynState struct {
-	WindowStartNs uint64
-	SynCount      uint64
-	SynAckCount   uint64
-	AckCount      uint64
-	DropCount     uint64
-	Lock          uint32
-	Pad           uint32
-}
 
 // PerfEventData mirrors struct perf_event_data (64 bytes, packed).
 type PerfEventData struct {

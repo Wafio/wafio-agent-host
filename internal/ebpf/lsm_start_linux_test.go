@@ -4,12 +4,50 @@ package ebpf
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cilium/ebpf"
 )
+
+// IsLSMActive reports whether proactive BPF-LSM blocking is currently active.
+func (tm *TraceManager) IsLSMActive() bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.lsmActive
+}
+
+// BlockBinaryPath adds an executable path to the BPF-LSM blocklist map.
+func (tm *TraceManager) BlockBinaryPath(path string, policyID uint32) error {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if !tm.lsmActive || tm.lsmBlockMap == nil {
+		return fmt.Errorf("BPF-LSM is not active")
+	}
+
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("binary path cannot be empty")
+	}
+	if len(path) >= 256 {
+		return fmt.Errorf("path exceeds max length of 255 chars: %s", path)
+	}
+
+	var key [256]byte
+	copy(key[:], path)
+
+	rule := LSMRule{
+		Action:   ActionBlock,
+		PolicyID: policyID,
+		Enabled:  1,
+	}
+
+	return tm.lsmBlockMap.Update(key, &rule, ebpf.UpdateAny)
+}
 
 // startLSM must not load or attach anything when the kernel does not list
 // bpf, and must say so in the log and in the trace status. LSMObjectPath names

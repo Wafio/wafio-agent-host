@@ -21,8 +21,8 @@ const (
 	// LSMFileOpenBasename: the kernel has no usable bpf_d_path for this hook
 	// (5.8 and 5.9 lack the helper, 5.10 refuses it in LSM programs);
 	// file_open looks up the dentry name ("shadow"). The blocklist keys are
-	// the exact strings BlockBinaryPath writes, i.e. absolute paths, so such
-	// an entry never matches in this mode: only a bare file-name key would.
+	// absolute paths, so such an entry never matches in this mode: only a
+	// bare file-name key would.
 	LSMFileOpenBasename = "basename"
 	// LSMFileOpenNone: no file_open program is loaded (object without one,
 	// or the variant(s) rejected).

@@ -580,24 +580,6 @@ func (pe *PolicyEngine) RecordKernelEnforcement(evt TraceEvent) {
 	}
 }
 
-// UpdateLastLogFailure marks the most recent log entry (matching policyID and
-// event timestamp) as failed with the given reason. Used by userspace kill
-// path when the SIGKILL could not be delivered (PID vanished, permission
-// error, etc.). This is best-effort: if no matching entry exists we log a
-// new failure-only entry.
-func (pe *PolicyEngine) UpdateLastLogFailure(policyID uint32, reason string) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	// Walk backwards to find the most recent entry for this policy.
-	for i := len(pe.enforcementLog) - 1; i >= 0; i-- {
-		if pe.enforcementLog[i].PolicyID == policyID {
-			pe.enforcementLog[i].Success = false
-			pe.enforcementLog[i].FailureReason = reason
-			return
-		}
-	}
-}
-
 // matchPolicy checks if an event matches a policy's criteria.
 func (pe *PolicyEngine) matchPolicy(p *EnforcementPolicy, evt TraceEvent) bool {
 	// Check event type
@@ -965,12 +947,6 @@ func (pe *PolicyEngine) GetEnforcementLog(limit int) []EnforcementLogEntry {
 		result[i], result[j] = result[j], result[i]
 	}
 	return result
-}
-
-func (pe *PolicyEngine) EnforcementLogCount() int {
-	pe.mu.RLock()
-	defer pe.mu.RUnlock()
-	return len(pe.enforcementLog)
 }
 
 // DrainEnforcementLog returns up to `limit` oldest entries (FIFO) and removes

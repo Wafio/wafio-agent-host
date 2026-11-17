@@ -1,13 +1,13 @@
 package ebpf
 
 // The firewall and trace policy model and its validation live in shared/hostpolicy, so the control
-// plane can import them without this package. The declarations below keep every name used here, by
-// the agent and by the tests compiling as before. shortcut: aliases instead of qualified names; the
-// host agent repo can drop this file with gopls rename once it owns the package.
+// plane can import them without this package. The declarations below keep the names that the code of
+// this repository uses compiling as before; names only tests use are in hostpolicy_alias_test.go.
+// shortcut: aliases instead of qualified names; the host agent repo can drop this file with gopls
+// rename once it owns the package.
 
 import "github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 
-type AllowedCountryEntry = hostpolicy.AllowedCountryEntry
 type AllowlistEntry = hostpolicy.AllowlistEntry
 type AnomalyConfigAPI = hostpolicy.AnomalyConfigAPI
 type BlocklistEntry = hostpolicy.BlocklistEntry
@@ -117,45 +117,23 @@ const traceShedEventName = hostpolicy.TraceShedEventName
 const TraceSocket = hostpolicy.TraceSocket
 const TraceUmount = hostpolicy.TraceUmount
 const TraceUnlink = hostpolicy.TraceUnlink
-const WarnEgressControlPlaneRuleMissing = hostpolicy.WarnEgressControlPlaneRuleMissing
-const WarnEgressDNSRuleMissing = hostpolicy.WarnEgressDNSRuleMissing
-const WarnGeoAllowActive = hostpolicy.WarnGeoAllowActive
-const WarnGeoAllowNoEscape = hostpolicy.WarnGeoAllowNoEscape
-const WarnSSHPortAssumed = hostpolicy.WarnSSHPortAssumed
 
 var BaselineCoverageNotes = hostpolicy.BaselineCoverageNotes
-var ErrAllowlistNestingTooDeep = hostpolicy.ErrAllowlistNestingTooDeep
-var ErrAllowlistPortsTooMany = hostpolicy.ErrAllowlistPortsTooMany
 var ErrAllowlistPortsUnsupported = hostpolicy.ErrAllowlistPortsUnsupported
 var ErrAllowlistWildcardScoped = hostpolicy.ErrAllowlistWildcardScoped
-var ErrBlocklistNestingTooDeep = hostpolicy.ErrBlocklistNestingTooDeep
 var ErrDataplaneLacksExemptions = hostpolicy.ErrDataplaneLacksExemptions
-var ErrEgressBlockTooBroad = hostpolicy.ErrEgressBlockTooBroad
-var ErrEgressDenyUnpinned = hostpolicy.ErrEgressDenyUnpinned
 var ErrGeoAllowNoDataset = hostpolicy.ErrGeoAllowNoDataset
 var ErrGeoAllowNoRanges = hostpolicy.ErrGeoAllowNoRanges
-var ErrGeoAllowUnacknowledged = hostpolicy.ErrGeoAllowUnacknowledged
 var ErrGeoAllowUnsupported = hostpolicy.ErrGeoAllowUnsupported
-var ErrGeoCountryInvalid = hostpolicy.ErrGeoCountryInvalid
 var ErrGeoModeInvalid = hostpolicy.ErrGeoModeInvalid
-var ErrGeoRangesExceedCapacity = hostpolicy.ErrGeoRangesExceedCapacity
 var ErrIPListBatch = hostpolicy.ErrIPListBatch
 var ErrIPListCapacity = hostpolicy.ErrIPListCapacity
-var ErrIngressDenyNeedsAllow = hostpolicy.ErrIngressDenyNeedsAllow
-var ErrIngressDenyNeedsConntrack = hostpolicy.ErrIngressDenyNeedsConntrack
 var ErrInvalidIPEntry = hostpolicy.ErrInvalidIPEntry
-var ErrInvalidPortPolicy = hostpolicy.ErrInvalidPortPolicy
 var ErrInvalidPorts = hostpolicy.ErrInvalidPorts
 var ErrNoControlPlaneMap = hostpolicy.ErrNoControlPlaneMap
-var ErrWildcardBlockNeedsAllowlist = hostpolicy.ErrWildcardBlockNeedsAllowlist
-var ErrWildcardBlockNeedsConntrack = hostpolicy.ErrWildcardBlockNeedsConntrack
-var matchModifierFields = hostpolicy.MatchModifierFields
-var narrowingMatchFields = hostpolicy.NarrowingMatchFields
 var TraceEventTypes = hostpolicy.TraceEventTypes
 var traceKeepBuiltin = hostpolicy.TraceKeepBuiltin
 
-var CanonicalPortPolicy = hostpolicy.CanonicalPortPolicy
-var ClassifyTraceEvent = hostpolicy.ClassifyTraceEvent
 var classifyTraceEvent = hostpolicy.ClassifyTraceEventWith
 var clip = hostpolicy.Clip
 var connectionFresh = hostpolicy.ConnectionFresh
@@ -167,33 +145,21 @@ var filenameTermNarrows = hostpolicy.FilenameTermNarrows
 var FirewallErrorCode = hostpolicy.FirewallErrorCode
 var GeoPrefixFromIPNet = hostpolicy.GeoPrefixFromIPNet
 var GeoRangesFit = hostpolicy.GeoRangesFit
-var HasScopedAllowlistEntry = hostpolicy.HasScopedAllowlistEntry
 var IPListKeys = hostpolicy.IPListKeys
 var IPListPrefixes = hostpolicy.IPListPrefixes
-var KeepsBuiltinRead = hostpolicy.KeepsBuiltinRead
-var LockoutEscape = hostpolicy.LockoutEscape
 var matchTerms = hostpolicy.MatchTerms
-var MergeGeoPrefixes = hostpolicy.MergeGeoPrefixes
-var NeedsDataplaneExemptions = hostpolicy.NeedsDataplaneExemptions
 var NormalizeCountryCode = hostpolicy.NormalizeCountryCode
 var NormalizeGeoMode = hostpolicy.NormalizeGeoMode
 var NormalizePortScanConfig = hostpolicy.NormalizePortScanConfig
 var NormalizePortScopes = hostpolicy.NormalizePortScopes
 var ParseActionName = hostpolicy.ParseActionName
-var policyHasNarrowingMatch = hostpolicy.PolicyHasNarrowingMatch
 var PortPolicyDeadline = hostpolicy.PortPolicyDeadline
 var PortScopesKey = hostpolicy.PortScopesKey
 var PrefixKey = hostpolicy.PrefixKey
-var SamePortPolicyKey = hostpolicy.SamePortPolicyKey
-var TraceAgentReportNames = hostpolicy.TraceAgentReportNames
-var traceEventIsNoise = hostpolicy.TraceEventIsNoise
-var traceOpenKept = hostpolicy.TraceOpenKept
 var ValidateAllowlistPorts = hostpolicy.ValidateAllowlistPorts
 var ValidateEgressBlocklistCapacity = hostpolicy.ValidateEgressBlocklistCapacity
 var ValidateEnforcementPolicy = hostpolicy.ValidateEnforcementPolicy
-var ValidateFirewallSafety = hostpolicy.ValidateFirewallSafety
 var ValidateHostFirewall = hostpolicy.ValidateHostFirewall
-var ValidateIPListNesting = hostpolicy.ValidateIPListNesting
 var ValidatePortPolicyRule = hostpolicy.ValidatePortPolicyRule
 var ValidatePortScanConfig = hostpolicy.ValidatePortScanConfig
 var ValidateRateConfig = hostpolicy.ValidateRateConfig

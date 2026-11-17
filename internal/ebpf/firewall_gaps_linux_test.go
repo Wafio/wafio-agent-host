@@ -21,6 +21,14 @@ import (
 // unpinned maps and run packets through BPF_PROG_TEST_RUN only: nothing is
 // attached and no live agent map is touched.
 
+// ListJail returns up to limit live jail entries (latest expiry first) and
+// how many are live in all.
+func (m *Manager) ListJail(limit int) ([]BlocklistEntry, int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.listJailLocked(limit)
+}
+
 // putListEntry writes a permanent ingress allowlist (allow) or blocklist
 // entry the way the manager stores it (prefixes in LPM tries).
 func putListEntry(t *testing.T, c *cebpf.Collection, allow bool, entry string) {

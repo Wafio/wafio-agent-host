@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	wafebpf "github.com/wafio/wafio-agent-host/internal/ebpf"
+	"github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 )
 
 // fakeGeoDataplane logs the geo writes applyGeoState makes, in order.
@@ -286,10 +287,10 @@ func TestValidateEBPFStateGeoAllow(t *testing.T) {
 		}
 	}
 	s.GeoAllowAcknowledged = false
-	if _, err := validateEBPFStateWith(s, fullGeoEnv); !errors.Is(err, wafebpf.ErrGeoAllowUnacknowledged) {
+	if _, err := validateEBPFStateWith(s, fullGeoEnv); !errors.Is(err, hostpolicy.ErrGeoAllowUnacknowledged) {
 		t.Fatalf("unacknowledged: %v", err)
 	}
-	if code, _ := wafebpf.FirewallErrorCode(wafebpf.ErrGeoAllowUnacknowledged); !strings.HasPrefix(refuseApply(wafebpf.ErrGeoAllowUnacknowledged).Error(), applyRefusedPrefix+code+")") {
+	if code, _ := wafebpf.FirewallErrorCode(hostpolicy.ErrGeoAllowUnacknowledged); !strings.HasPrefix(refuseApply(hostpolicy.ErrGeoAllowUnacknowledged).Error(), applyRefusedPrefix+code+")") {
 		t.Fatal("refusal text")
 	}
 }

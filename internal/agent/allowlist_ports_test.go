@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	wafebpf "github.com/wafio/wafio-agent-host/internal/ebpf"
+	"github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 )
 
 // Port-scoped allowlist entries on the host agent: the allowlist_scoped key
@@ -93,7 +93,7 @@ func TestSkippedScopedEntryIsNoEscapeHatch(t *testing.T) {
 	s := decodeScopedState(t, raw)
 	mergeScopedAllowlist(s, false)
 	_, err := validateEBPFStateWith(s, env)
-	if !errors.Is(err, wafebpf.ErrWildcardBlockNeedsAllowlist) {
+	if !errors.Is(err, hostpolicy.ErrWildcardBlockNeedsAllowlist) {
 		t.Fatalf("old object: %v", err)
 	}
 

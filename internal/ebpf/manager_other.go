@@ -35,7 +35,6 @@ func (m *Manager) UpdateFullConfig(_ FullConfigAPI) error         { return ErrNo
 func (m *Manager) AddToBlocklist(_ string, _ time.Duration) error { return ErrNotSupported }
 func (m *Manager) RemoveFromBlocklist(_ string) error             { return ErrNotSupported }
 func (m *Manager) ListBlocklist(_ int) ([]BlocklistEntry, error)  { return nil, ErrNotSupported }
-func (m *Manager) AddToAllowlist(_ string, _ time.Duration) error { return ErrNotSupported }
 func (m *Manager) AddToAllowlistPorts(_ string, _ time.Duration, _ []PortScope) error {
 	return ErrNotSupported
 }
@@ -44,7 +43,6 @@ func (m *Manager) SetAllowlistScopedSkipped(_ int)               {}
 func (m *Manager) RemoveFromAllowlist(_ string) error            { return ErrNotSupported }
 func (m *Manager) ListAllowlist(_ int) ([]AllowlistEntry, error) { return nil, ErrNotSupported }
 func (m *Manager) AddToJail(_ string, _ time.Duration) error     { return ErrNotSupported }
-func (m *Manager) ListJail(_ int) ([]BlocklistEntry, int, error) { return nil, 0, ErrNotSupported }
 func (m *Manager) BlockCountry(_ string) error                   { return ErrNotSupported }
 func (m *Manager) UnblockCountry(_ string) error                 { return ErrNotSupported }
 func (m *Manager) ListBlockedCountries() ([]string, error)       { return nil, ErrNotSupported }
@@ -54,8 +52,6 @@ func (m *Manager) DrainRecentEvents(_ int) []Event               { return nil }
 func (m *Manager) PendingEvents() int                            { return 0 }
 func (m *Manager) GetRecentEvents(_ int) []Event                 { return nil }
 func (m *Manager) LoadGeoIPEntry(_ net.IP, _ string) error       { return ErrNotSupported }
-func (m *Manager) LoadGeoCIDR(_ *net.IPNet) error                { return ErrNotSupported }
-func (m *Manager) ClearGeoCIDRs() error                          { return nil }
 func (m *Manager) GeoAllowSupported() bool                       { return false }
 func (m *Manager) GeoState() GeoRangeState                       { return GeoRangeState{Mode: GeoModeBlock} }
 func (m *Manager) CaptureGeo() (*GeoSnapshot, error)             { return nil, nil }
@@ -69,7 +65,6 @@ func (m *Manager) ApplyGeoRanges(mode string, _ []string, _ []netip.Prefix) erro
 	}
 	return nil
 }
-func (m *Manager) PinnedMapPath(_ string) string { return "" }
 
 // Port policy stubs
 func (m *Manager) AddPortPolicy(_ PortPolicyAPI) error                { return ErrNotSupported }

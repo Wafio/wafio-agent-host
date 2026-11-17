@@ -28,8 +28,6 @@ func (tm *TraceManager) QueuedEvents() int                                      
 func (tm *TraceManager) FilterRecentEvents(_ string, _ uint32, _ int) []TraceEvent { return nil }
 func (tm *TraceManager) GetConfig() (*TraceConfigAPI, error)                       { return nil, ErrTraceNotSupported }
 func (tm *TraceManager) UpdateConfig(_ TraceConfigAPI) error                       { return ErrTraceNotSupported }
-func (tm *TraceManager) AddFilteredPID(_ uint32) error                             { return ErrTraceNotSupported }
-func (tm *TraceManager) RemoveFilteredPID(_ uint32) error                          { return ErrTraceNotSupported }
 func (tm *TraceManager) GetStats() (*TraceStats, error)                            { return nil, ErrTraceNotSupported }
 
 // Enforcement stubs
@@ -49,7 +47,3 @@ func (tm *TraceManager) DrainEnforcementLog(_ int) []EnforcementLogEntry { retur
 func (tm *TraceManager) ClearEnforcementLog()                            {}
 
 func (tm *TraceManager) ReplacePolicies(_ []EnforcementPolicy) error { return ErrTraceNotSupported }
-func (tm *TraceManager) IsLSMActive() bool                           { return false }
-func (tm *TraceManager) BlockBinaryPath(_ string, _ uint32) error    { return ErrTraceNotSupported }
-func (tm *TraceManager) UnblockBinaryPath(_ string) error            { return ErrTraceNotSupported }
-func (tm *TraceManager) ListBlockedBinaryPaths() ([]string, error)   { return nil, ErrTraceNotSupported }

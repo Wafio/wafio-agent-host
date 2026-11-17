@@ -63,7 +63,6 @@ type ContainerEnricher struct {
 
 const (
 	defaultDockerSocket   = "/var/run/docker.sock"
-	containerEnrichTTL    = 10 * time.Second
 	containerReconcileTTL = 30 * time.Second // full refresh while the event stream is healthy
 )
 
@@ -360,16 +359,6 @@ func (e *ContainerEnricher) Enrich(cgroupID uint64) *ContainerInfo {
 	}
 	// Possibly a sub-cgroup created since the last walk.
 	return e.rescanFor(cgroupID)
-}
-
-// EnrichByShortID returns ContainerInfo by short container ID (12 hex chars).
-func (e *ContainerEnricher) EnrichByShortID(id string) *ContainerInfo {
-	if len(id) < 12 {
-		return nil
-	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.byShortID[id[:12]]
 }
 
 // Available reports whether Docker/containerd was detected on this host.

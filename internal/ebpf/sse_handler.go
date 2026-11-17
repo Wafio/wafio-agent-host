@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -34,7 +33,6 @@ import (
 //   • Heartbeat keep-alive comments every tick
 //   • Channel-based subscription via query params
 //   • Graceful disconnect detection via flush errors
-//   • Connection counting for observability
 // ──────────────────────────────────────────────────────────────────────────────
 
 // SSEHandler serves Server-Sent Events for real-time eBPF data streaming.
@@ -44,13 +42,6 @@ type SSEHandler struct {
 	// AuthToken is the host-agent local API token; when non-empty
 	// the stream (and its preflight) requires it.
 	AuthToken string
-
-	activeConns atomic.Int64 // active SSE connection count
-}
-
-// ActiveConnections returns the number of active SSE connections.
-func (h *SSEHandler) ActiveConnections() int64 {
-	return h.activeConns.Load()
 }
 
 // Handle dispatches SSE requests. Returns true if handled.
@@ -87,10 +78,7 @@ func (h *SSEHandler) Handle(ctx *fasthttp.RequestCtx) bool {
 	ctx.Response.Header.Set("X-Accel-Buffering", "no") // disable nginx buffering
 	setCORSHeaders(ctx)
 
-	h.activeConns.Add(1)
-
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer h.activeConns.Add(-1)
 		h.streamLoop(w, channels)
 	})
 

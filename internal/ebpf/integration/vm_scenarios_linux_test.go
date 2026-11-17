@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/wafio/wafio-agent-host/internal/ebpf"
+	"github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 )
 
 // The scenarios below replace the earlier "console VM" lockout checks. They
@@ -339,8 +340,8 @@ func TestVMScenarioEgressDenyControlPlane(t *testing.T) {
 	}
 
 	warnings := applyState(t, fw.Manager, withDNS)
-	if !hasWarning(warnings, ebpf.WarnEgressControlPlaneRuleMissing) {
-		t.Errorf("expected warning %s (no egress allow for the control-plane port), got %+v", ebpf.WarnEgressControlPlaneRuleMissing, warnings)
+	if !hasWarning(warnings, hostpolicy.WarnEgressControlPlaneRuleMissing) {
+		t.Errorf("expected warning %s (no egress allow for the control-plane port), got %+v", hostpolicy.WarnEgressControlPlaneRuleMissing, warnings)
 	}
 	dropsBefore := portPolicyDrops(t, fw.Manager)
 
@@ -376,8 +377,8 @@ func TestVMScenarioEgressDenyControlPlane(t *testing.T) {
 
 	// Without the 53 rule the query is dropped on egress.
 	warnings = applyState(t, fw.Manager, withoutDNS)
-	if !hasWarning(warnings, ebpf.WarnEgressDNSRuleMissing) {
-		t.Errorf("expected warning %s, got %+v", ebpf.WarnEgressDNSRuleMissing, warnings)
+	if !hasWarning(warnings, hostpolicy.WarnEgressDNSRuleMissing) {
+		t.Errorf("expected warning %s, got %+v", hostpolicy.WarnEgressDNSRuleMissing, warnings)
 	}
 	if udpOK && env.udpEcho(t, 2*time.Second) {
 		t.Error("UDP echo on 53 answered although the 53/udp allow rule was removed")
@@ -393,14 +394,14 @@ func TestVMScenarioEgressDenyControlPlane(t *testing.T) {
 
 	// The guard side: with the control plane not yet pinned, egress Deny All
 	// without a DNS rule is refused (the control plane may need DNS).
-	_, err = ebpf.ValidateFirewallSafety(ebpf.FirewallSafetyInput{
+	_, err = hostpolicy.ValidateFirewallSafety(ebpf.FirewallSafetyInput{
 		Config:               &withoutDNS.cfg,
 		PortPolicyConfig:     &withoutDNS.pp,
 		PortPolicies:         withoutDNS.rules,
 		SSHPorts:             []uint16{sshPort},
 		ControlPlaneUnpinned: true,
 	})
-	if !errors.Is(err, ebpf.ErrEgressDenyUnpinned) {
+	if !errors.Is(err, hostpolicy.ErrEgressDenyUnpinned) {
 		t.Errorf("unpinned control plane without a DNS rule: got %v, want ErrEgressDenyUnpinned", err)
 	}
 

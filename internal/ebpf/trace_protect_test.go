@@ -10,6 +10,13 @@ import (
 	"testing"
 )
 
+// NewProtectedProcessSet merges DefaultProtectedProcessNames with the extra
+// names and exact executable paths. Invalid entries (blank, a name containing
+// '/', a relative or non-canonical exe path) are ignored.
+func NewProtectedProcessSet(extraNames, exePaths []string) *ProtectedProcessSet {
+	return NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: extraNames, ExePaths: exePaths})
+}
+
 // ── Broad Kill policy validation ───────────────────────────────────────────
 
 func TestBroadKillPolicyRequiresAcknowledgement(t *testing.T) {

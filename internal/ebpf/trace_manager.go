@@ -33,7 +33,6 @@ import (
 const (
 	traceMapEvents    = "trace_events"
 	traceMapConfig    = "trace_config_map"
-	traceMapPIDFilter = "trace_pid_filter"
 	traceMapStats     = "trace_stats"
 	traceMapEnforce   = "trace_enforce_map"
 	traceMapDeferred  = "trace_deferred_signals"
@@ -69,7 +68,6 @@ type TraceManager struct {
 	// map references
 	eventsMap      *ebpf.Map
 	configMap      *ebpf.Map
-	pidFilterMap   *ebpf.Map
 	statsMap       *ebpf.Map
 	enforceMap     *ebpf.Map
 	deferredMap    *ebpf.Map
@@ -250,7 +248,6 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 		return fmt.Errorf("map %q not found in BPF object", traceMapEvents)
 	}
 	tm.configMap = coll.Maps[traceMapConfig]
-	tm.pidFilterMap = coll.Maps[traceMapPIDFilter]
 	tm.statsMap = coll.Maps[traceMapStats]
 	tm.enforceMap = coll.Maps[traceMapEnforce]
 	tm.deferredMap = coll.Maps[traceMapDeferred]
@@ -778,85 +775,6 @@ func (tm *TraceManager) lsmRingbufLoop(ctx context.Context, reader *ringbuf.Read
 	}
 }
 
-// IsLSMActive reports whether proactive BPF-LSM blocking is currently active.
-func (tm *TraceManager) IsLSMActive() bool {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.lsmActive
-}
-
-// BlockBinaryPath adds an executable path to the BPF-LSM blocklist map.
-func (tm *TraceManager) BlockBinaryPath(path string, policyID uint32) error {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if !tm.lsmActive || tm.lsmBlockMap == nil {
-		return fmt.Errorf("BPF-LSM is not active")
-	}
-
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return fmt.Errorf("binary path cannot be empty")
-	}
-	if len(path) >= 256 {
-		return fmt.Errorf("path exceeds max length of 255 chars: %s", path)
-	}
-
-	var key [256]byte
-	copy(key[:], path)
-
-	rule := LSMRule{
-		Action:   ActionBlock,
-		PolicyID: policyID,
-		Enabled:  1,
-	}
-
-	return tm.lsmBlockMap.Update(key, &rule, ebpf.UpdateAny)
-}
-
-// UnblockBinaryPath removes an executable path from the BPF-LSM blocklist map.
-func (tm *TraceManager) UnblockBinaryPath(path string) error {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if !tm.lsmActive || tm.lsmBlockMap == nil {
-		return fmt.Errorf("BPF-LSM is not active")
-	}
-
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return fmt.Errorf("binary path cannot be empty")
-	}
-
-	var key [256]byte
-	copy(key[:], path)
-
-	return tm.lsmBlockMap.Delete(key)
-}
-
-// ListBlockedBinaryPaths returns all paths currently blocked in BPF-LSM.
-func (tm *TraceManager) ListBlockedBinaryPaths() ([]string, error) {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if !tm.lsmActive || tm.lsmBlockMap == nil {
-		return nil, fmt.Errorf("BPF-LSM is not active")
-	}
-
-	var paths []string
-	var key [256]byte
-	var rule LSMRule
-
-	iter := tm.lsmBlockMap.Iterate()
-	for iter.Next(&key, &rule) {
-		if rule.Enabled != 0 {
-			p := strings.TrimRight(string(key[:]), "\x00")
-			if p != "" {
-				paths = append(paths, p)
-			}
-		}
-	}
-
-	return paths, iter.Err()
-}
-
 // BlockConnectIP adds a destination IPv4 to the BPF-LSM socket_connect
 // blocklist: outbound connects are denied synchronously in-kernel (-EPERM)
 // before any packet leaves the host.
@@ -1052,31 +970,6 @@ func (tm *TraceManager) writeConfig(bpfCfg TraceConfigBPF) error {
 	binary.LittleEndian.PutUint32(val[12:16], bpfCfg.FilterOwnPid)
 	binary.LittleEndian.PutUint32(val[16:20], bpfCfg.AgentPid)
 	return tm.configMap.Update(key, val, ebpf.UpdateAny)
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-//  PID Filter Management
-// ────────────────────────────────────────────────────────────────────────────
-
-func (tm *TraceManager) AddFilteredPID(pid uint32) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	if tm.pidFilterMap == nil {
-		return fmt.Errorf("pid filter map not available")
-	}
-	var val uint8 = 1
-	return tm.pidFilterMap.Update(pid, val, ebpf.UpdateAny)
-}
-
-func (tm *TraceManager) RemoveFilteredPID(pid uint32) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	if tm.pidFilterMap == nil {
-		return fmt.Errorf("pid filter map not available")
-	}
-	return tm.pidFilterMap.Delete(pid)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

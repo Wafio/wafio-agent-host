@@ -229,14 +229,9 @@ func (m *Manager) ListBlocklist(limit int) ([]BlocklistEntry, error) {
 	return out, err
 }
 
-// AddToAllowlist adds an address, CIDR or IPv4 range to the ingress
-// allowlist with an optional TTL (every port and protocol: ALLOW_F_ALL).
-func (m *Manager) AddToAllowlist(ipStr string, ttl time.Duration) error {
-	return m.addListEntry(true, ipStr, ttl, nil)
-}
-
-// AddToAllowlistPorts is AddToAllowlist scoped to ports (empty = every
-// port). Scoped entries need an object that matches scopes
+// AddToAllowlistPorts adds an address, CIDR or IPv4 range to the ingress
+// allowlist with an optional TTL, scoped to ports (empty = every port and
+// protocol: ALLOW_F_ALL). Scoped entries need an object that matches scopes
 // (ErrAllowlistPortsUnsupported) and never name a /0 prefix.
 func (m *Manager) AddToAllowlistPorts(ipStr string, ttl time.Duration, ports []PortScope) error {
 	return m.addListEntry(true, ipStr, ttl, ports)

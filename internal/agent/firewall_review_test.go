@@ -15,6 +15,7 @@ import (
 	"time"
 
 	wafebpf "github.com/wafio/wafio-agent-host/internal/ebpf"
+	"github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 )
 
 // A bundle the lockout guard rejects is acknowledged as
@@ -141,7 +142,7 @@ func TestEgressDenyNeedsPinnedControlPlaneOrDNS(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := firewallEnv{exemptions: true, controlPlaneUnpinned: true}
-	if _, err := validateEBPFStateWith(&s, env); !errors.Is(err, wafebpf.ErrEgressDenyUnpinned) {
+	if _, err := validateEBPFStateWith(&s, env); !errors.Is(err, hostpolicy.ErrEgressDenyUnpinned) {
 		t.Fatalf("unpinned egress deny without DNS accepted: %v", err)
 	}
 	relaxed, ok := relaxEgressForDNS(raw)

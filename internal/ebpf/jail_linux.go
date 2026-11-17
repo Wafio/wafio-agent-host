@@ -52,14 +52,8 @@ func (m *Manager) AddToJail(ipStr string, ttl time.Duration) error {
 	return m.jailMap.Update(key, &val, ebpf.UpdateAny)
 }
 
-// ListJail returns up to limit live jail entries (latest expiry first) and
-// how many are live in all.
-func (m *Manager) ListJail(limit int) ([]BlocklistEntry, int, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.listJailLocked(limit)
-}
-
+// listJailLocked returns up to limit live jail entries (latest expiry first)
+// and how many are live in all. The caller holds m.mu.
 func (m *Manager) listJailLocked(limit int) ([]BlocklistEntry, int, error) {
 	if m.jailMap == nil {
 		return nil, 0, ErrJailUnavailable

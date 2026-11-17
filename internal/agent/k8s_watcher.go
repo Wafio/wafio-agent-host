@@ -43,7 +43,6 @@ type K8sPodContext struct {
 const (
 	k8sTokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec // G101: a file path, not a credential
 	k8sCAFile     = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	k8sNsFile     = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 	k8sWatchRetry = 5 * time.Second
 	// k8sListInterval is the pause between successful pod lists (the same
 	// cadence as the Docker container poll).
@@ -88,13 +87,6 @@ func NewK8sWatcher() *K8sWatcher {
 // Available reports whether in-cluster credentials were found.
 func (w *K8sWatcher) Available() bool {
 	return w != nil && w.client != nil && w.token != ""
-}
-
-// Watching reports whether the pod watch loop is live.
-func (w *K8sWatcher) Watching() bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.watching
 }
 
 // Lookup returns the pod context for a container ID (full or short), if known.

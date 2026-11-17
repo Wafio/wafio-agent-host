@@ -91,14 +91,6 @@ type ProtectedProcessSet struct {
 	defaultsReplaced bool // DefaultProtectedProcessNames dropped by configuration
 }
 
-// NewProtectedProcessSet merges DefaultProtectedProcessNames with the extra
-// names and exact executable paths supplied by configuration. Invalid entries
-// (blank, a name containing '/', a relative or non-canonical exe path) are
-// ignored; see ProtectedProcessConfig.Validate for reporting them.
-func NewProtectedProcessSet(extraNames, exePaths []string) *ProtectedProcessSet {
-	return NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: extraNames, ExePaths: exePaths})
-}
-
 func truncateComm(name string) string {
 	if len(name) > taskCommLen-1 {
 		return name[:taskCommLen-1]

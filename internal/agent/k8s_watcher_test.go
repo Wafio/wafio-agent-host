@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+// Watching reports whether the pod watch loop is live.
+func (w *K8sWatcher) Watching() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.watching
+}
+
 // The enrichment both transports start (gRPC stream per connection,
 // HTTP push per Run) includes the Kubernetes pod watcher, and a successful
 // pod list is not repeated back to back.
