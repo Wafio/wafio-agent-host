@@ -67,8 +67,7 @@ jobs:
           done
           echo "matrix=${json%,}]" >> "$GITHUB_OUTPUT"
 
-  # Not yet validated on a GitHub runner, so it runs with continue-on-error. It
-  # boots each kernel in a little-vm-helper VM and loads the objects from
+  # It boots each kernel in a little-vm-helper VM and loads the objects from
   # build-objects, so the in-kernel verifier accepts or rejects them
   # (TestBPFObjectsPassVerifier), then runs the BPF_PROG_TEST_RUN packet tests
   # and the fork tracepoint ABI test, and finally the firewall lockout and Kill
@@ -76,9 +75,7 @@ jobs:
   # long-lived connection must survive ingress and egress Deny All, a policy
   # push and an agent restart; a narrowed Kill hits only its fixture). 5.10 is
   # the oldest supported kernel; 5.15 and 6.1 add the legacy-TC kernels between
-  # it and the TCX kernels (6.6 and later, here 6.12). Once green for a few
-  # runs: pin the action by SHA, confirm the image tags, and drop
-  # continue-on-error. Manual run on a Linux box as root instead:
+  # it and the TCX kernels (6.6 and later, here 6.12). Manual run on a Linux box as root instead:
   #   ./scripts/build-ebpf.sh
   #   WAFIO_TEST_BPF_DIR=build/ebpf WAFIO_TRACE_FORK_TEST_OBJECT=build/ebpf/wafio_trace.o \
   #     go test -count=1 -v -run 'TestBPFObjectsPassVerifier|TestKernel|TestForkTracepointKernelABI' ./internal/ebpf/
@@ -86,11 +83,9 @@ jobs:
   # need the peer (see internal/ebpf/integration/README.md); run them only in
   # a disposable VM.
   ebpf-verifier-vm:
-    name: eBPF verifier in VM (experimental, ${{ matrix.kernel }})
+    name: eBPF verifier in VM (${{ matrix.kernel }})
     needs: build-objects
     runs-on: ubuntu-latest
-    # Keep until this job has passed once on a runner.
-    continue-on-error: true
     timeout-minutes: 40
     strategy:
       fail-fast: false
