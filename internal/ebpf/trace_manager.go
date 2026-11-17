@@ -46,7 +46,6 @@ const (
 	traceMapProtectedBudget = "trace_protected_budget"
 
 	lsmMapConfig      = "wafio_lsm_config"
-	lsmMapBlocklist   = "wafio_lsm_blocklist"
 	lsmMapIPBlocklist = "wafio_lsm_ip_blocklist"
 	lsmMapEvents      = "wafio_lsm_events"
 )
@@ -134,7 +133,6 @@ type TraceManager struct {
 	lsmLink       link.Link
 	lsmExtraLinks []link.Link // socket_connect / socket_sendmsg hook links
 	lsmConfigMap  *ebpf.Map
-	lsmBlockMap   *ebpf.Map
 	lsmIPBlockMap *ebpf.Map
 	lsmEventsMap  *ebpf.Map
 	// lsmSuppressedMap: per-CPU count of network deny reports the object
@@ -473,7 +471,7 @@ func (tm *TraceManager) startLSM(ctx context.Context, listPath string) {
 		} else if plan.State == LSMStateUnverified {
 			tm.log.Printf("INFO: BPF-LSM hooks attached; the kernel LSM list was unreadable, so whether they run is unverified")
 		} else {
-			tm.log.Printf("INFO: BPF-LSM proactive blocking enabled (-EPERM on bprm_check_security)")
+			tm.log.Printf("INFO: BPF-LSM enabled for outbound connect and addressed-send blocking by IP")
 		}
 	}
 }
@@ -504,14 +502,7 @@ func (tm *TraceManager) Stop() error {
 
 	tm.closeLinks()
 
-	if tm.lsmLink != nil {
-		_ = tm.lsmLink.Close() // detach on shutdown; the kernel drops the link with its fd
-		tm.lsmLink = nil
-	}
-	for _, l := range tm.lsmExtraLinks {
-		_ = l.Close() // detach on shutdown; the kernel drops the link with its fd
-	}
-	tm.lsmExtraLinks = nil
+	tm.closeLSMLinks()
 	if tm.lsmColl != nil {
 		tm.lsmColl.Close()
 		tm.lsmColl = nil
@@ -528,6 +519,18 @@ func (tm *TraceManager) Stop() error {
 	tm.running = false
 	tm.log.Printf("trace manager stopped (processed %d events)", tm.totalEvents.Load())
 	return nil
+}
+
+// closeLSMLinks detaches the LSM programs; the kernel drops each link with its fd.
+func (tm *TraceManager) closeLSMLinks() {
+	if tm.lsmLink != nil {
+		_ = tm.lsmLink.Close() // nothing to do if detaching fails
+		tm.lsmLink = nil
+	}
+	for _, l := range tm.lsmExtraLinks {
+		_ = l.Close() // nothing to do if detaching fails
+	}
+	tm.lsmExtraLinks = nil
 }
 
 func (tm *TraceManager) resolveLSMPath() string {
@@ -554,8 +557,8 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 		return fmt.Errorf("load LSM spec from %s: %w", lsmPath, err)
 	}
 
-	// socket_sendmsg is optional: a kernel that rejects it keeps exec and
-	// connect blocking.
+	// socket_sendmsg is optional: a kernel that rejects it keeps connect
+	// blocking.
 	coll, dropped, err := createDroppingOptional(spec.Programs, []string{lsmProgSendmsg},
 		func() (*ebpf.Collection, error) { return ebpf.NewCollection(spec) })
 	if err != nil {
@@ -566,24 +569,20 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 	}
 	tm.lsmColl = coll
 	tm.lsmConfigMap = coll.Maps[lsmMapConfig]
-	tm.lsmBlockMap = coll.Maps[lsmMapBlocklist]
 	tm.lsmIPBlockMap = coll.Maps[lsmMapIPBlocklist]
 	tm.lsmEventsMap = coll.Maps[lsmMapEvents]
 	tm.lsmSuppressedMap = coll.Maps["wafio_lsm_reports_suppressed"]
 
-	// Attach every LSM program present in the object; the bprm hook is the
-	// historical minimum, socket_connect is newer, socket_sendmsg newer still.
-	progNames := []string{"wafio_bprm_check_security", "wafio_socket_connect", lsmProgSendmsg}
+	// Attach every LSM program present in the object. socket_connect is the
+	// required one; socket_sendmsg is optional.
 	var attached []string
-	for _, name := range progNames {
+	for _, name := range []string{lsmProgConnect, lsmProgSendmsg} {
 		prog := coll.Programs[name]
 		if prog == nil {
 			continue
 		}
 		lsmLink, err := link.AttachLSM(link.LSMOptions{Program: prog})
 		if err != nil {
-			// socket_connect needs kernel ≥ 5.7 hook support —
-			// non-fatal when the kernel lacks the hook.
 			tm.log.Printf("LSM attach %s skipped: %v", name, err)
 			continue
 		}
@@ -594,9 +593,12 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 		}
 		attached = append(attached, name)
 	}
-	if tm.lsmLink == nil {
+	// socket_sendmsg alone denies nothing: its rules are written only when
+	// socket_connect denies too.
+	if !slices.Contains(attached, lsmProgConnect) {
+		tm.closeLSMLinks()
 		coll.Close()
-		return fmt.Errorf("no LSM program could be attached")
+		return fmt.Errorf("%s could not be attached", lsmProgConnect)
 	}
 	tm.log.Printf("BPF-LSM hooks attached: %v", attached)
 
@@ -607,7 +609,6 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 		zero := uint32(0)
 		cfg := LSMConfig{
 			Enabled:      1,
-			BlockExec:    1,
 			BlockConnect: boolToU32(tm.cfg.LSMBlockConnect),
 			AgentPID:     agentPID(),
 		}
@@ -636,7 +637,7 @@ func (tm *TraceManager) loadLSM(ctx context.Context) error {
 	// config write would turn a kill policy into a no-op. Any of those keeps
 	// dest-IP policies in userspace.
 	denies, reason := connectBlocklistDenies(tm.lsmIPBlockMap != nil,
-		slices.Contains(attached, "wafio_socket_connect"), tm.cfg.LSMBlockConnect, configErr)
+		slices.Contains(attached, lsmProgConnect), tm.cfg.LSMBlockConnect, configErr)
 	// Only an object with the marker denies IPv4-mapped AF_INET6
 	// connects; with an older one userspace keeps enforcing them.
 	mapped := coll.Maps[lsmMapConnectV4Mapped] != nil
@@ -693,18 +694,12 @@ func (tm *TraceManager) lsmRingbufLoop(ctx context.Context, reader *ringbuf.Read
 		pathStr := strings.TrimRight(string(evt.Path[:]), "\x00")
 		commStr := strings.TrimRight(string(evt.Comm[:]), "\x00")
 
-		// Hook-specific presentation: exec carries a path, connect and send an IP.
-		eventType, eventName, category := TraceExecve, "execve", "process"
-		subject := pathStr
-		description := "blocked unauthorized execution"
-		switch evt.Hook {
-		case LSMHookConnect:
-			eventType, eventName, category = TraceConnect, "socket_connect", "network"
-			subject = net.IP(evt.Addr[:4]).String()
-			description = "BPF-LSM blocked outbound connect"
-		case LSMHookSendmsg:
-			eventType, eventName, category = TraceSendto, "socket_sendmsg", "network"
-			subject = net.IP(evt.Addr[:4]).String()
+		// Hook-specific presentation: connect and send both name an IP.
+		eventType, eventName, category := TraceConnect, "socket_connect", "network"
+		subject := net.IP(evt.Addr[:4]).String()
+		description := "BPF-LSM blocked outbound connect"
+		if evt.Hook == LSMHookSendmsg {
+			eventType, eventName = TraceSendto, "socket_sendmsg"
 			description = "BPF-LSM blocked outbound send"
 		}
 		addrFamily, familyNote := lsmConnectFamily(evt)

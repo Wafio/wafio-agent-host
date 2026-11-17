@@ -113,7 +113,7 @@ func TestLSMConnectEventFamily(t *testing.T) {
 			t.Errorf("family %#x: got (%d, %q), want (%d, %q)", tc.family, fam, note, tc.want, tc.note)
 		}
 	}
-	if fam, note := lsmConnectFamily(WafioLSMEvent{Hook: LSMHookExec, Family: 10}); fam != 0 || note != "" {
-		t.Errorf("exec hook reported a socket family: (%d, %q)", fam, note)
+	if fam, note := lsmConnectFamily(WafioLSMEvent{Hook: 0, Family: 10}); fam != 0 || note != "" {
+		t.Errorf("unknown hook reported a socket family: (%d, %q)", fam, note)
 	}
 }

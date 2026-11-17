@@ -4,14 +4,13 @@ package ebpf
 
 import (
 	"bytes"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 // IsLSMActive reports whether proactive BPF-LSM blocking is currently active.
@@ -19,34 +18,6 @@ func (tm *TraceManager) IsLSMActive() bool {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	return tm.lsmActive
-}
-
-// BlockBinaryPath adds an executable path to the BPF-LSM blocklist map.
-func (tm *TraceManager) BlockBinaryPath(path string, policyID uint32) error {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if !tm.lsmActive || tm.lsmBlockMap == nil {
-		return fmt.Errorf("BPF-LSM is not active")
-	}
-
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return fmt.Errorf("binary path cannot be empty")
-	}
-	if len(path) >= 256 {
-		return fmt.Errorf("path exceeds max length of 255 chars: %s", path)
-	}
-
-	var key [256]byte
-	copy(key[:], path)
-
-	rule := LSMRule{
-		Action:   ActionBlock,
-		PolicyID: policyID,
-		Enabled:  1,
-	}
-
-	return tm.lsmBlockMap.Update(key, &rule, ebpf.UpdateAny)
 }
 
 // startLSM must not load or attach anything when the kernel does not list
@@ -75,14 +46,11 @@ func TestStartLSMWithoutKernelBPF(t *testing.T) {
 			t.Errorf("log lacks %q: %q", want, logged)
 		}
 	}
-	if strings.Contains(logged, "hooks attached") || strings.Contains(logged, "proactive blocking enabled") {
+	if strings.Contains(logged, "hooks attached") || strings.Contains(logged, "BPF-LSM enabled") {
 		t.Errorf("log claims LSM blocking: %q", logged)
 	}
 	if n := strings.Count(logged, "\n"); n != 1 {
 		t.Errorf("want one line, got %d: %q", n, logged)
-	}
-	if err := tm.BlockBinaryPath("/usr/bin/true", 1); err == nil {
-		t.Error("BlockBinaryPath succeeded without LSM")
 	}
 }
 
@@ -124,5 +92,44 @@ func TestStartLSMSwitchedOff(t *testing.T) {
 	tm.startLSM(t.Context(), list)
 	if st := tm.Status(); st.LSMActive || st.LSMState != LSMStateDisabled || out.Len() != 0 {
 		t.Fatalf("active=%t state=%q log=%q", st.LSMActive, st.LSMState, out.String())
+	}
+}
+
+// With bpf in the kernel's LSM list, startLSM loads wafio_lsm.o and attaches
+// its socket programs, which alone make LSM active. Needs root, BPF LSM
+// (lsm=...,bpf) and WAFIO_TEST_BPF_DIR: kernel lab.
+func TestKernelStartLSMAttachesSocketPrograms(t *testing.T) {
+	dir := os.Getenv("WAFIO_TEST_BPF_DIR")
+	if dir == "" {
+		t.Skip("set WAFIO_TEST_BPF_DIR to the compiled objects (needs root)")
+	}
+	if planLSM(true, kernelLSMListPath).State != LSMStateActive {
+		t.Skip("BPF LSM not enabled on this kernel")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	var out bytes.Buffer
+	tm := NewTraceManager(TraceManagerConfig{LSMEnabled: true, LSMBlockConnect: true, LSMObjectPath: filepath.Join(dir, "wafio_lsm.o")}, log.New(&out, "", 0))
+	tm.startLSM(t.Context(), kernelLSMListPath)
+	t.Cleanup(func() {
+		if tm.lsmReader != nil {
+			_ = tm.lsmReader.Close() // unblocks the reader loop
+		}
+		tm.wg.Wait()
+		tm.closeLSMLinks()
+		if tm.lsmColl != nil {
+			tm.lsmColl.Close()
+		}
+	})
+	t.Log(out.String())
+	if st := tm.Status(); !st.LSMActive || st.LSMState != LSMStateActive {
+		t.Fatalf("status active=%t state=%q", st.LSMActive, st.LSMState)
+	}
+	if tm.lsmLink == nil || !strings.Contains(out.String(), "BPF-LSM hooks attached: [wafio_socket_connect") {
+		t.Errorf("socket_connect is not attached: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "LSM connect blocklist loaded") {
+		t.Errorf("dest-IP policies are not kernel-enforceable: %q", out.String())
 	}
 }

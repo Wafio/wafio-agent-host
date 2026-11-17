@@ -14,6 +14,10 @@ const afInet6 uint16 = 10
 // IPv4 blocklist. Older objects lack it and return early for AF_INET6.
 const lsmMapConnectV4Mapped = "wafio_lsm_connect_v4mapped"
 
+// lsmProgConnect is the socket_connect program. Required: without it no
+// BPF-LSM program can deny anything, so the LSM object counts as failed.
+const lsmProgConnect = "wafio_socket_connect"
+
 // lsmProgSendmsg is the socket_sendmsg program. Optional:
 // an object without it, a kernel without the hook, or a verifier that
 // rejects it leaves addressed sends enforced from userspace.

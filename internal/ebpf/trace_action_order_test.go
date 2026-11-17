@@ -2,8 +2,8 @@ package ebpf
 
 import "testing"
 
-// Block is enforced only by the BPF-LSM hooks, before the event (exec and
-// connect blocklists). From a traced event nothing can block
+// Block is enforced only by the BPF-LSM hooks, before the event (the IP
+// blocklist). From a traced event nothing can block
 // any more: trace_enforce_map ignores it and userspace has no block path. It
 // used to outrank Kill, so a matching Block policy won the event, did
 // nothing, and suppressed a Kill that could have acted.

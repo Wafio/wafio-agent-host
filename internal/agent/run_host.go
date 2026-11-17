@@ -29,7 +29,7 @@ type HostConfig struct {
 	// eBPF runtime security tracing (Linux only)
 	TraceEnabled    bool
 	TraceObjectPath string
-	LSMEnabled      bool // proactive BPF-LSM blocking (exec/connect)
+	LSMEnabled      bool // BPF-LSM: outbound connect and addressed send blocking by IP
 	LSMBlockConnect bool // LSM: deny socket_connect to blocklisted IPs
 	// Protected processes: never targeted by Kill enforcement. Added
 	// to the built-in list unless ProtectedReplaceDefaults; see

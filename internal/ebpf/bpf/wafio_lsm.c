@@ -2,7 +2,6 @@
 // wafio_lsm.c — Proactive Linux Security Module (BPF-LSM) for pre-event blocking.
 //
 // Hooks:
-//   - lsm/bprm_check_security: block unauthorized binary executions (-EPERM)
 //   - lsm/socket_connect:      block outbound connects to blocklisted IPv4
 //                              addresses (-EPERM), including an AF_INET6
 //                              connect to the IPv4-mapped form
@@ -31,7 +30,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define TRACE_ACTION_SIMULATE 3
 #define TRACE_ACTION_BLOCK    4
 
-#define LSM_HOOK_EXEC   0
 #define LSM_HOOK_CONNECT 2
 #define LSM_HOOK_SENDMSG 3
 
@@ -42,7 +40,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define LSM_SIN6_LEN_RFC2133 24
 #define EPERM 1
 
-/* LSM blocklist rule (executable path or IP keyed) */
+/* LSM blocklist rule, keyed by destination IPv4 */
 struct lsm_rule {
     __u32 action;       /* TRACE_ACTION_* */
     __u32 policy_id;
@@ -58,7 +56,6 @@ struct lsm_rule {
 /* Global LSM Configuration (single-entry array, key=0) */
 struct lsm_config {
     __u32 enabled;        /* 1 = LSM enabled */
-    __u32 block_exec;     /* 1 = -EPERM on exec match, 0 = alert only */
     __u32 block_connect;  /* 1 = -EPERM on socket_connect match, 0 = alert only */
     __u32 agent_pid;      /* never block Wafio control plane or agent */
     __u32 pad;
@@ -76,7 +73,7 @@ struct wafio_lsm_event {
     __s32 ret_code;
     __u32 hook;           /* LSM_HOOK_* */
     char  comm[TRACE_COMM_LEN];
-    char  path[LSM_PATH_LEN];   /* exec path; empty for connect */
+    char  path[LSM_PATH_LEN];   /* unused, always empty */
     __u8  addr[16];             /* connect destination (IPv4 in [0..3]) */
     __u16 port;                 /* connect destination port (host order) */
     __u16 family;               /* connect: socket address family; 0 otherwise */
@@ -90,14 +87,6 @@ struct {
     __type(value, struct lsm_config);
     __uint(max_entries, 1);
 } wafio_lsm_config SEC(".maps");
-
-/* Blocklist map: executable path (e.g. "/bin/nc") -> rule */
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, char[LSM_PATH_LEN]);
-    __type(value, struct lsm_rule);
-    __uint(max_entries, 1024);
-} wafio_lsm_blocklist SEC(".maps");
 
 /* Outbound connect blocklist: destination IPv4 (big-endian) -> rule */
 struct {
@@ -125,13 +114,13 @@ struct {
     __uint(max_entries, 1 << 20);
 } wafio_lsm_events SEC(".maps");
 
-/* Network deny reports (connect, sendmsg) are rate-limited per CPU: a
- * process looping sendto() at a blocklisted IP must not flood the ring and
- * crowd out exec reports. The denial itself and the
- * rule's hit_count are never limited. LSM_NET_REPORTS_PER_SEC reports per
- * CPU per second pass; the rest are counted in wafio_lsm_reports_suppressed
- * (per CPU, read by the agent). Per-CPU values need no atomics; a program
- * preempted on the same CPU may miscount by one. */
+/* Deny reports (connect, sendmsg) are rate-limited per CPU: a process
+ * looping sendto() at a blocklisted IP must not flood the ring. The denial
+ * itself and the rule's hit_count are never limited.
+ * LSM_NET_REPORTS_PER_SEC reports per CPU per second pass; the rest are
+ * counted in wafio_lsm_reports_suppressed (per CPU, read by the agent).
+ * Per-CPU values need no atomics; a program preempted on the same CPU may
+ * miscount by one. */
 #define LSM_NET_REPORTS_PER_SEC 32
 #define LSM_REPORT_WINDOW_NS    1000000000ULL
 
@@ -194,11 +183,10 @@ lsm_gate(void) {
 /* Submit a rule-hit event; returns the rule's action. */
 static __always_inline __u32
 lsm_report(struct lsm_config *cfg, struct lsm_rule *rule, __u32 hook,
-           const char path[LSM_PATH_LEN], __be32 addr, __u16 port, __u16 family) {
+           __be32 addr, __u16 port, __u16 family) {
     __sync_fetch_and_add(&rule->hit_count, 1);
 
-    if ((hook == LSM_HOOK_CONNECT || hook == LSM_HOOK_SENDMSG) &&
-        !lsm_net_report_allowed(bpf_ktime_get_ns()))
+    if (!lsm_net_report_allowed(bpf_ktime_get_ns()))
         return rule->action;
 
     struct wafio_lsm_event *evt = bpf_ringbuf_reserve(&wafio_lsm_events, sizeof(*evt), 0);
@@ -212,19 +200,9 @@ lsm_report(struct lsm_config *cfg, struct lsm_rule *rule, __u32 hook,
         evt->action = rule->action;
         evt->policy_id = rule->policy_id;
         evt->hook = hook;
-        switch (hook) {
-        case LSM_HOOK_CONNECT:
-        case LSM_HOOK_SENDMSG:
-            evt->ret_code = cfg->block_connect ? -EPERM : 0;
-            break;
-        default:
-            evt->ret_code = cfg->block_exec ? -EPERM : 0;
-        }
+        evt->ret_code = cfg->block_connect ? -EPERM : 0;
         bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
-        if (path)
-            __builtin_memcpy(evt->path, path, LSM_PATH_LEN);
-        if (addr)
-            *(__be32 *)evt->addr = addr;
+        *(__be32 *)evt->addr = addr;
         evt->port = port;
         evt->family = family;
         bpf_ringbuf_submit(evt, 0);
@@ -238,42 +216,6 @@ lsm_report(struct lsm_config *cfg, struct lsm_rule *rule, __u32 hook,
  * subprogram returns a constant, verified independently. */
 static __noinline int deny_perm(void)   { return -EPERM; }
 static __noinline int lsm_allow(void)   { return 0; }
-
-SEC("lsm/bprm_check_security")
-int BPF_PROG(wafio_bprm_check_security, struct linux_binprm *bprm, int ret)
-{
-    /* If prior LSM module already denied, honor denial. The verifier needs a
-     * provable [-4095, 0] range for LSM program returns — an unchecked
-     * scalar arg makes R0 "unknown" at exit and the whole collection
-     * rejects. */
-    if (ret != 0) {
-        if (ret < -4095 || ret > 0)
-            return 0;
-        return ret;
-    }
-
-    struct lsm_config *cfg = lsm_gate();
-    if (!cfg)
-        return 0;
-
-    char path[LSM_PATH_LEN] = {};
-    const char *fn = BPF_CORE_READ(bprm, filename);
-    if (!fn)
-        return 0;
-
-    bpf_core_read_str(path, sizeof(path), fn);
-
-    /* Lookup path in blocklist */
-    struct lsm_rule *rule = bpf_map_lookup_elem(&wafio_lsm_blocklist, path);
-    if (!rule || !rule->enabled)
-        return 0;
-
-    __u32 action = lsm_report(cfg, rule, LSM_HOOK_EXEC, path, 0, 0, 0);
-
-    if (cfg->block_exec && action == TRACE_ACTION_BLOCK)
-        return deny_perm();
-    return lsm_allow();
-}
 
 /* The IPv4 peer a connect reaches. An AF_INET destination, or an
  * AF_INET6 one carrying an IPv4-mapped address (::ffff:a.b.c.d), which a
@@ -336,7 +278,7 @@ int BPF_PROG(wafio_socket_connect, struct socket *sock, struct sockaddr *address
     if (!rule || !rule->enabled)
         return 0;
 
-    __u32 action = lsm_report(cfg, rule, LSM_HOOK_CONNECT, 0, daddr,
+    __u32 action = lsm_report(cfg, rule, LSM_HOOK_CONNECT, daddr,
                               __builtin_bswap16(dport), family);
 
     if (cfg->block_connect && action == TRACE_ACTION_BLOCK)
@@ -411,7 +353,7 @@ int BPF_PROG(wafio_socket_sendmsg, struct socket *sock, struct msghdr *msg,
     if (!rule || !rule->enabled || !(rule->flags & LSM_RULE_SEND))
         return 0;
 
-    __u32 action = lsm_report(cfg, rule, LSM_HOOK_SENDMSG, 0, daddr,
+    __u32 action = lsm_report(cfg, rule, LSM_HOOK_SENDMSG, daddr,
                               __builtin_bswap16(dport), family);
 
     if (cfg->block_connect && action == TRACE_ACTION_BLOCK)

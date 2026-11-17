@@ -52,10 +52,9 @@ type LSMRule struct {
 // addressed sends to the IP too.
 const LSMRuleSend uint32 = 1 << 0
 
-// LSMConfig mirrors struct lsm_config in wafio_lsm.c (20 bytes).
+// LSMConfig mirrors struct lsm_config in wafio_lsm.c (16 bytes).
 type LSMConfig struct {
 	Enabled      uint32
-	BlockExec    uint32
 	BlockConnect uint32 // -EPERM on blocklisted socket_connect matches
 	AgentPID     uint32
 	Pad          uint32
@@ -63,7 +62,6 @@ type LSMConfig struct {
 
 // LSM hook IDs (must match LSM_HOOK_* in wafio_lsm.c).
 const (
-	LSMHookExec    uint32 = 0
 	LSMHookConnect uint32 = 2
 	LSMHookSendmsg uint32 = 3
 )
@@ -780,7 +778,7 @@ type TraceStatus struct {
 // ActionPriority returns the ordering used to pick the "best" matching policy
 // action when multiple policies fire on the same event: kill trumps block
 // trumps alert trumps simulate trumps monitor. Block acts only through the
-// BPF-LSM hooks before the event (exec and connect blocklists); from a
+// BPF-LSM hooks before the event (the IP blocklist); from a
 // traced event neither trace_enforce_map nor userspace can block, so a Block
 // match must never suppress a Kill that can still act (it used to rank first).
 // The raw uint32 constants cannot be used directly because ActionSimulate=3
