@@ -89,7 +89,7 @@ func init() {
 	// Control plane identity and the HTTP fallback transport.
 	rootCmd.Flags().StringVar(&cfg.ServerURL, "server-url", "", "WAFio control plane base URL (e.g. https://wafio.example.com) for the HTTP telemetry fallback; used only when the gRPC stream is not configured or cannot start, and needs --host-key")
 	rootCmd.Flags().StringVar(&cfg.HostKey, "host-key", "", "WAFio Host Key (wafh_...) issued in the web panel; identifies the host on the gRPC stream and in HTTP fallback pushes")
-	rootCmd.Flags().StringVar(&cfg.AgentAPIKey, "agent-api-key", "", "DEPRECATED: the control plane ignores it and accepts only --host-key; kept so old unit files still start, but with no host key and no gRPC stream the agent refuses to start")
+	rootCmd.Flags().StringVar(&cfg.AgentAPIKey, "agent-api-key", "", "DEPRECATED: the control plane ignores it and accepts only --host-key; kept so old unit files still start; with no host key and no gRPC stream the agent starts and logs a warning, and its pushes are refused")
 	rootCmd.Flags().StringVar(&cfg.AgentName, "agent-name", "", "friendly process name shown in the control plane (defaults to hostname)")
 
 	// GeoIP enrichment.

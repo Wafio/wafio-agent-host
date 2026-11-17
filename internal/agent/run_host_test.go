@@ -1,6 +1,12 @@
 package agent
 
-import "testing"
+import (
+	"bytes"
+	"log"
+	"os"
+	"strings"
+	"testing"
+)
 
 // The host agent no longer reads config.yaml: the GeoIP database comes from
 // the flag, then WAFIO_GEO_COUNTRY_DB_PATH, then the legacy WAFIO_GEOIP_DB_PATH.
@@ -23,10 +29,10 @@ func TestHostGeoIPPath(t *testing.T) {
 	}
 }
 
-// The retired agent API key is refused only when it is the sole credential of
-// the HTTP push. A host key or a complete gRPC setup lets the agent start, with
-// the key ignored.
-func TestCheckAgentAPIKey(t *testing.T) {
+// The retired agent API key never stops the agent. When it is the sole credential
+// of the HTTP push, the warning says how to fix that; otherwise the key is only
+// reported as ignored.
+func TestWarnAgentAPIKey(t *testing.T) {
 	base := func(edit func(*HostConfig)) HostConfig {
 		c := HostConfig{AgentAPIKey: "old", ServerURL: "http://cp"}
 		edit(&c)
@@ -35,20 +41,30 @@ func TestCheckAgentAPIKey(t *testing.T) {
 	grpc := func(c *HostConfig) {
 		c.GRPCServer, c.GRPCClientCert, c.GRPCClientKey, c.GRPCCACert = "cp:9090", "c", "k", "ca"
 	}
+	const sole, ignored = "only the retired agent API key is set", "is no longer used and is ignored"
 	for _, tc := range []struct {
-		name    string
-		cfg     HostConfig
-		wantErr bool
+		name string
+		cfg  HostConfig
+		want string // substring of the log; empty means no log
 	}{
-		{"no key", base(func(c *HostConfig) { c.AgentAPIKey = "" }), false},
-		{"key only, push to a server", base(func(*HostConfig) {}), true},
-		{"key and host key", base(func(c *HostConfig) { c.HostKey = "wafh_x" }), false},
-		{"key and gRPC", base(grpc), false},
-		{"key and gRPC without a CA file", base(func(c *HostConfig) { grpc(c); c.GRPCCACert = "" }), true},
-		{"key, no server to push to", base(func(c *HostConfig) { c.ServerURL = "" }), false},
+		{"no key", base(func(c *HostConfig) { c.AgentAPIKey = "" }), ""},
+		{"key only, push to a server", base(func(*HostConfig) {}), sole},
+		{"key and host key", base(func(c *HostConfig) { c.HostKey = "wafh_x" }), ignored},
+		{"key and gRPC", base(grpc), ignored},
+		{"key and gRPC without a CA file", base(func(c *HostConfig) { grpc(c); c.GRPCCACert = "" }), sole},
+		{"key, no server to push to", base(func(c *HostConfig) { c.ServerURL = "" }), ignored},
 	} {
-		if err := checkAgentAPIKey(tc.cfg); (err != nil) != tc.wantErr {
-			t.Errorf("%s: err = %v, want error %t", tc.name, err, tc.wantErr)
+		var buf bytes.Buffer
+		log.SetOutput(&buf)
+		warnAgentAPIKey(tc.cfg)
+		log.SetOutput(os.Stderr)
+		got := buf.String()
+		if tc.want == "" {
+			if got != "" {
+				t.Errorf("%s: logged %q, want nothing", tc.name, got)
+			}
+		} else if !strings.Contains(got, "WARNING") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: logged %q, want a WARNING with %q", tc.name, got, tc.want)
 		}
 	}
 }
