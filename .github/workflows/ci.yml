@@ -1,9 +1,11 @@
 name: ci
 
-# Small extra gate on pull requests. The full set of gates is scripts/ci-local.sh,
+# Small extra gate on pushes to main and on pull requests. The full set of gates is scripts/ci-local.sh,
 # run on Linux.
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -25,11 +27,5 @@ jobs:
           go-version: '1.26'
           cache: true
           cache-dependency-path: go.sum
-      - name: Read access to the shared module
-        env:
-          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
-        run: |
-          git config --global url."https://x-access-token:${GH_READ_TOKEN}@github.com/Wafio/".insteadOf "https://github.com/wafio/"
-          echo "GOPRIVATE=github.com/wafio/*" >> "$GITHUB_ENV"
       - run: go vet ./...
       - run: go test ./...

@@ -30,14 +30,12 @@ the firewall and trace policy model and a few helpers come from
   root or the capabilities listed under "Capabilities".
 - To build the BPF objects: `clang`, `llvm` and `libbpf-dev` on Linux, or Docker.
 - For the gates: `golangci-lint`, and `gitleaks` or Docker.
-- `go.mod` requires `github.com/wafio/wafio-cp-backend/shared v0.1.0`. Until
-  that tag is published, check out `wafio-cp-backend` next to this repo and use
-  an untracked workspace that replaces the module with that checkout (`go.work`
-  is in `.gitignore`):
+- `go.mod` requires `github.com/wafio/wafio-cp-backend/shared v0.1.0`, which `go`
+  fetches from the public wafio-cp-backend repository. To change `shared` and this
+  agent together, check out wafio-cp-backend next to this repo and use an untracked
+  workspace that replaces the module (`go.work` is in `.gitignore`):
   `go work init . && go work edit -replace github.com/wafio/wafio-cp-backend/shared=../wafio-cp-backend/shared`.
   A `use` line is not enough: Go still looks up the version `go.mod` names.
-  Once the tag exists, `go` fetches the module from the public wafio-cp-backend
-  repository and the workspace is not needed.
 
 ## Build
 

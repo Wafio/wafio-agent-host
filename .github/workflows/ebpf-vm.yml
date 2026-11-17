@@ -34,12 +34,6 @@ jobs:
           go-version: '1.26'
           cache: true
           cache-dependency-path: go.sum
-      - name: Read access to the shared module
-        env:
-          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
-        run: |
-          git config --global url."https://x-access-token:${GH_READ_TOKEN}@github.com/Wafio/".insteadOf "https://github.com/wafio/"
-          echo "GOPRIVATE=github.com/wafio/*" >> "$GITHUB_ENV"
       # The script pins -mcpu=v1, so the objects also load on kernels before 5.12.
       - name: Build BPF objects
         run: ./scripts/build-ebpf.sh
@@ -110,12 +104,6 @@ jobs:
           go-version: '1.26'
           cache: true
           cache-dependency-path: go.sum
-      - name: Read access to the shared module
-        env:
-          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
-        run: |
-          git config --global url."https://x-access-token:${GH_READ_TOKEN}@github.com/Wafio/".insteadOf "https://github.com/wafio/"
-          echo "GOPRIVATE=github.com/wafio/*" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ebpf-objects
