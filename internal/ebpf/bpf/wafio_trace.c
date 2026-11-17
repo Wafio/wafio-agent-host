@@ -241,14 +241,6 @@ protect_on_exit(void)
         bpf_map_delete_elem(&trace_protected_tgids, &tgid);
 }
 
-/* PID filter: ignore events from specific PIDs (used to filter agent itself) */
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key,   __u32);
-    __type(value, __u8);
-    __uint(max_entries, 256);
-} trace_pid_filter SEC(".maps");
-
 /* Per-event-type counters for statistics */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -415,9 +407,6 @@ static __always_inline int should_trace(__u32 event_type, __u32 severity)
         __u64 pid_tgid = bpf_get_current_pid_tgid();
         __u32 tgid = pid_tgid >> 32;
         if (tgid == cfg->agent_pid)
-            return 0;
-        /* Also check the hash map for additional filtered PIDs */
-        if (bpf_map_lookup_elem(&trace_pid_filter, &tgid))
             return 0;
     }
 
