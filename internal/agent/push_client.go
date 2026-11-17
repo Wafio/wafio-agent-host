@@ -24,12 +24,12 @@ import (
 // ──────────────────────────────────────────────────────────────────────────────
 //
 // Architecture:
-//   Agent (eBPF) → PushClient → HTTP POST /api/internal/ebpf/ingest → Server → PostgreSQL
+//   Agent (eBPF) → PushClient → HTTP POST /api/internal/host/ingest → Server → PostgreSQL
 //
 // The agent periodically collects metrics, events, connections, bandwidth, trace
 // events, stats, and enforcement log entries — then POSTs them as a single batch
-// to the server's ingestion endpoint. The server validates the agent API key
-// and stores data in PostgreSQL.
+// to the server's ingestion endpoint. The server checks the host key and
+// stores data in PostgreSQL.
 //
 // Push intervals:
 //   • metrics + events + trace + enforcement  → every 1s
@@ -40,11 +40,10 @@ type PushClient struct {
 	httpDroppedEvents atomic.Uint64
 	httpAccepted      atomic.Uint64
 	serverURL         string // e.g. "http://localhost:9087"
-	apiKey            string // LEGACY raw agent API key (X-Agent-Key path)
 	listenAddr        string // agent's own listen address (e.g. "0.0.0.0:9999")
-	// HostKey is the new bearer credential (wafh_*) issued by the UI per
-	// registered host; when set it is sent as `X-Wafio-Host-Key` and
-	// takes precedence over `apiKey`. Plumbed from Config.HostKey.
+	// HostKey is the bearer credential (wafh_*) issued by the UI per
+	// registered host; it is sent as `X-Wafio-Host-Key`. Plumbed from
+	// HostConfig.HostKey.
 	HostKey string
 	// AgentName labels this process on the server side when multiple
 	// agents of the same kind share a host (e.g. two WAF processes).
@@ -152,10 +151,9 @@ func (p *PushPayload) hasTraceForwardHits() bool {
 	return p.TraceForward != nil && len(p.TraceForward.RuleHits) > 0
 }
 
-func NewPushClient(serverURL, apiKey, listenAddr string, ebpfMgr *wafebpf.Manager, traceMgr *wafebpf.TraceManager) *PushClient {
+func NewPushClient(serverURL, listenAddr string, ebpfMgr *wafebpf.Manager, traceMgr *wafebpf.TraceManager) *PushClient {
 	pc := &PushClient{
 		serverURL:  serverURL,
-		apiKey:     apiKey,
 		listenAddr: listenAddr,
 		ebpfMgr:    ebpfMgr,
 		traceMgr:   traceMgr,
@@ -455,11 +453,6 @@ func (pc *PushClient) send(ctx context.Context, payload *PushPayload) {
 	req.Header.Set("Content-Type", "application/json")
 	if pc.HostKey != "" {
 		req.Header.Set("X-Wafio-Host-Key", pc.HostKey)
-	}
-	if pc.apiKey != "" {
-		// Still emit the legacy header when configured so control planes
-		// that have not yet been upgraded to host-key auth keep working.
-		req.Header.Set("X-Agent-Key", pc.apiKey)
 	}
 	if pc.AgentName != "" {
 		req.Header.Set("X-Wafio-Agent-Name", pc.AgentName)

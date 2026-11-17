@@ -311,7 +311,7 @@ func dialAndServeEBPFStream(ctx context.Context, cfg *ebpfGRPCStreamConfig) erro
 	// one. This client is never used for HTTP — it's only used to drive
 	// collectFast/collectMedium.
 	if pc == nil {
-		pc = NewPushClient("", "", "", eMgr, tMgr)
+		pc = NewPushClient("", "", eMgr, tMgr)
 	}
 	enrichmentCtx, enrichmentCancel := context.WithCancel(ctx)
 	defer enrichmentCancel()

@@ -45,29 +45,6 @@ func TestProtectedProcessFlags(t *testing.T) {
 	}
 }
 
-// The flags of the retired WAF pipeline and IP jail are still accepted, with
-// any value, and stay out of --help, so a unit that passes them keeps starting.
-func TestRetiredFlagsAreAcceptedAndHidden(t *testing.T) {
-	fs := rootCmd.Flags()
-	var args []string
-	for _, name := range retiredFlags {
-		args = append(args, "--"+name+"=1")
-	}
-	if err := fs.Parse(args); err != nil {
-		t.Fatalf("retired flags must still parse: %v", err)
-	}
-	for _, name := range retiredFlags {
-		f := fs.Lookup(name)
-		if f == nil || !f.Changed {
-			t.Errorf("--%s not declared or not set", name)
-			continue
-		}
-		if !f.Hidden || f.Deprecated == "" {
-			t.Errorf("--%s must be hidden and deprecated", name)
-		}
-	}
-}
-
 // The help names the transport the agent uses: gRPC with mutual TLS, with HTTP
 // push to --server-url only as the fallback. --agent-api-key stays declared so
 // an old unit file starts, and its help says the control plane ignores it.

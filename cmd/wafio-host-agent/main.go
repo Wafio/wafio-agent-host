@@ -27,14 +27,6 @@ import (
 
 var cfg = agent.DefaultHostConfig()
 
-// retiredFlags fed the in-process WAF pipeline and IP jail the host agent no
-// longer runs. They are accepted and ignored (hidden, deprecated) for one
-// release, so a unit or script that still passes them keeps starting.
-var retiredFlags = []string{
-	"jail-threshold", "jail-window-sec", "jail-duration-sec",
-	"project-id", "connect-timeout-ms", "rw-timeout-ms",
-}
-
 const (
 	flagProtectedProcesses       = "protected-processes"
 	flagProtectedExePaths        = "protected-exe-paths"
@@ -98,7 +90,7 @@ func init() {
 	// Control plane identity and the HTTP fallback transport.
 	rootCmd.Flags().StringVar(&cfg.ServerURL, "server-url", "", "WAFio control plane base URL (e.g. https://wafio.example.com) for the HTTP telemetry fallback; used only when the gRPC stream is not configured or cannot start, and needs --host-key")
 	rootCmd.Flags().StringVar(&cfg.HostKey, "host-key", "", "WAFio Host Key (wafh_...) issued in the web panel; identifies the host on the gRPC stream and in HTTP fallback pushes")
-	rootCmd.Flags().StringVar(&cfg.AgentAPIKey, "agent-api-key", "", "DEPRECATED: the control plane ignores it and accepts only --host-key; kept so old unit files still start")
+	rootCmd.Flags().StringVar(&cfg.AgentAPIKey, "agent-api-key", "", "DEPRECATED: the control plane ignores it and accepts only --host-key; kept so old unit files still start, but with no host key and no gRPC stream the agent refuses to start")
 	rootCmd.Flags().StringVar(&cfg.AgentName, "agent-name", "", "friendly process name shown in the control plane (defaults to hostname)")
 
 	// GeoIP enrichment.
@@ -110,14 +102,6 @@ func init() {
 	rootCmd.Flags().StringVar(&cfg.GRPCClientCert, "grpc-client-cert", "", "mTLS client cert PEM file (e.g. /etc/wafio/agent/client.crt)")
 	rootCmd.Flags().StringVar(&cfg.GRPCClientKey, "grpc-client-key", "", "mTLS client key PEM file  (e.g. /etc/wafio/agent/client.key)")
 	rootCmd.Flags().StringVar(&cfg.GRPCCACert, "grpc-ca-cert", "", "mTLS CA cert PEM file     (e.g. /etc/wafio/agent/ca.crt)")
-
-	// Retired flags: any value is accepted and ignored.
-	for _, name := range retiredFlags {
-		rootCmd.Flags().String(name, "", "")
-		if err := rootCmd.Flags().MarkDeprecated(name, "the host agent runs no WAF pipeline, so the flag has no effect and is removed in the next release"); err != nil {
-			panic(err) // cannot fail: the flag was declared on the line above
-		}
-	}
 }
 
 func run(cmd *cobra.Command, _ []string) error {

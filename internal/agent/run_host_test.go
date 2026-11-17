@@ -22,3 +22,33 @@ func TestHostGeoIPPath(t *testing.T) {
 		}
 	}
 }
+
+// The retired agent API key is refused only when it is the sole credential of
+// the HTTP push. A host key or a complete gRPC setup lets the agent start, with
+// the key ignored.
+func TestCheckAgentAPIKey(t *testing.T) {
+	base := func(edit func(*HostConfig)) HostConfig {
+		c := HostConfig{AgentAPIKey: "old", ServerURL: "http://cp"}
+		edit(&c)
+		return c
+	}
+	grpc := func(c *HostConfig) {
+		c.GRPCServer, c.GRPCClientCert, c.GRPCClientKey, c.GRPCCACert = "cp:9090", "c", "k", "ca"
+	}
+	for _, tc := range []struct {
+		name    string
+		cfg     HostConfig
+		wantErr bool
+	}{
+		{"no key", base(func(c *HostConfig) { c.AgentAPIKey = "" }), false},
+		{"key only, push to a server", base(func(*HostConfig) {}), true},
+		{"key and host key", base(func(c *HostConfig) { c.HostKey = "wafh_x" }), false},
+		{"key and gRPC", base(grpc), false},
+		{"key and gRPC without a CA file", base(func(c *HostConfig) { grpc(c); c.GRPCCACert = "" }), true},
+		{"key, no server to push to", base(func(c *HostConfig) { c.ServerURL = "" }), false},
+	} {
+		if err := checkAgentAPIKey(tc.cfg); (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, want error %t", tc.name, err, tc.wantErr)
+		}
+	}
+}
