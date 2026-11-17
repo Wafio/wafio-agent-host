@@ -1,0 +1,29 @@
+# Blocking lint set: it passes on the current tree with 0 issues, so a red run
+# means a new problem. Run it with:
+#   golangci-lint run ./...
+version: "2"
+
+run:
+  timeout: 5m
+
+formatters:
+  enable:
+    - gofmt
+
+linters:
+  default: none
+  enable:
+    - bodyclose  # a leaked response body is a real leak
+    - depguard   # package layering, rules below
+    - govet
+    - ineffassign
+
+  settings:
+    depguard:
+      rules:
+        ebpf-below-agent:
+          files:
+            - "**/internal/ebpf/**"
+          deny:
+            - pkg: "github.com/wafio/wafio-agent-host/internal/agent"
+              desc: "internal/ebpf is the lower layer: the agent imports it, never the reverse"

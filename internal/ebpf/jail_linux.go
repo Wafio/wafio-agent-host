@@ -1,0 +1,96 @@
+//go:build linux
+
+package ebpf
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sort"
+	"time"
+
+	"github.com/cilium/ebpf"
+)
+
+// The jail: addresses the WAF agent jails after repeated L7 blocks
+// live in wafio_jail, apart from the operator lists. A push
+// replaces the operator lists only (ReplaceIPLists), and the rollback
+// snapshot leaves the jail out, so a jailed address stays jailed for its
+// TTL; the dashboard reads the jail from the host status (Status.Jail).
+
+// ErrJailUnavailable: the attached XDP object has no wafio_jail.
+var ErrJailUnavailable = errors.New("the attached XDP object has no jail map; update the eBPF objects with the agent")
+
+// statusJailEntries bounds the jail entries carried in Status (the status
+// payload goes to the control plane every few seconds).
+const statusJailEntries = 100
+
+// AddToJail jails one address for ttl (> 0). Prefixes and ranges are
+// refused: the jail holds the sources the WAF agent saw, one by one.
+func (m *Manager) AddToJail(ipStr string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("a jail entry needs a TTL")
+	}
+	a, err := netip.ParseAddr(ipStr)
+	if err != nil || a.Zone() != "" {
+		return fmt.Errorf("%w: the jail takes single addresses, not %q", ErrInvalidIPEntry, clip(ipStr))
+	}
+	a = a.Unmap()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.jailMap == nil {
+		return ErrJailUnavailable
+	}
+	key := IPKeyFromIP(net.IP(a.AsSlice()))
+	now := m.ktimeNow()
+	val := IPListVal{AddedNs: now, ExpiresNs: now + durationNs(ttl), RuleType: 1}
+	var old IPListVal
+	if err := m.jailMap.Lookup(key, &old); err == nil {
+		val.HitCount = old.HitCount
+	}
+	return m.jailMap.Update(key, &val, ebpf.UpdateAny)
+}
+
+// ListJail returns up to limit live jail entries (latest expiry first) and
+// how many are live in all.
+func (m *Manager) ListJail(limit int) ([]BlocklistEntry, int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.listJailLocked(limit)
+}
+
+func (m *Manager) listJailLocked(limit int) ([]BlocklistEntry, int, error) {
+	if m.jailMap == nil {
+		return nil, 0, ErrJailUnavailable
+	}
+	now := m.ktimeNow()
+	var out []BlocklistEntry
+	total := 0
+	var key IPKey
+	var val IPListVal
+	iter := m.jailMap.Iterate()
+	for iter.Next(&key, &val) {
+		if val.ExpiresNs != 0 && val.ExpiresNs <= now {
+			continue
+		}
+		total++
+		e := BlocklistEntry{IP: key.ToIP().String(), AddedAt: m.bpfTimeToWall(val.AddedNs), HitCount: val.HitCount}
+		if val.ExpiresNs != 0 {
+			t := m.bpfTimeToWall(val.ExpiresNs)
+			e.ExpiresAt = &t
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].ExpiresAt, out[j].ExpiresAt
+		if a == nil || b == nil {
+			return a == nil && b != nil
+		}
+		return a.After(*b)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, total, iter.Err()
+}

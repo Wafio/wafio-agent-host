@@ -1,0 +1,14 @@
+# gitleaks configuration (scripts/ci-local.sh runs it with this file).
+# Extends the default rule set. Test files carry dummy tokens on purpose; any
+# other secret fails the run.
+
+title = "wafio-agent-host"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Go tests carry dummy tokens"
+paths = [
+  '''_test\.go$''',
+]

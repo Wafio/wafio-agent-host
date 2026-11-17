@@ -1,0 +1,227 @@
+name: ebpf-vm
+
+# Loads the BPF objects into real kernels (little-vm-helper VMs) so the kernel
+# verifier accepts or rejects them, then runs the packet tests and the firewall
+# lockout and Kill scenarios of internal/ebpf/integration. Dispatch only: run it
+# before a release and after a change under internal/ebpf.
+#   gh workflow run ebpf-vm.yml -f all_kernels=true
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_kernels:
+        description: Run all four kernels (5.10, 5.15, 6.1, 6.12), not only 5.10 and 6.12
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-objects:
+    name: build BPF objects and kernel matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Read access to the shared module
+        env:
+          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${GH_READ_TOKEN}@github.com/Wafio/".insteadOf "https://github.com/wafio/"
+          echo "GOPRIVATE=github.com/wafio/*" >> "$GITHUB_ENV"
+      # The script pins -mcpu=v1, so the objects also load on kernels before 5.12.
+      - name: Build BPF objects
+        run: ./scripts/build-ebpf.sh
+      - name: Check every object was produced
+        run: |
+          for o in wafio_xdp.o wafio_tc.o wafio_trace.o wafio_lsm.o; do
+            test -s "build/ebpf/$o" || { echo "missing build/ebpf/$o"; exit 1; }
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ebpf-objects
+          path: build/ebpf/
+          retention-days: 7
+      - name: Select kernels
+        id: m
+        env:
+          ALL: ${{ inputs.all_kernels }}
+        run: |
+          # image-version must be a dated tag (<kernel>-<YYYYMMDD.HHMMSS>): the
+          # action derives the image file name by stripping the date suffix, and
+          # `lvh images pull` names the file after the kernel alone
+          # (complexity-test_5.10.qcow2). A `-main` tag is not stripped, so the
+          # VM start looked for complexity-test_5.10-main.qcow2 and failed with
+          # "unable to pull image ... invalid reference format". Refresh the
+          # dates from quay.io/lvh-images/complexity-test when bumping.
+          v=20260928.013030
+          if [ "$ALL" = true ]; then kernels='5.10 5.15 6.1 6.12'; else kernels='5.10 6.12'; fi
+          json='['
+          for k in $kernels; do
+            json="$json{\"kernel\":\"$k\",\"image-version\":\"$k-$v\"},"
+          done
+          echo "matrix=${json%,}]" >> "$GITHUB_OUTPUT"
+
+  # Not yet validated on a GitHub runner, so it runs with continue-on-error. It
+  # boots each kernel in a little-vm-helper VM and loads the objects from
+  # build-objects, so the in-kernel verifier accepts or rejects them
+  # (TestBPFObjectsPassVerifier), then runs the BPF_PROG_TEST_RUN packet tests
+  # and the fork tracepoint ABI test, and finally the firewall lockout and Kill
+  # scenarios of internal/ebpf/integration (an established SSH session and a
+  # long-lived connection must survive ingress and egress Deny All, a policy
+  # push and an agent restart; a narrowed Kill hits only its fixture). 5.10 is
+  # the oldest supported kernel; 5.15 and 6.1 add the legacy-TC kernels between
+  # it and the TCX kernels (6.6 and later, here 6.12). Once green for a few
+  # runs: pin the action by SHA, confirm the image tags, and drop
+  # continue-on-error. Manual run on a Linux box as root instead:
+  #   ./scripts/build-ebpf.sh
+  #   WAFIO_TEST_BPF_DIR=build/ebpf WAFIO_TRACE_FORK_TEST_OBJECT=build/ebpf/wafio_trace.o \
+  #     go test -count=1 -v -run 'TestBPFObjectsPassVerifier|TestKernel|TestForkTracepointKernelABI' ./internal/ebpf/
+  # The lockout scenarios change the firewall of the machine they run on and
+  # need the peer (see internal/ebpf/integration/README.md); run them only in
+  # a disposable VM.
+  ebpf-verifier-vm:
+    name: eBPF verifier in VM (experimental, ${{ matrix.kernel }})
+    needs: build-objects
+    runs-on: ubuntu-latest
+    # Keep until this job has passed once on a runner.
+    continue-on-error: true
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # Default 5.10 + 6.12; all four with all_kernels.
+        include: ${{ fromJSON(needs.build-objects.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Read access to the shared module
+        env:
+          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${GH_READ_TOKEN}@github.com/Wafio/".insteadOf "https://github.com/wafio/"
+          echo "GOPRIVATE=github.com/wafio/*" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ebpf-objects
+          path: build/
+      - name: Build the kernel test binary and VM script
+        run: |
+          CGO_ENABLED=0 go test -c -o build/ebpf-kernel.test ./internal/ebpf/
+          # Firewall lockout and Kill scenarios (internal/ebpf/integration,
+          # opt-in through WAFIO_EBPF_VM_SCENARIOS): the same binary also
+          # serves as the runner-side peer (TestVMPeerServer).
+          CGO_ENABLED=0 go test -c -o build/ebpf-vm-scenarios.test ./internal/ebpf/integration
+          # The action pastes `cmd` into an unquoted ssh heredoc, so any `$` in
+          # it would expand on the runner; keep the logic in a script instead.
+          cat > build/vm-test.sh <<'SH'
+          set -e
+          uname -r
+          # Every scenario opens sockets, BPF maps and objects: the default 1024
+          # ran out across scenarios ("too many open files" loading the object).
+          ulimit -n 65536
+          cd /host
+          # /host is a 9p mount served by the QEMU process on the runner, whose
+          # own descriptor limit the slirp port-forward connections share: read
+          # the BPF objects from the VM's disk, never over 9p, once traffic runs.
+          rm -rf /tmp/wafio-bpf && mkdir -p /tmp/wafio-bpf
+          cp -r /host/build/ebpf /tmp/wafio-bpf/
+          WAFIO_TEST_BPF_DIR=/tmp/wafio-bpf/ebpf ./build/ebpf-kernel.test -test.count=1 -test.v -test.run '^TestBPFObjectsPassVerifier$'
+          WAFIO_TEST_BPF_DIR=/tmp/wafio-bpf/ebpf WAFIO_TRACE_FORK_TEST_OBJECT=/tmp/wafio-bpf/ebpf/wafio_trace.o \
+            ./build/ebpf-kernel.test -test.count=1 -test.v -test.run 'TestKernel|TestForkTracepointKernelABI'
+          # Lockout and Kill scenarios. They run over this SSH session: if one
+          # cuts it, the job fails, which is the signal (the runner-side
+          # ssh gives up within ~30 s, see the ServerAlive step below).
+          set -o pipefail
+          mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
+          IF=$(ip -o route show default | awk '{print $5; exit}')
+          # Kernels below 6.6 attach TC through a netlink filter that outlives
+          # a crashed test; XDP and TCX links go away with the process.
+          # The trap keeps the script's own exit status: under `set -e` a failing
+          # cleanup command (`tc qdisc del` exits 2 where TCX left no clsact,
+          # kernels >= 6.6) would end the trap with that status and turn a green
+          # run into exit 2. Cleanup failures are ignored, the test result is not.
+          trap 'rc=$?; set +e; tc qdisc del dev "$IF" clsact 2>/dev/null; ip link set dev "$IF" xdpgeneric off 2>/dev/null; rm -rf /sys/fs/bpf/wafio-vmtest-*; exit $rc' EXIT
+          rm -f /host/build/vm-warnings.log
+          WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_TEST_BPF_DIR=/tmp/wafio-bpf/ebpf WAFIO_VM_WARN_FILE=/host/build/vm-warnings.log \
+            ./build/ebpf-vm-scenarios.test -test.count=1 -test.v -test.timeout=8m -test.run '^TestVMScenario' 2>&1 | tee /host/build/vm-scenarios.log
+          echo 'vm-scenarios: complete'
+          SH
+      - name: Start the scenario peer and make ssh fail fast
+        run: |
+          # If a scenario cuts the SSH session, the action's own ssh exits 255
+          # within ~30 s instead of hanging until the job timeout.
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf 'Host localhost\n  ServerAliveInterval 5\n  ServerAliveCountMax 6\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          # Peer on the runner: the VM reaches 127.0.0.1 here through the QEMU
+          # gateway (usually 10.0.2.2). Ports 7000/7001 tcp and 53 udp.
+          sudo env WAFIO_VM_PEER_SERVE=1 nohup ./build/ebpf-vm-scenarios.test \
+            -test.run '^TestVMPeerServer$' -test.timeout=0 > build/vm-peer.log 2>&1 &
+          echo $! > build/vm-peer.pid
+          for _ in $(seq 100); do
+            if (exec 3<>/dev/tcp/127.0.0.1/7000) 2>/dev/null; then ready=1; break; fi
+            sleep 0.1
+          done
+          [ "${ready:-0}" = 1 ] || { cat build/vm-peer.log; echo 'peer did not come up'; exit 1; }
+      - name: Raise the QEMU descriptor limit once the VM starts
+        run: |
+          # Every slirp port-forward connection and every 9p file is a
+          # descriptor in the QEMU process, whose limit is the runner default
+          # (1024). The lvh action starts QEMU inside one opaque step, so a
+          # bounded background watcher raises the limit as soon as it exists.
+          # pgrep -x matches the exact process name (no self-match).
+          cat > build/raise-qemu-nofile.sh <<'RAISE'
+          for _ in $(seq 3000); do
+            pid=$(pgrep -x qemu-system-x86_64 | head -1 || true)
+            if [ -n "$pid" ]; then
+              sudo prlimit --pid "$pid" --nofile=65536:65536 && echo "qemu pid $pid: nofile raised" || echo "prlimit failed for $pid"
+              prlimit --pid "$pid" --nofile
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo 'no qemu-system-x86_64 within 10 minutes'
+          RAISE
+          nohup bash build/raise-qemu-nofile.sh > build/raise-qemu-nofile.log 2>&1 &
+      - name: Load the objects in kernel ${{ matrix.kernel }}
+        # v0.0.31: its install step tolerates a missing /var/lib/man-db/auto-update
+        # (v0.0.26 failed on current ubuntu-latest).
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          test-name: wafio-bpf-${{ matrix.kernel }}
+          image: complexity-test
+          image-version: ${{ matrix.image-version }}
+          install-dependencies: 'true'   # QEMU/KVM tools are not on ubuntu-latest
+          host-mount: ./
+          # 7002: the VM listener the peer probes for the ingress scenario.
+          port-forward: '7002:7002'
+          cmd: bash /host/build/vm-test.sh
+      - name: Scenario logs
+        if: always()
+        run: |
+          if [ -s build/vm-warnings.log ]; then
+            {
+              echo "### VM scenario warnings (kernel ${{ matrix.kernel }})"
+              sed 's/^/- /' build/vm-warnings.log
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          tail -n 300 build/vm-scenarios.log build/vm-peer.log build/raise-qemu-nofile.log || true
+          # SIGTERM to sudo is relayed to the peer; no pattern kill (it would
+          # match this very command line).
+          sudo kill "$(cat build/vm-peer.pid)" || true

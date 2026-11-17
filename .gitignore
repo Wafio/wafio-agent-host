@@ -1,0 +1,26 @@
+# Build output
+/build/
+/dist/
+/wafio-host-agent
+*.test
+*.o
+
+# Local files that must never be committed
+.env
+.env.*
+*.pem
+*.key
+!**/ca.crt
+*.log
+*.sbom.json
+*.bak-*
+nohup.out
+
+# Local cross-repo workspace
+go.work
+go.work.sum
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/

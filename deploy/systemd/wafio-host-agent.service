@@ -1,0 +1,87 @@
+# systemd unit for wafio-host-agent, one per host. It ships inside the host
+# agent bundle as systemd/wafio-host-agent.service (deploy/BUNDLE.md of wafio-release).
+#
+# Provides:
+#   - eBPF XDP/TC kernel firewall (L3/L4 packet filtering)
+#   - Runtime security tracing (eBPF tracepoints: exec, file, network, privilege)
+#
+# Settings come from /etc/wafio/host-agent.env (see host-agent.env.example). The
+# agent reads WAFIO_HOST_KEY, WAFIO_AGENT_NAME, WAFIO_SERVER_URL and the
+# WAFIO_GRPC_* values from its environment, so the host key never appears on the
+# command line (readable by every local user through /proc/<pid>/cmdline).
+# WAFIO_PROTECTED_PROCESSES, WAFIO_PROTECTED_EXE_PATHS,
+# WAFIO_PROTECTED_REPLACE_DEFAULTS, WAFIO_LOCAL_API_TOKEN_FILE and
+# WAFIO_LOCAL_API_TOKEN_GROUP are read the same way.
+#
+# systemd expands ${VAR} only in Exec*= lines. BindReadOnlyPaths= and
+# ReadWritePaths= below name the default paths; a host that keeps its files
+# elsewhere needs a drop-in (systemctl edit wafio-host-agent).
+#
+# The system group wafio must exist (groupadd --system wafio): systemd refuses
+# to start a unit that names a missing group.
+#
+# This agent runs as root. It needs CAP_BPF, CAP_NET_ADMIN and CAP_SYS_ADMIN to
+# attach XDP/TC programs and CAP_KILL for process enforcement.
+[Unit]
+Description=WAFio Host Agent (eBPF Firewall + Runtime Security)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# Member of wafio so the local API token can be made group-readable.
+# Root holds no CAP_CHOWN here, so it can only hand the file to a group it is
+# in. Set WAFIO_LOCAL_API_TOKEN_GROUP=wafio in the env file to use it.
+SupplementaryGroups=wafio
+EnvironmentFile=-/etc/wafio/host-agent.env
+ExecStart=/usr/local/bin/wafio-host-agent \
+  --interface         ${WAFIO_INTERFACE} \
+  --ebpf=true \
+  --xdp-obj           ${WAFIO_EBPF_XDP_OBJ} \
+  --tc-obj            ${WAFIO_EBPF_TC_OBJ} \
+  --geoip-db          ${WAFIO_GEOIP_DB} \
+  --trace=true \
+  --trace-obj         ${WAFIO_TRACE_OBJ}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wafio-host-agent
+# BPF/perf attachment, network hooks, memlock and cross-UID enforcement.
+# CAP_KILL is needed for cross-UID SIGKILL; CAP_SYS_RESOURCE supports memlock setup.
+# CAP_SYS_PTRACE lets the protected-process check read /proc/<pid>/exe, ns/mnt,
+# root and environ of root daemons (sshd, systemd, dockerd...), which hold more
+# capabilities than this set: without it the kernel refuses those reads and
+# nothing but pid 1 and the agent is protected from Kill policies (the startup
+# self-check then reports proc_access=denied).
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_PERFMON CAP_KILL CAP_SYS_RESOURCE CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_PERFMON CAP_KILL CAP_SYS_RESOURCE CAP_SYS_PTRACE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Keep the default certificate files readable even if a path below /etc/wafio is
+# a link into a home directory. A missing file is ignored (the "-").
+BindReadOnlyPaths=-/etc/wafio/certs/host/client.crt -/etc/wafio/certs/host/client.key -/etc/wafio/certs/host/ca.crt
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Local API token, regenerated each start: /run/wafio/host-agent.token (0600).
+# Every call to 127.0.0.1:18089 except /healthz needs
+#   Authorization: Bearer $(sudo cat /run/wafio/host-agent.token)
+RuntimeDirectory=wafio
+RuntimeDirectoryMode=0755
+# Keep /run/wafio across stops: other wafio units may keep files there.
+RuntimeDirectoryPreserve=yes
+# Last good firewall policy, re-applied at start so a restart or a refused
+# bundle never leaves the host without its firewall:
+# /var/lib/wafio-host-agent/firewall-last-good.json (0600). Its own directory:
+# /var/lib/wafio belongs to the control plane on single-host installs.
+StateDirectory=wafio-host-agent
+StateDirectoryMode=0700
+# /var/log/wafio, created and writable (journald stays the main log).
+LogsDirectory=wafio
+ReadWritePaths=/sys/fs/bpf -/etc/wafio/ebpf
+
+[Install]
+WantedBy=multi-user.target
