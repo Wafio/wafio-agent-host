@@ -2,7 +2,7 @@
 
 `TestTraceObserveAndSimulate` is opt-in and uses a fresh unpinned BPF collection. It attaches tracing probes temporarily, observes its own inert file/TCP operations, verifies simulate (not kill), the syscall-exit ABI, and deletion of the last policy. Cleanup closes only its own links/maps. Other host activity is discarded by the test and never printed.
 
-Build on macOS without Docker, then execute on an authorized Linux lab:
+Build the test binary, then run it on an authorized Linux lab:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o build/ebpf-integration-linux.test ./internal/ebpf/integration
@@ -21,9 +21,6 @@ namespace default route is added. It attaches generic XDP and both TCX hooks,
 then verifies real ICMP allow, source-IP block, monitor pass, and remove-block
 pass. Cleanup detaches its own links and removes only those new resources.
 This verifies a veth/generic-XDP path, not driver offload or customer interfaces.
-
-Recorded lab result: Linux6.8.0-111 amd64, 2026-09-11: PASS (4.10s), all three
-hooks attached; private interface wlh2388223 and namespace/pins removed.
 
 ### Open results
 
@@ -66,9 +63,8 @@ unique private filename. Only its own child reads that file repeatedly. The
 complex filename predicate uses deferred exact-process identity enforcement;
 parent observation is excluded. It verifies the child actually exits through
 SIGKILL before its timeout and the outcome log reports helper acceptance.
-No running host-agent policy is changed. Linux6.8 amd64 result2026-09-11:
-PASS1.26s after fixing outcome loss when the initial log had already drained.
-A separate negative identity test rejects mismatched process start identity.
+No running host-agent policy is changed. A separate negative identity test
+rejects mismatched process start identity.
 
 ### VM scenarios (CI)
 

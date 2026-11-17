@@ -17,7 +17,7 @@ gRPC with mutual TLS. It does no HTTP inspection: that is the WAF agent.
 | wafio-portal | wafio.cloud site and blog (SvelteKit), portal API (Go) (private) |
 | uddin-lang-rs | Rust uddin interpreter |
 | wafio-release | installers, release bundle layout, release and publish scripts (private) |
-| wafio-docs | skills, role agents, specs, findings, plans, ops notes (private) |
+| wafio-docs | internal notes (private) |
 
 The agent protocol (`shared/proto/agent/v1` and the generated `shared/agentpb`),
 the firewall and trace policy model and a few helpers come from
@@ -149,7 +149,7 @@ host at run time. The first start after an upgrade needs the new objects in
 ## Release
 
 ```sh
-scripts/build-dist.sh v1.11.0
+scripts/build-dist.sh v2.0.0
 ```
 
 It builds the objects, builds the binary with `go build -trimpath` and writes
@@ -177,7 +177,7 @@ internal/ebpf/integration/  Linux integration fixtures and VM scenarios
 deploy/systemd/           unit and env example, shipped inside the bundle
 docs/lab.md               Linux lab and test levels
 scripts/                  ci-local.sh, build-ebpf.sh, build-dist.sh, gen-notices.sh
-.github/workflows/        ci.yml (pull requests), ebpf-vm.yml (manual)
+.github/workflows/        ci.yml (pushes to main and pull requests), ebpf-vm.yml (manual)
 ```
 
 ## License

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build what a release takes from this repository: the host agent, its eBPF objects and what ships with them.
 #
-#   scripts/build-dist.sh v1.11.0
+#   scripts/build-dist.sh v2.0.0
 #
 # Output, in dist/host-agent/:
 #   wafio-host-agent                    the agent, linux/amd64, static
@@ -19,7 +19,7 @@ set -euo pipefail
 
 version=${1:?usage: scripts/build-dist.sh vX.Y.Z}
 [ $# -eq 1 ] || { echo "usage: scripts/build-dist.sh vX.Y.Z" >&2; exit 2; }
-[[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || { echo "version must look like v1.11.0" >&2; exit 2; }
+[[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || { echo "version must look like v2.0.0" >&2; exit 2; }
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out=$root/dist/host-agent

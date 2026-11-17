@@ -66,7 +66,7 @@ func bpfSourceDefines(t *testing.T, file string, prefixes ...string) string {
 // get the BPF annotations right on its own. glibc's <sys/cdefs.h> defines
 // __always_inline, and a harness that redefined it after including libc
 // headers failed with -Werror ("__always_inline" redefined) on Linux while
-// passing on macOS (CI rounds 2 and 3). Here the libc headers come first and
+// passing on macOS. Here the libc headers come first and
 // the annotations are then replaced; a harness that still defines them the
 // same way (empty) is an identical, silent redefinition.
 const nativeCPrelude = `#include <stdint.h>
