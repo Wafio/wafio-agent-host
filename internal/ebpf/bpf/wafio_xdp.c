@@ -1350,8 +1350,7 @@ conntrack_reply_proof_ool(struct xdp_md *ctx, struct ip_key *src, struct ip_key 
     __be16 dport = (__be16)ports;
     __u8 proto = meta & 0xff;
     __u8 tcp_flags = (meta >> 8) & 0xff;
-    if (proto != IPPROTO_TCP || sport == 0 || dport == 0 ||
-        !(tcp_flags & 0x10) || (tcp_flags & 0x06))
+    if (sport == 0 || dport == 0)
         return 0;
     __u32 zero = 0;
     struct xdp_ct_scratch *b = bpf_map_lookup_elem(&wafio_xdp_ct_buf, &zero);
@@ -1387,10 +1386,19 @@ conntrack_reply_proof_ool(struct xdp_md *ctx, struct ip_key *src, struct ip_key 
     return 1;
 }
 
+/* reply_candidate: a packet conntrack_reply_proof can prove, a TCP ACK
+ * without SYN or RST. The callers test it before anything that costs a
+ * lookup: most drops (SYN probes, UDP, ICMP) stop here. */
+static __always_inline int
+reply_candidate(__u8 proto, __u8 tcp_flags) {
+    return proto == IPPROTO_TCP && (tcp_flags & 0x10) && !(tcp_flags & 0x06);
+}
+
 static __always_inline int
 conntrack_reply_proof(struct xdp_md *ctx, struct ip_key *src_key, struct ip_key *dst_key,
                       __be16 sport, __be16 dport, __u8 proto, __u8 tcp_flags) {
-    return conntrack_reply_proof_ool(ctx, src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
+    return reply_candidate(proto, tcp_flags) &&
+           conntrack_reply_proof_ool(ctx, src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
                                      (__u32)proto | (__u32)tcp_flags << 8);
 }
 
@@ -1703,6 +1711,7 @@ xdp_l4_stage(struct xdp_md *ctx) {
         /* The default deny (no rule for the port) spares replies: one that
          * lost its conntrack entry passes on socket proof. */
         if (action == ACTION_DROP && !a->is_reply && cfg->enable_conntrack &&
+            reply_candidate(a->proto, a->tcp_flags) &&
             !match_port_rule(dport_host, a->proto, PORT_DIR_INGRESS, a->now_ns) &&
             conntrack_reply_proof(ctx, &a->src, &a->dst, a->sport, a->dport, a->proto, a->tcp_flags)) {
             a->is_reply = 1;
@@ -1866,7 +1875,8 @@ process_ipv4(struct xdp_md *ctx, void *data, void *data_end,
     /* A port-scoped allowlist entry passes only TCP/UDP to its ports; the
      * rest of the source's traffic continues below. */
     action = check_ip_lists(&src_key, now_ns, is_reply, iph->protocol, dport);
-    if (action == ACTION_DROP && !is_reply && cfg->enable_conntrack) {
+    if (action == ACTION_DROP && !is_reply && cfg->enable_conntrack &&
+        reply_candidate(iph->protocol, tcp_flags)) {
         /* The family-wide block spares replies: one that lost its
          * conntrack entry passes on socket proof. */
         int as_reply = check_ip_lists(&src_key, now_ns, 1, iph->protocol, dport);
@@ -2070,7 +2080,8 @@ process_ipv6(struct xdp_md *ctx, void *data, void *data_end,
 
     /* ── 1. Allowlist / Blocklist (scoped entries: see IPv4) ─────────── */
     action = check_ip_lists(&src_key, now_ns, is_reply, headers->proto, dport);
-    if (action == ACTION_DROP && !is_reply && cfg->enable_conntrack) { /* as IPv4 */
+    if (action == ACTION_DROP && !is_reply && cfg->enable_conntrack && /* as IPv4 */
+        reply_candidate(headers->proto, tcp_flags)) {
         int as_reply = check_ip_lists(&src_key, now_ns, 1, headers->proto, dport);
         if (as_reply != ACTION_DROP &&
             conntrack_reply_proof(ctx, &src_key, &dst_key, sport, dport, headers->proto, tcp_flags)) {
