@@ -543,9 +543,16 @@ func publicLoopback(t *testing.T, network, addr string) loopbackConn {
 		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	c, err := net.Dial(network, l.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
+	// Linux 5.10 and 5.15 make a new IPv6 address on lo usable for a connect
+	// a moment after adding it: a dial before that fails with "network is
+	// unreachable".
+	var c net.Conn
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if c, err = net.Dial(network, l.Addr().String()); err == nil {
+			break
+		} else if !errors.Is(err, unix.ENETUNREACH) || time.Now().After(deadline) {
+			t.Fatalf("dial: %v", err)
+		}
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return loopbackConn{host: addr, srvPort: uint16(l.Addr().(*net.TCPAddr).Port), cliPort: uint16(c.LocalAddr().(*net.TCPAddr).Port)}
