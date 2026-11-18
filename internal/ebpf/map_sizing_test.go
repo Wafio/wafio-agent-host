@@ -191,6 +191,9 @@ func TestMemoryBasis(t *testing.T) {
 		{"no meminfo", "", unit, nil, 0, "", true},
 		{"no MemTotal line", "MemFree: 1 kB\n", unit, nil, 0, "", true},
 		{"MemTotal in a unit other than kB", "MemTotal: 2009700 MB\n", unit, nil, 0, "", true},
+		{"MemTotal of zero", "MemTotal: 0 kB\n", unit, nil, 0, "", true},
+		{"a memory.max of zero is ignored", meminfo2G, unit, map[string]string{
+			"system.slice/wafio-host-agent.service": "0\n"}, total, "meminfo", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := fakeRoot(t, tc.meminfo, tc.cgroup, tc.memoryMax)

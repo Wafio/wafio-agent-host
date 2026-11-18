@@ -183,7 +183,9 @@ func MemoryBasis(root string) (bytes uint64, source string, err error) {
 	for p := filepath.Clean("/" + path); ; p = filepath.Dir(p) {
 		raw, err := os.ReadFile(filepath.Join(root, "sys/fs/cgroup", p, "memory.max"))
 		if err == nil {
-			if limit, perr := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64); perr == nil && limit < bytes {
+			// A limit of 0 is no memory size (nothing could run under it):
+			// it would read as scale 0, which means the ceilings.
+			if limit, perr := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64); perr == nil && limit > 0 && limit < bytes {
 				bytes, source = limit, memorySourceCgroup
 			}
 		}
@@ -206,7 +208,7 @@ func parseMemTotal(meminfo string) (uint64, bool) {
 			return 0, false
 		}
 		kb, err := strconv.ParseUint(f[0], 10, 64)
-		if err != nil || kb > math.MaxUint64/1024 {
+		if err != nil || kb == 0 || kb > math.MaxUint64/1024 {
 			return 0, false
 		}
 		return kb * 1024, true
