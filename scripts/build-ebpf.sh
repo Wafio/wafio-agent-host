@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the four CO-RE eBPF objects (wafio_xdp.o, wafio_tc.o, wafio_trace.o,
-# wafio_lsm.o) into build/ebpf. One set loads on every kernel from 5.10 with BTF.
+# Build the three CO-RE eBPF objects (wafio_xdp.o, wafio_tc.o, wafio_trace.o)
+# into build/ebpf. One set loads on every kernel from 5.10 with BTF.
 #
 #   scripts/build-ebpf.sh
 #   BPF_OUT_DIR=build/ebpf-x scripts/build-ebpf.sh      other output directory
@@ -29,7 +29,7 @@ case $out in
 esac
 mkdir -p "$root/$out"
 
-compile='for o in xdp tc trace lsm; do clang $CFLAGS -c "$SRC/wafio_$o.c" -o "$OUT/wafio_$o.o"; done'
+compile='for o in xdp tc trace; do clang $CFLAGS -c "$SRC/wafio_$o.c" -o "$OUT/wafio_$o.o"; done'
 flags="-O2 -g -target bpf -mcpu=v1 -D__TARGET_ARCH_x86_64"
 
 if [ "$(uname -s)" = Linux ] && [ -z "${BPF_DOCKER:-}" ] && command -v clang >/dev/null && [ -f /usr/include/bpf/bpf_helpers.h ]; then

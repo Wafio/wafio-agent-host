@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -123,5 +124,32 @@ func TestInvalidMapScaleStopsTheStart(t *testing.T) {
 	want := `invalid --ebpf-map-scale "1.5" (or WAFIO_EBPF_MAP_SCALE): want auto or a number above 0 and at most 1`
 	if err == nil || err.Error() != want {
 		t.Fatalf("run returned %v, want %q", err, want)
+	}
+}
+
+// A unit file written for a release that had BPF-LSM may still pass --lsm or
+// --lsm-block-connect. The agent must start with it, so the flags stay
+// declared, hidden from the help, and change nothing.
+func TestRetiredLSMFlagsAreAccepted(t *testing.T) {
+	saved := cfg
+	t.Cleanup(func() { cfg = saved })
+
+	fs := rootCmd.Flags()
+	for _, name := range []string{"lsm", "lsm-block-connect"} {
+		f := fs.Lookup(name)
+		if f == nil || !f.Hidden || f.Deprecated == "" {
+			t.Fatalf("--%s must stay declared, hidden and deprecated: %+v", name, f)
+		}
+	}
+	before := cfg
+	if err := fs.Parse([]string{"--lsm=false", "--lsm-block-connect", "--trace"}); err != nil {
+		t.Fatalf("retired flags rejected: %v", err)
+	}
+	if !cfg.TraceEnabled {
+		t.Error("a flag after the retired ones was not parsed")
+	}
+	cfg.TraceEnabled = before.TraceEnabled
+	if !reflect.DeepEqual(cfg, before) {
+		t.Errorf("retired flags changed the config: %+v, was %+v", cfg, before)
 	}
 }

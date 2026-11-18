@@ -66,8 +66,14 @@ func init() {
 	// eBPF runtime security tracing.
 	rootCmd.Flags().BoolVar(&cfg.TraceEnabled, "trace", false, "enable eBPF runtime security tracing")
 	rootCmd.Flags().StringVar(&cfg.TraceObjectPath, "trace-obj", "internal/ebpf/bpf/wafio_trace.o", "path to compiled trace BPF object")
-	rootCmd.Flags().BoolVar(&cfg.LSMEnabled, "lsm", true, "enable BPF-LSM proactive blocking (requires kernel BPF-LSM hooks)")
-	rootCmd.Flags().BoolVar(&cfg.LSMBlockConnect, "lsm-block-connect", false, "LSM: deny socket_connect, and addressed sends (sendto, MSG_FASTOPEN), to blocklisted IPs (-EPERM)")
+	// BPF-LSM is gone. The flags stay accepted and do nothing, so a unit file
+	// that still passes one does not stop the agent, and with it the firewall.
+	for _, name := range []string{"lsm", "lsm-block-connect"} {
+		rootCmd.Flags().Bool(name, false, "")
+		if err := rootCmd.Flags().MarkDeprecated(name, "BPF-LSM was removed and the flag does nothing"); err != nil {
+			panic(err)
+		}
+	}
 
 	// Protected processes: never killed by runtime-security Kill enforcement.
 	// Added to the built-in names unless --protected-replace-defaults is set.

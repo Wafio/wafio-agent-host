@@ -22,9 +22,6 @@ import (
 //
 // CI runs it inside a VM per kernel (the ebpf-verifier-vm job in
 // .github/workflows/security.yml); without the variable it skips.
-// wafio_lsm.o is optional in production (the tracer runs without it when the
-// kernel lacks BPF LSM), so its failure is only fatal with
-// WAFIO_TEST_BPF_REQUIRE_LSM=1.
 func TestBPFObjectsPassVerifier(t *testing.T) {
 	dir := os.Getenv("WAFIO_TEST_BPF_DIR")
 	if dir == "" {
@@ -33,20 +30,11 @@ func TestBPFObjectsPassVerifier(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %+v", err)
 	}
-	objects := []struct {
-		name     string
-		optional bool
-	}{
-		{"wafio_xdp.o", false},
-		{"wafio_tc.o", false},
-		{"wafio_trace.o", false},
-		{"wafio_lsm.o", os.Getenv("WAFIO_TEST_BPF_REQUIRE_LSM") != "1"},
-	}
-	for _, obj := range objects {
-		t.Run(obj.name, func(t *testing.T) {
-			spec, err := cebpf.LoadCollectionSpec(filepath.Join(dir, obj.name))
+	for _, obj := range []string{"wafio_xdp.o", "wafio_tc.o", "wafio_trace.o"} {
+		t.Run(obj, func(t *testing.T) {
+			spec, err := cebpf.LoadCollectionSpec(filepath.Join(dir, obj))
 			if err != nil {
-				t.Fatalf("parse %s: %+v", obj.name, err)
+				t.Fatalf("parse %s: %+v", obj, err)
 			}
 			for _, m := range spec.Maps {
 				m.Pinning = cebpf.PinNone
@@ -62,17 +50,14 @@ func TestBPFObjectsPassVerifier(t *testing.T) {
 			coll, err := create()
 			if err != nil {
 				// %+v includes the full verifier log of a rejected program.
-				if obj.optional {
-					t.Skipf("optional object not loadable on this kernel: %+v", err)
-				}
-				t.Fatalf("load %s: %+v", obj.name, err)
+				t.Fatalf("load %s: %+v", obj, err)
 			}
 			defer coll.Close()
 			if len(coll.Programs) == 0 {
-				t.Fatalf("%s has no programs", obj.name)
+				t.Fatalf("%s has no programs", obj)
 			}
 			for name := range coll.Programs {
-				t.Logf("%s: %s verified", obj.name, name)
+				t.Logf("%s: %s verified", obj, name)
 			}
 		})
 	}

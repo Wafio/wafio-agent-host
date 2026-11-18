@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// A rejected optional hook (sendmsg, legacy syscalls) must not
+// A rejected optional hook (a kprobe twin, legacy syscalls) must not
 // take the rest of its object down, nor the other optional hooks: the
 // program the load error names is removed and the load retried, one program
 // at a time; only an unidentifiable failure drops every optional program.

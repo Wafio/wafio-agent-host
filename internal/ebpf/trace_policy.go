@@ -5,15 +5,11 @@ import (
 	"fmt"
 	"net/netip"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
-
-// afInet is AF_INET as the trace program stores it in TraceEvent.AddrFamily.
-const afInet uint16 = 2
 
 // ────────────────────────────────────────────────────────────────────────────
 //  PolicyEngine — runtime security enforcement policy evaluation & storage
@@ -42,101 +38,16 @@ type PolicyEngine struct {
 	pushKernelRule   func(eventType uint32, rule TraceEnforceRuleBPF) error
 	removeKernelRule func(eventType uint32) error
 
-	// BPF-LSM connect blocklist callbacks: destination IPs denied
-	// synchronously at socket_connect (-EPERM before any packet leaves).
-	pushConnectBlock   func(ip string, policyID uint32) error
-	removeConnectBlock func(ip string) error
-	// activeConnectBlocks tracks what was last pushed so sync can remove
-	// IPs that no longer have an enforcing policy.
-	activeConnectBlocks map[string]uint32
-	// connectMapped: the loaded LSM object also denies an AF_INET6 connect to
-	// the IPv4-mapped form of a blocklisted address (see lsm_connect.go).
-	connectMapped bool
-	// pushConnectSend replaces pushConnectBlock while the socket_sendmsg
-	// hook is attached and denying: it also carries whether
-	// addressed sends to the IP are denied. activeConnectSend is the send
-	// flag last pushed per IP.
-	pushConnectSend   func(ip string, policyID uint32, send bool) error
-	activeConnectSend map[string]bool
-
 	// killRouting writes the kernel kill-candidate routes (see
 	// trace_priority.go) after every policy change.
 	killRouting func(routes killRoutes)
 }
 
-// SetConnectCallbacks wires the BPF-LSM connect blocklist sync. Passing nil
-// for push disables the kernel path: dest-IP-only policies then downgrade to
-// userspace like any other complex match.
-func (pe *PolicyEngine) SetConnectCallbacks(
-	push func(ip string, policyID uint32) error,
-	remove func(ip string) error,
-) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.pushConnectBlock = push
-	pe.removeConnectBlock = remove
-	pe.markConnectAvailabilityLocked()
-	pe.syncKillRoutingLocked()
-}
-
-// SetSendBlocklist wires the BPF-LSM socket_sendmsg hook:
-// with push set, connect-blocklist entries are written through it with a
-// send flag — set when an enforcing policy for the IP selects sendto — and
-// Evaluate skips userspace action on a sendto the hook denied, as it does
-// for connects. nil unwires it (addressed sends back to userspace). Call
-// after SetConnectCallbacks; entries whose flag changes are rewritten.
-func (pe *PolicyEngine) SetSendBlocklist(push func(ip string, policyID uint32, send bool) error) error {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.pushConnectSend = push
-	err := pe.syncConnectBlocksLocked()
-	pe.syncKillRoutingLocked()
-	return err
-}
-
-// connectBlocklistDenies decides whether the host agent may wire the BPF-LSM
-// connect blocklist into the engine. Once wired, Evaluate skips userspace
-// action on connects it believes the blocklist denied, so the kernel
-// must really deny them: blocklist map loaded, socket_connect program
-// attached, LSM config written, block_connect on. Otherwise dest-IP policies
-// stay in userspace; reason says why, for the agent log.
-func connectBlocklistDenies(mapLoaded, hookAttached, blockConnect bool, configErr error) (bool, string) {
-	switch {
-	case !mapLoaded:
-		return false, "connect blocklist map missing"
-	case !hookAttached:
-		return false, "socket_connect hook not attached"
-	case configErr != nil:
-		return false, "LSM config write failed: " + configErr.Error()
-	case !blockConnect:
-		return false, "report-only (lsm-block-connect off)"
-	}
-	return true, ""
-}
-
-// connectBlockAvailableLocked reports whether the LSM connect path is wired.
-func (pe *PolicyEngine) connectBlockAvailableLocked() bool {
-	return pe.pushConnectBlock != nil
-}
-
-func (pe *PolicyEngine) markConnectAvailabilityLocked() {
-	avail := pe.connectBlockAvailableLocked()
-	for _, p := range pe.policies {
-		if p.ConnectBlockAvailable != avail {
-			np := *p
-			np.ConnectBlockAvailable = avail
-			pe.policies[p.ID] = &np
-		}
-	}
-}
-
 func NewPolicyEngine() *PolicyEngine {
 	return &PolicyEngine{
-		policies:            make(map[uint32]*EnforcementPolicy),
-		activeConnectBlocks: make(map[string]uint32),
-		activeConnectSend:   make(map[string]bool),
-		nextID:              1,
-		maxLogEntries:       2000,
+		policies:      make(map[uint32]*EnforcementPolicy),
+		nextID:        1,
+		maxLogEntries: 2000,
 	}
 }
 
@@ -164,41 +75,9 @@ func policyHasComplexMatch(p *EnforcementPolicy) bool {
 		p.MatchDestIP != ""
 }
 
-// destIPOnly reports a policy whose ONLY match criterion is MatchDestIP: the
-// BPF-LSM socket_connect hook evaluates the destination IP synchronously in
-// the kernel, so such a policy can still be kernel-enforced (via the connect
-// blocklist) even though the per-event rule path cannot express it.
-func destIPOnly(p *EnforcementPolicy) bool {
-	return p.MatchDestIP != "" && p.MatchComm == "" && p.MatchFilename == "" &&
-		p.MatchUID == nil && p.MatchDestPort == ""
-}
-
-// connectBlockEnforces reports whether the BPF-LSM connect blocklist can carry
-// p: a dest-IP-only Block or Kill policy that selects every connect to its IP
-// (event types empty or including connect, minimum severity the lowest),
-// while the blocklist is wired (avail). The hook denies every connect to the
-// IP with -EPERM, whatever the event type or severity, and has no alert mode:
-// any narrower policy would deny connects it never selects, so it stays in
-// userspace.
-func connectBlockEnforces(p *EnforcementPolicy, avail bool) bool {
-	if !avail || !destIPOnly(p) || ParseSeverityName(p.MinSeverity) != SevInfo {
-		return false
-	}
-	if len(p.EventTypes) > 0 && !slices.ContainsFunc(p.EventTypes, func(name string) bool {
-		return strings.EqualFold(name, "connect")
-	}) {
-		return false
-	}
-	switch ParseActionName(p.Action) {
-	case ActionBlock, ActionKill:
-		return true
-	}
-	return false
-}
-
 // policyDestIP parses MatchDestIP as validation accepts it (trimmed, IPv4 or
-// IPv4-mapped IPv6) into its plain IPv4 form, which is also the connect
-// blocklist key. ok is false when the field is empty or does not parse.
+// IPv4-mapped IPv6) into its plain IPv4 form. ok is false when the field is
+// empty or does not parse.
 func policyDestIP(matchDestIP string) (netip.Addr, bool) {
 	a, err := netip.ParseAddr(strings.TrimSpace(matchDestIP))
 	if err != nil {
@@ -232,6 +111,11 @@ func normalizeEnforcementMode(p *EnforcementPolicy) {
 	// Remember what the user originally asked for
 	p.KernelEnforceRequested = p.KernelEnforce
 
+	// An older control plane can still send action "block"; nothing denies a connect any more, so it acts as alert.
+	if ParseActionName(p.Action) == ActionBlock {
+		p.Action = "alert"
+	}
+
 	// Simulate (dry-run) is a pure userspace concept — the kernel only knows
 	// alert/kill. Force userspace mode for simulate so we can log "would-have"
 	// without ever firing bpf_send_signal.
@@ -240,15 +124,11 @@ func normalizeEnforcementMode(p *EnforcementPolicy) {
 		strings.EqualFold(p.Action, "shadow")
 
 	// Auto-downgrade: kernel can only match on event_type + severity.
-	// Anything using comm/filename/uid must run in userspace. Same for simulate.
-	// Exception: a dest-IP-only Block/Kill policy is enforced synchronously by
-	// the BPF-LSM socket_connect hook (the connect blocklist), so it keeps
-	// kernel mode — but only when that path is actually wired (engine connect
-	// callbacks).
+	// Anything using comm/filename/uid/port/dest-ip must run in userspace. Same for simulate.
 	if p.KernelEnforce && isSimulate {
 		p.KernelEnforce = false
 		p.AutoDowngraded = true
-	} else if p.KernelEnforce && policyHasComplexMatch(p) && !connectBlockEnforces(p, p.ConnectBlockAvailable) {
+	} else if p.KernelEnforce && policyHasComplexMatch(p) {
 		p.KernelEnforce = false
 		p.AutoDowngraded = true
 	} else {
@@ -294,7 +174,6 @@ func (pe *PolicyEngine) ReplacePolicies(policies []EnforcementPolicy) error {
 		if p.MatchCommMode == "" {
 			p.MatchCommMode = CommMatchSubstring
 		}
-		p.ConnectBlockAvailable = pe.connectBlockAvailableLocked()
 		if p.ID == 0 || p.ID == ^uint32(0) || p.Name == "" {
 			return fmt.Errorf("invalid policy identity or name")
 		}
@@ -335,7 +214,6 @@ func (pe *PolicyEngine) AddPolicy(p EnforcementPolicy) (*EnforcementPolicy, erro
 		p.Action = "monitor"
 	}
 	DefaultCommMatchMode(&p, "") // new policies compare whole words
-	p.ConnectBlockAvailable = pe.connectBlockAvailableLocked()
 
 	// Normalize enforcement mode (may auto-downgrade kernel → userspace)
 	normalizeEnforcementMode(&p)
@@ -373,7 +251,6 @@ func (pe *PolicyEngine) UpdatePolicy(id uint32, p EnforcementPolicy) (*Enforceme
 	}
 	DefaultCommMatchMode(&p, existing.MatchCommMode) // an update without a mode keeps it
 
-	p.ConnectBlockAvailable = pe.connectBlockAvailableLocked()
 	// Normalize enforcement mode (may auto-downgrade kernel → userspace)
 	normalizeEnforcementMode(&p)
 
@@ -458,13 +335,6 @@ func (pe *PolicyEngine) Evaluate(evt TraceEvent) (action uint32, policyID uint32
 		if !pe.matchPolicy(p, evt) {
 			continue
 		}
-		if pe.connectDeniedByBlocklistLocked(p, evt) {
-			// Denied in the kernel before the connect happened: a hit, but
-			// no second action from userspace.
-			p.HitCount++
-			continue
-		}
-
 		pAction := ParseActionName(p.Action)
 		if pri := ActionPriority(pAction); pri > bestPri || (pri == bestPri && pri > 0 && (bestPolicyID != 0 && p.ID < bestPolicyID)) {
 			bestAction = pAction
@@ -691,37 +561,6 @@ func (pe *PolicyEngine) matchPolicy(p *EnforcementPolicy, evt TraceEvent) bool {
 	return true
 }
 
-// connectDeniedByBlocklistLocked reports whether the BPF-LSM connect blocklist
-// already enforced p on evt. sys_enter_connect traces a connect before
-// security_socket_connect denies it, so the event still reaches Evaluate;
-// acting on it again would kill a process whose connect never happened. The
-// hook sees AF_INET connects and, with an object that has the marker, AF_INET6
-// connects to an IPv4-mapped address. sys_enter_sendto likewise precedes
-// security_socket_sendmsg: with that hook wired, a sendto to an IPv4 (or
-// IPv4-mapped) destination whose entry carries the send flag was denied too.
-// Anything else the hooks never saw (an AF_INET6 connect with an older object,
-// a sendto without the sendmsg hook) is still enforced from userspace. Must be
-// called with pe.mu held.
-func (pe *PolicyEngine) connectDeniedByBlocklistLocked(p *EnforcementPolicy, evt TraceEvent) bool {
-	if !p.KernelEnforce || !connectBlockEnforces(p, pe.connectBlockAvailableLocked()) {
-		return false
-	}
-	viaConnect := connectHookCoversEvent(evt, pe.connectMapped)
-	viaSend := pe.pushConnectSend != nil && policySelectsSend(p) && sendHookCoversEvent(evt)
-	if !viaConnect && !viaSend {
-		return false
-	}
-	ip, ok := policyDestIP(p.MatchDestIP)
-	if !ok {
-		return false
-	}
-	_, onBlocklist := pe.activeConnectBlocks[ip.String()]
-	if viaSend {
-		return onBlocklist && pe.activeConnectSend[ip.String()]
-	}
-	return onBlocklist
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 //  Kernel Rule Sync (push policies to BPF map)
 // ────────────────────────────────────────────────────────────────────────────
@@ -732,15 +571,14 @@ func (pe *PolicyEngine) connectDeniedByBlocklistLocked(p *EnforcementPolicy, evt
 func (pe *PolicyEngine) syncKernelRulesLocked() error {
 	if pe.pushKernelRule == nil || pe.removeKernelRule == nil {
 		for _, p := range pe.policies {
-			// Dest-IP-only policies ride the LSM connect blocklist, which can
-			// be wired even when the per-event enforce map is not — keep them.
-			if p.KernelEnforce && !connectBlockEnforces(p, pe.connectBlockAvailableLocked()) {
+			if p.KernelEnforce {
 				p.KernelEnforce = false
 				p.AutoDowngraded = true
 				p.EnforcementMode = "downgraded"
 			}
 		}
-		return pe.syncDerivedMapsLocked()
+		pe.syncKillRoutingLocked()
+		return nil
 	}
 
 	// A single BPF slot cannot represent overlapping severity thresholds.
@@ -850,74 +688,7 @@ func (pe *PolicyEngine) syncKernelRulesLocked() error {
 		}
 	}
 
-	return pe.syncDerivedMapsLocked()
-}
-
-// syncConnectBlocksLocked reconciles the BPF-LSM connect blocklist with the
-// current policy snapshot: the highest-priority enabled kernel-enforce policy
-// wins per destination IP, and IPs without an enforcing policy are removed.
-// Keys are the canonical IPv4 form, as in the kernel map, so two spellings of
-// one address share one entry. With the socket_sendmsg hook wired, an entry
-// carries the send flag when any of its enforcing policies selects sendto.
-// Must be called with pe.mu held.
-func (pe *PolicyEngine) syncConnectBlocksLocked() error {
-	if pe.removeConnectBlock == nil {
-		return nil
-	}
-
-	best := make(map[string]uint32) // ip → policyID
-	bestAction := make(map[string]uint32)
-	send := make(map[string]bool) // ip → an enforcing policy selects sendto
-	for _, p := range pe.policies {
-		if !p.Enabled || !p.KernelEnforce || !connectBlockEnforces(p, true) {
-			continue
-		}
-		addr, ok := policyDestIP(p.MatchDestIP)
-		if !ok {
-			continue
-		}
-		ip := addr.String()
-		if policySelectsSend(p) {
-			send[ip] = true
-		}
-		action := ParseActionName(p.Action)
-		if prev, ok := bestAction[ip]; !ok || ActionPriority(action) > ActionPriority(prev) ||
-			(action == prev && p.ID < best[ip]) {
-			best[ip] = p.ID
-			bestAction[ip] = action
-		}
-	}
-
-	for ip := range pe.activeConnectBlocks {
-		if _, ok := best[ip]; !ok {
-			if err := pe.removeConnectBlock(ip); err != nil {
-				return fmt.Errorf("remove connect block %s: %w", ip, err)
-			}
-			delete(pe.activeConnectBlocks, ip)
-			delete(pe.activeConnectSend, ip)
-		}
-	}
-	for ip, policyID := range best {
-		// The kernel entry's send flag: only written through the sendmsg
-		// pusher; pushConnectBlock leaves it clear.
-		wantSend := send[ip] && pe.pushConnectSend != nil
-		prev, ok := pe.activeConnectBlocks[ip]
-		prevSend, sendKnown := pe.activeConnectSend[ip]
-		if ok && prev == policyID && sendKnown && prevSend == wantSend {
-			continue
-		}
-		var err error
-		if pe.pushConnectSend != nil {
-			err = pe.pushConnectSend(ip, policyID, wantSend)
-		} else {
-			err = pe.pushConnectBlock(ip, policyID)
-		}
-		if err != nil {
-			return fmt.Errorf("push connect block %s: %w", ip, err)
-		}
-		pe.activeConnectBlocks[ip] = policyID
-		pe.activeConnectSend[ip] = wantSend
-	}
+	pe.syncKillRoutingLocked()
 	return nil
 }
 

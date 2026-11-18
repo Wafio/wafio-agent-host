@@ -36,9 +36,6 @@ func TestKillCandidateRoutes(t *testing.T) {
 	cases := []struct {
 		name     string
 		policies map[uint32]*EnforcementPolicy
-		connect  bool // LSM connect blocklist wired
-		mapped   bool // LSM object maps IPv4-mapped AF_INET6 connects
-		send     bool // LSM socket_sendmsg hook wired
 		want     map[uint32]uint32
 	}{
 		{
@@ -86,51 +83,10 @@ func TestKillCandidateRoutes(t *testing.T) {
 			want:     map[uint32]uint32{},
 		},
 		{
-			// The blocklist denies AF_INET connects, but an old LSM object
-			// lets an IPv4-mapped AF_INET6 connect through to userspace.
-			name:     "blocklist policy with an old LSM object keeps connect",
+			// Nothing denies a connect in the kernel, so a kernel-mode Kill
+			// policy for an address still needs the userspace kill.
+			name:     "kernel-mode dest-IP kill keeps connect and sendto",
 			policies: policySet(EnforcementPolicy{Enabled: true, Action: "kill", MatchDestIP: "203.0.113.9", KernelEnforce: true}),
-			connect:  true,
-			want:     map[uint32]uint32{TraceConnect: SevInfo, TraceSendto: SevInfo},
-		},
-		{
-			// An object with the marker: every connect reaching the IPv4
-			// address is denied in the kernel; only sendto still needs
-			// userspace.
-			name:     "blocklist policy with the mapped-connect object leaves sendto only",
-			policies: policySet(EnforcementPolicy{Enabled: true, Action: "kill", MatchDestIP: "203.0.113.9", KernelEnforce: true}),
-			connect:  true,
-			mapped:   true,
-			want:     map[uint32]uint32{TraceSendto: SevInfo},
-		},
-		{
-			// socket_sendmsg hook: addressed sends to the IP are denied in
-			// the kernel as well; nothing is left for a userspace kill.
-			name:     "blocklist policy with the sendmsg hook routes nothing",
-			policies: policySet(EnforcementPolicy{Enabled: true, Action: "kill", MatchDestIP: "203.0.113.9", KernelEnforce: true}),
-			connect:  true,
-			mapped:   true,
-			send:     true,
-			want:     map[uint32]uint32{},
-		},
-		{
-			// A connect-only blocklist policy never marks its entry for
-			// sends, so sendto is not denied for it — and not selected.
-			name:     "connect-only blocklist policy with the sendmsg hook",
-			policies: policySet(EnforcementPolicy{Enabled: true, Action: "kill", EventTypes: []string{"connect"}, MatchDestIP: "203.0.113.9", KernelEnforce: true}),
-			connect:  true,
-			mapped:   true,
-			send:     true,
-			want:     map[uint32]uint32{},
-		},
-		{
-			// A comm-narrowed dest-IP policy stays in userspace: the hook
-			// never sees it, sendto remains a kill candidate.
-			name:     "userspace dest-IP policy keeps sendto with the sendmsg hook",
-			policies: policySet(EnforcementPolicy{Enabled: true, Action: "kill", MatchDestIP: "203.0.113.9", MatchComm: "implant", KernelEnforce: true}),
-			connect:  true,
-			mapped:   true,
-			send:     true,
 			want:     map[uint32]uint32{TraceConnect: SevInfo, TraceSendto: SevInfo},
 		},
 		{
@@ -142,10 +98,9 @@ func TestKillCandidateRoutes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, p := range tc.policies {
-				p.ConnectBlockAvailable = tc.connect
 				normalizeEnforcementMode(p)
 			}
-			got := killCandidateRoutes(tc.policies, tc.connect, tc.mapped, tc.send)
+			got := killCandidateRoutes(tc.policies)
 			if !maps.Equal(got, tc.want) {
 				t.Fatalf("routes = %v, want %v", got, tc.want)
 			}

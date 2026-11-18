@@ -136,16 +136,13 @@ The distribution kernels build veth, `sch_ingress` and `cls_bpf` as modules, and
 guest is a busybox initramfs with no module tree. Extract those three modules from the
 kernel package (`linux-modules-*` on Ubuntu, `linux-image-*` on Debian), decompress
 them, put them in the initramfs in dependency order and `insmod` them in `init`, with
-`ip link set lo up` for the loopback sockets of the socket proof tests,
-`ip route add 203.0.113.0/24 dev lo` for the BPF LSM send test (it connects a UDP
-socket to that range, and the guest has no other network) and
+`ip link set lo up` for the loopback sockets of the socket proof tests and
 `ulimit -l unlimited` (kernels before 5.11 charge maps to the memlock limit, as the
-unit's `LimitMEMLOCK=infinity` allows). Boot with `lsm=capability,bpf` so that the
-BPF LSM objects load, and run the static test binaries (`CGO_ENABLED=0 go test -c`)
-as root:
+unit's `LimitMEMLOCK=infinity` allows). Run the static test binaries
+(`CGO_ENABLED=0 go test -c`) as root:
 
 ```sh
-WAFIO_TEST_BPF_DIR=/objs/ebpf WAFIO_TEST_BPF_REQUIRE_LSM=1 ebpf-kernel.test -test.run 'TestBPF|TestKernel'
+WAFIO_TEST_BPF_DIR=/objs/ebpf ebpf-kernel.test -test.run 'TestBPF|TestKernel'
 WAFIO_TEST_BPF_DIR=/objs/ebpf WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_EBPF_FLOOR_LOAD=1 \
   WAFIO_EBPF_INTEGRATION=1 WAFIO_TRACE_OBJECT=/objs/ebpf/wafio_trace.o ebpf-integration.test \
   -test.run 'TestVMScenarioMapScale|TestVMScenarioKilledAgent|TestVMScenarioLastGood|TestMapFloorLoad|TestTraceOpenResultPendingFull'
@@ -153,8 +150,9 @@ WAFIO_TEST_BPF_DIR=/objs/ebpf WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_EBPF_FLOOR_LOAD=1 
 
 ### Results
 
-Run on QEMU with KVM (2 vCPUs, 1.5 GB), guests booted with `lsm=capability,bpf`,
-objects built with clang 18, root. "Kernel tests" is `TestBPF*` and `TestKernel*` of
+Run on QEMU with KVM (2 vCPUs, 1.5 GB), objects built with clang 18, root. The runs
+predate the removal of BPF-LSM: the guests booted with `lsm=capability,bpf` and the
+counts include its tests. "Kernel tests" is `TestBPF*` and `TestKernel*` of
 `internal/ebpf` (the object, verifier, budget, packet and map full tests);
 "scenarios" is the three scenarios above, `TestMapFloorLoad` and the two
 `TestTraceOpenResultPendingFull*` tests.
