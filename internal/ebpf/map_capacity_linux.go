@@ -63,22 +63,59 @@ func newByteArrays(size uint32, n int) any {
 // count returns the number of entries in a hash or LRU hash map.
 func (c *entryCounter) count(m *ebpf.Map) (uint64, error) {
 	keys, vals := c.buffers(m.KeySize(), m.ValueSize())
+	if n, ok := batchCount(m, keys, vals, nil); ok {
+		return n, nil
+	}
+	return countByIteration(m)
+}
+
+// batchCount counts the entries of m, read a chunk at a time into keys and
+// vals (slices of one length), for which keep holds (nil: all). keep gets the
+// index of the entry in keys and vals. ok is false when the kernel refuses
+// batch lookups (kernels before 5.6, a bucket larger than the chunk): the
+// caller walks the keys then.
+func batchCount(m *ebpf.Map, keys, vals any, keep func(i int) bool) (total uint64, ok bool) {
 	var cursor ebpf.MapBatchCursor
-	var total uint64
 	for {
 		n, err := m.BatchLookup(&cursor, keys, vals, nil)
-		total += uint64(n)
+		for i := range n {
+			if keep == nil || keep(i) {
+				total++
+			}
+		}
 		switch {
 		case err == nil && n > 0:
 			continue
 		case err == nil || errors.Is(err, ebpf.ErrKeyNotExist):
-			return total, nil
+			return total, true
 		default:
-			// Kernels before 5.6 and a bucket larger than the chunk refuse a
-			// batch lookup: walk the keys.
-			return countByIteration(m)
+			return 0, false
 		}
 	}
+}
+
+// liveConnections counts the conntrack entries of flows that are still fresh
+// (connectionFresh, as ListConnections). The table keeps the entries of ended
+// flows until it needs their room, and evicts those first, so a busy host keeps
+// it at capacity: only the fresh flows show how full it is.
+func (m *Manager) liveConnections() (uint64, error) {
+	now := m.ktimeNow()
+	keys, vals := make([]ConnKey, mapCountChunk), make([]ConnVal, mapCountChunk)
+	if n, ok := batchCount(m.conntrackMap, keys, vals, func(i int) bool {
+		return connectionFresh(keys[i].Proto, vals[i].LastSeenNs, now)
+	}); ok {
+		return n, nil
+	}
+	var n uint64
+	var key ConnKey
+	var val ConnVal
+	iter := m.conntrackMap.Iterate()
+	for iter.Next(&key, &val) {
+		if connectionFresh(key.Proto, val.LastSeenNs, now) {
+			n++
+		}
+	}
+	return n, iter.Err()
 }
 
 // countByIteration counts the keys one by one. The iterator stops with an
@@ -129,16 +166,29 @@ func (m *Manager) sampleMaps(now time.Time) {
 	out := make([]MapCapacity, 0, len(refs))
 	for _, r := range refs {
 		c := MapCapacity{Name: r.name, MaxEntries: r.m.MaxEntries(), DefaultMaxEntries: mapDefaultSize(r.name)}
-		if n, err := m.counter.count(r.m); err == nil {
+		var n uint64
+		var err error
+		if r.name == mapConntrack {
+			n, err = m.liveConnections()
+		} else {
+			n, err = m.counter.count(r.m)
+		}
+		if err == nil {
 			c.Entries = &n
 		}
 		var last time.Time
 		var warn bool
 		switch {
-		case r.m.Type() == ebpf.LRUHash:
+		case r.name == mapConntrack:
+			// Full: the fresh flows need the whole table, so the LRU evicts
+			// flows that are still live.
 			margin := uint64(mapLRUFreeNodesPerCPU) * uint64(max(m.cfg.MapSizes.CPUs, 1))
 			full := c.Entries != nil && *c.Entries+margin >= uint64(c.MaxEntries)
 			last, warn = m.fullTrack.note(r.name, now, full)
+		case r.m.Type() == ebpf.LRUHash:
+			// wafio_bandwidth and wafio_geoip are caches: they fill up and
+			// evict by design, and their entries carry no age to tell a live
+			// one from an old one. They never count as full.
 		case r.hasSlot && m.stateFullMap != nil:
 			v := sumPerCPU(m.stateFullMap, r.slot)
 			c.FullCount = &v

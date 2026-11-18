@@ -99,7 +99,9 @@ its capacity with distinct sources:
   their TTL make room; jailed sources stay dropped.
 - Geoip and bandwidth (LRU): an evicted geoip address escapes the reactive geo
   block until it is enriched again; the accounting map accepts any number of
-  sources and no verdict depends on it.
+  sources and no verdict depends on it. The sampler reports both at capacity and
+  never as full. A conntrack table filled with ended flows is not full either; a
+  flood of fresh flows is.
 - The entry counter (batch lookup in chunks and the key walk) and the load of XDP
   and TC at the floor and the ceiling sizes through `loadXDP` and `loadTC`, with
   identical shared maps.

@@ -325,10 +325,12 @@ type MapSizing struct {
 }
 
 // MapCapacity is one sized map. Entries is the live count (absent for the
-// ring and before the first sample). FullCount is the number of inserts the map
-// refused since start, absent for an LRU map, which evicts instead. LastFullAt
-// is the last time FullCount grew; for an LRU map, the last sample that found
-// it within one eviction margin of full.
+// ring and before the first sample); for wafio_conntrack, the flows still
+// fresh. FullCount is the number of inserts the map refused since start, absent
+// for an LRU map, which evicts instead. LastFullAt is the last time FullCount
+// grew; for wafio_conntrack, the last sample that found its fresh flows within
+// one eviction margin of full. The LRU caches (wafio_bandwidth, wafio_geoip)
+// fill up by design and never have one.
 type MapCapacity struct {
 	Name              string     `json:"name"`
 	MaxEntries        uint32     `json:"max_entries"`

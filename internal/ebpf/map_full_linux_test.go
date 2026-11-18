@@ -449,12 +449,16 @@ func TestKernelMapFullConntrackSocketProof(t *testing.T) {
 		t.Fatalf("conntrack holds %d entries after %d flows, want about its size %d", entries, 2*capacity, capacity)
 	}
 
-	// The sampler finds the LRU map full and reports no refused inserts.
+	// The flows of the flood are fresh: the sampler finds the table full of
+	// live flows, names it in the warning and reports no refused inserts.
 	now := time.Now()
 	mgr.sampleMaps(now)
 	status := mgr.mapSizingStatus()
-	if ct := mapSizingEntry(t, status, mapConntrack); ct.FullCount != nil || ct.LastFullAt == nil || ct.Entries == nil {
-		t.Errorf("conntrack sample %+v: want entries and last_full_at, no full_count", ct)
+	if ct := mapSizingEntry(t, status, mapConntrack); ct.FullCount != nil || ct.LastFullAt == nil || ct.Entries == nil || *ct.Entries+margin < uint64(capacity) {
+		t.Errorf("conntrack sample %+v: want about %d fresh entries and last_full_at, no full_count", ct, capacity)
+	}
+	if w := mapFullWarning(status, now); !strings.Contains(w, mapConntrack) {
+		t.Errorf("coverage warning %q does not name %s", w, mapConntrack)
 	}
 
 	for _, fam := range adoptFamilies {
@@ -718,12 +722,59 @@ func TestKernelMapFullJail(t *testing.T) {
 
 // The LRU maps evict. An address the reactive geo cache lost escapes the geo
 // block until it is enriched again, and the accounting map keeps accepting
-// sources without a verdict depending on it.
+// sources without a verdict depending on it. Both are caches that fill up by
+// design: the sampler reports their entries and never calls them full. The
+// conntrack table counts as full only when its fresh flows fill it, not when
+// ended flows wait there to be evicted.
 func TestKernelMapFullLRUEvict(t *testing.T) {
 	sizes := floorSizes(t)
+	notFull := func(t *testing.T, mgr *Manager, name string, wantEntries func(uint64) bool) {
+		t.Helper()
+		now := time.Now()
+		mgr.sampleMaps(now)
+		status := mgr.mapSizingStatus()
+		e := mapSizingEntry(t, status, name)
+		if e.Entries == nil || !wantEntries(*e.Entries) || e.FullCount != nil || e.LastFullAt != nil {
+			var n any = e.Entries
+			if e.Entries != nil {
+				n = *e.Entries
+			}
+			t.Errorf("%s sample %+v, entries %v: want its entries, no full_count and no last_full_at", name, e, n)
+		}
+		if w := mapFullWarning(status, now); strings.Contains(w, name) {
+			t.Errorf("coverage warning %q names %s", w, name)
+		}
+	}
+
+	t.Run("conntrack of ended flows", func(t *testing.T) {
+		c := sizedObjectCollection(t, "wafio_xdp.o", sizes)
+		mgr, logs := bareManager(t, sizes, c, nil)
+		capacity := int(c.Maps[mapConntrack].MaxEntries())
+		now := monoNow(t)
+		const fresh = 10
+		for n := 0; n < capacity; n++ {
+			key := ConnKey{Src: mfKey(mfAddr(n)), Dst: mfKey(mfLocal), Sport: ntohs(40000), Dport: ntohs(443), Proto: 6}
+			last := now - 600_000_000_000 // ten minutes ago: past the TCP and UDP TTLs
+			if n%2 == 1 {
+				key.Proto = 17
+			}
+			if n >= capacity-fresh { // written last: the LRU evicts the oldest writes first
+				last = now
+			}
+			putPacketMap(t, c, mapConntrack, key, ConnVal{FirstSeenNs: last, LastSeenNs: last, TCPState: 1})
+		}
+		if got := countEntries(t, c.Maps[mapConntrack]); got+uint64(2*mapLRUFreeNodesPerCPU*sizes.CPUs) < uint64(capacity) {
+			t.Fatalf("conntrack holds %d entries, want about its size %d", got, capacity)
+		}
+		notFull(t, mgr, mapConntrack, func(n uint64) bool { return n == fresh })
+		if strings.Contains(logs.String(), "WARN") {
+			t.Errorf("a WARN for a table of ended flows: %q", logs.String())
+		}
+	})
 
 	t.Run("geoip", func(t *testing.T) {
 		c := sizedObjectCollection(t, "wafio_xdp.o", sizes)
+		mgr, _ := bareManager(t, sizes, c, nil)
 		capacity := int(c.Maps[mapGeoIP].MaxEntries())
 		putPacketMap(t, c, mapConfig, uint32(0), GlobalConfig{Enabled: 1, EnableGeoblock: 1})
 		cn := PackCountry('C', 'N')
@@ -751,6 +802,7 @@ func TestKernelMapFullLRUEvict(t *testing.T) {
 		if got := runPacket(t, c, mfTCP(blocked, 40000, 443, 0x02)); got != xdpPas {
 			t.Errorf("address evicted from the geo cache: verdict %d, want pass (it escapes until enriched again)", got)
 		}
+		notFull(t, mgr, mapGeoIP, func(n uint64) bool { return n+uint64(2*mapLRUFreeNodesPerCPU*sizes.CPUs) >= uint64(capacity) })
 		putPacketMap(t, c, mapGeoIP, mfKey(blocked), geo)
 		if got := runPacket(t, c, mfTCP(blocked, 40000, 443, 0x02)); got != xdpDrp {
 			t.Errorf("address enriched again: verdict %d, want drop", got)
@@ -758,7 +810,8 @@ func TestKernelMapFullLRUEvict(t *testing.T) {
 	})
 
 	t.Run("bandwidth", func(t *testing.T) {
-		_, tcColl := packetPairSized(t, sizes)
+		xdpColl, tcColl := packetPairSized(t, sizes)
+		mgr, _ := bareManager(t, sizes, xdpColl, tcColl)
 		capacity := int(tcColl.Maps[mapBandwidth].MaxEntries())
 		putPacketMap(t, tcColl, mapConfig, uint32(0), GlobalConfig{Enabled: 1})
 		for n := 0; n < 2*capacity; n++ {
@@ -772,6 +825,7 @@ func TestKernelMapFullLRUEvict(t *testing.T) {
 		if got > uint64(capacity) || got+margin < uint64(capacity) {
 			t.Errorf("bandwidth holds %d entries after %d sources, want about %d", got, 2*capacity, capacity)
 		}
+		notFull(t, mgr, mapBandwidth, func(n uint64) bool { return n+margin >= uint64(capacity) })
 	})
 }
 

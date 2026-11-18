@@ -212,8 +212,13 @@ protection goes off without a signal.
 firewall maps, `trace_status` for the trace maps): the scale and where it came
 from, the memory it came from, and for each sized map `max_entries`, the size the
 object declares, the live `entries` (sampled every 30 s), `full_count` (inserts
-refused since start; absent for the LRU maps) and `last_full_at`. For an LRU map,
-`last_full_at` is the last sample within one eviction margin of full. While a
+refused since start; absent for the LRU maps) and `last_full_at`. The conntrack
+table keeps the entries of ended flows until it needs their room, so on a busy
+host it always sits at capacity: its `entries` counts only the flows still fresh
+(30 s for UDP, 300 s for TCP since their last packet), and `last_full_at` is the
+last sample that found those within one eviction margin of full, when the table
+evicts live flows. `wafio_bandwidth` and `wafio_geoip` are caches that fill up and
+evict by design; they report `entries` and never count as full. While a
 firewall map was full in the last 10 minutes the status adds one coverage warning,
 `eBPF maps full in the last 10 minutes: <names>. Map scale <s> (<source>): raise WAFIO_EBPF_MAP_SCALE (at most 1) or look for a flood.`,
 which marks the host degraded in the fleet view. The agent logs a WARN when a map
