@@ -136,7 +136,9 @@ The distribution kernels build veth, `sch_ingress` and `cls_bpf` as modules, and
 guest is a busybox initramfs with no module tree. Extract those three modules from the
 kernel package (`linux-modules-*` on Ubuntu, `linux-image-*` on Debian), decompress
 them, put them in the initramfs in dependency order and `insmod` them in `init`, with
-`ip link set lo up` for the loopback sockets of the socket proof tests and
+`ip link set lo up` for the loopback sockets of the socket proof tests,
+`ip route add 203.0.113.0/24 dev lo` for the BPF LSM send test (it connects a UDP
+socket to that range, and the guest has no other network) and
 `ulimit -l unlimited` (kernels before 5.11 charge maps to the memlock limit, as the
 unit's `LimitMEMLOCK=infinity` allows). Boot with `lsm=capability,bpf` so that the
 BPF LSM objects load, and run the static test binaries (`CGO_ENABLED=0 go test -c`)
@@ -152,22 +154,30 @@ WAFIO_TEST_BPF_DIR=/objs/ebpf WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_EBPF_FLOOR_LOAD=1 
 ### Results
 
 Run on QEMU with KVM (2 vCPUs, 1.5 GB), guests booted with `lsm=capability,bpf`,
-objects built with clang 18, root. "Kernel tests" is `TestBPF*`, `TestKernel*` and
-the fork ABI test of `internal/ebpf` (the object, verifier, budget, packet and map
-full tests); "scenarios" is the three scenarios above, `TestMapFloorLoad` and the two
+objects built with clang 18, root. "Kernel tests" is `TestBPF*` and `TestKernel*` of
+`internal/ebpf` (the object, verifier, budget, packet and map full tests);
+"scenarios" is the three scenarios above, `TestMapFloorLoad` and the two
 `TestTraceOpenResultPendingFull*` tests.
 
 | Kernel | Kernel tests | Scenarios and load test | Fail-open window |
 |---|---|---|---|
-| 5.10.0-43 (Debian 11) | 81 pass, 2 skip | 6 pass | 1.2 to 1.7 s |
-| 5.15.0-160 (Ubuntu 22.04) | 81 pass, 2 skip | 6 pass | 1.3 to 1.4 s |
-| 6.1.0-47 (Debian 12) | 82 pass, 1 skip | 6 pass | 1.1 to 1.6 s |
-| 6.8.0-110 (Ubuntu 24.04) | 82 pass, 1 skip | 5 pass, 1 skip (TCX: nothing to clean up) | 1.2 s |
+| 5.10.0-43 (Debian 11) | 84 pass, 2 skip | 6 pass | 1.1 s |
+| 5.15.0-160 (Ubuntu 22.04) | 84 pass, 2 skip | 6 pass | 1.3 s |
+| 6.1.0-47 (Debian 12) | 85 pass, 1 skip | 6 pass | 1.1 s |
+| 6.8.0-110 (Ubuntu 24.04) | 85 pass, 1 skip | 5 pass, 1 skip (TCX: nothing to clean up) | 1.2 s |
 
 The skips are tests that need a newer kernel feature, and the kill scenario on 6.8.
 The XDP verifier accepts `bpf_sk_lookup_tcp` and the TC verifier accepts the
-allocate-on-insert egress map on all four kernels. The same tests also pass on
-kernel 6.17 (the build host, as root).
+allocate-on-insert egress map on all four kernels. The verifier log counts these
+processed instructions (limit 1,000,000):
+
+| Kernel | `wafio_xdp_v4` | `wafio_xdp_v6` | `wafio_tc_egress` |
+|---|---|---|---|
+| 5.10, 6.1 | 314757 | 336770 | 484335 |
+| 5.15 | 434834 | 356124 | 584082 |
+| 6.8 | 192923 | 217738 | 382594 |
+
+The same tests also pass on kernel 6.17 (the build host, as root).
 
 The load test, on every kernel: 2000 of 2000 legitimate requests in each of the
 three runs, the tracked abuser dropped, and for each map 133618 or 133619 refused
