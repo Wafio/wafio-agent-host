@@ -167,8 +167,10 @@ type Manager struct {
 	capAt     time.Time
 	fullTrack mapFullTracker
 	counter   entryCounter
-	// jailFull counts the jail entries refused because the jail was full.
-	jailFull atomic.Uint64
+	// jailFull counts the jail entries refused because the jail was full;
+	// jailSweptAt is when a full jail was last swept (Unix ns, claimJailSweep).
+	jailFull    atomic.Uint64
+	jailSweptAt atomic.Int64
 
 	// ── background goroutines ──
 	cancel context.CancelFunc

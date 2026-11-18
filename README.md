@@ -204,7 +204,7 @@ protection goes off without a signal.
 | `wafio_syn_state`, `wafio_rate_state`, `wafio_portscan` (hash) | The insert is refused. The packet passes and the per-source check is skipped, with no event. A source already tracked stays tracked, so a known abuser stays limited. The refusals count in `state_table_full` and in `wafio_state_full`. |
 | `wafio_bandwidth` (LRU) | Evicts. The accounting is incomplete; no verdict depends on it. |
 | `wafio_geoip` (LRU) | Evicts. An evicted address escapes the reactive geo block until the enricher resolves it again. The enricher clears its own cache when it reaches the size of the map. The geo CIDR tries are not affected. |
-| `wafio_jail` (hash) | Refuses a new address. The agent first deletes the entries past their TTL and tries once more; if the jail is still full the local API answers `409 IP_LIST_FULL` and the refusal is counted. A jailed address is never evicted, and the WAF agent still blocks at L7. |
+| `wafio_jail` (hash) | Refuses a new address. The agent first deletes the entries past their TTL and tries once more (at most one such sweep a second, since a sweep reads every entry); if the jail is still full the local API answers `409 IP_LIST_FULL` and the refusal is counted. A jailed address is never evicted, and the WAF agent still blocks at L7. |
 | `trace_open_pending` (hash) | The open result is unknown. The event leaves without a result and counts in `open_result_unknown`. |
 | `trace_events` (ring) | Low-severity events are shed at 6/8 full and the losses are counted. |
 

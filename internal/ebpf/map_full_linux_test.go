@@ -720,6 +720,47 @@ func TestKernelMapFullJail(t *testing.T) {
 	})
 }
 
+// A full jail of live entries is swept at most once a second, however many
+// addresses the WAF agent jails: each sweep reads every entry.
+func TestKernelMapFullJailSweepsOnceASecond(t *testing.T) {
+	sizes := floorSizes(t)
+	c := sizedObjectCollection(t, "wafio_xdp.o", sizes)
+	mgr, _ := bareManager(t, sizes, c, nil)
+	capacity := int(c.Maps[mapJail].MaxEntries())
+	jailed := func(n int) string { a := mfAddr(n); return net.IP(a[:]).String() }
+	for n := 0; n < capacity; n++ {
+		if err := mgr.AddToJail(jailed(n), time.Hour); err != nil {
+			t.Fatalf("jail %d of %d: %v", n, capacity, err)
+		}
+	}
+	if err := mgr.AddToJail(jailed(capacity), time.Hour); !errors.Is(err, ErrJailFull) {
+		t.Fatalf("add to a full jail: %v, want ErrJailFull", err)
+	}
+	swept := mgr.jailSweptAt.Load()
+	if swept == 0 {
+		t.Fatal("the first refusal did not sweep the jail")
+	}
+	// An entry runs out right after that sweep. The next adds within the
+	// second do not sweep, so its slot stays taken.
+	putPacketMap(t, c, mapJail, mfKey(mfAddr(0)), IPListVal{AddedNs: 1, ExpiresNs: 2, RuleType: 1})
+	for i := 1; i <= 50; i++ {
+		if err := mgr.AddToJail(jailed(capacity+i), time.Hour); !errors.Is(err, ErrJailFull) {
+			t.Fatalf("add %d within the second: %v, want ErrJailFull", i, err)
+		}
+	}
+	if got := mgr.jailSweptAt.Load(); got != swept {
+		t.Fatalf("the jail was swept again within a second (%d, then %d)", swept, got)
+	}
+	// A second later the next add sweeps and takes the freed slot.
+	mgr.jailSweptAt.Store(swept - int64(jailSweepEvery))
+	if err := mgr.AddToJail(jailed(capacity+100), time.Hour); err != nil {
+		t.Fatalf("add after the second: %v", err)
+	}
+	if got := mgr.jailFull.Load(); got != 51 {
+		t.Errorf("jail full counter %d, want 51", got)
+	}
+}
+
 // The LRU maps evict. An address the reactive geo cache lost escapes the geo
 // block until it is enriched again, and the accounting map keeps accepting
 // sources without a verdict depending on it. Both are caches that fill up by

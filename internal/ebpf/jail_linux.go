@@ -51,7 +51,7 @@ func (m *Manager) AddToJail(ipStr string, ttl time.Duration) error {
 		val.HitCount = old.HitCount
 	}
 	err = m.jailMap.Update(key, &val, ebpf.UpdateAny)
-	if errors.Is(err, unix.E2BIG) {
+	if errors.Is(err, unix.E2BIG) && m.claimJailSweep(time.Now()) {
 		// Full: the entries past their TTL still hold slots until XDP meets
 		// the address again. Free them and try once more.
 		m.deleteExpiredJailLocked(now)
@@ -62,6 +62,18 @@ func (m *Manager) AddToJail(ipStr string, ttl time.Duration) error {
 		return fmt.Errorf("%w: %s not jailed", ErrJailFull, a)
 	}
 	return err
+}
+
+// jailSweepEvery spaces the sweeps of a full jail. A sweep reads every entry,
+// and during an attack the WAF agent may jail many addresses a second: with
+// the jail full of live entries, a sweep per request would cost a CPU.
+const jailSweepEvery = time.Second
+
+// claimJailSweep reports whether a full jail may be swept now: the first call
+// after jailSweepEvery since the last sweep wins.
+func (m *Manager) claimJailSweep(now time.Time) bool {
+	last := m.jailSweptAt.Load()
+	return now.UnixNano()-last >= int64(jailSweepEvery) && m.jailSweptAt.CompareAndSwap(last, now.UnixNano())
 }
 
 // deleteExpiredJailLocked removes the jail entries whose TTL ended before now
