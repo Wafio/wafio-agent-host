@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/valyala/fasthttp"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -503,6 +505,125 @@ func TestKernelMapFullConntrackSocketProof(t *testing.T) {
 				t.Errorf("second reply: verdict %d, want pass", got)
 			}
 		})
+	}
+}
+
+// publicLoopback is establishedLoopback on a public address, which no geo
+// exemption covers. The test goroutine stays on its thread, and the thread
+// moves to a network namespace of its own with addr on lo. Packets run from
+// the same thread, so the program's socket lookups see that namespace. The
+// thread is never unlocked, so it ends with the test.
+func publicLoopback(t *testing.T, network, addr string) loopbackConn {
+	t.Helper()
+	runtime.LockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+		t.Skipf("no network namespace: %v", err)
+	}
+	lo, err := netlink.LinkByName("lo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.LinkSetUp(lo); err != nil {
+		t.Fatal(err)
+	}
+	ip := net.ParseIP(addr)
+	bits := 128
+	if ip.To4() != nil {
+		bits = 32
+	}
+	if err := netlink.AddrAdd(lo, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}, Flags: unix.IFA_F_NODAD}); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen(network, net.JoinHostPort(addr, "0"))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	c, err := net.Dial(network, l.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return loopbackConn{host: addr, srvPort: uint16(l.Addr().(*net.TCPAddr).Port), cliPort: uint16(c.LocalAddr().(*net.TCPAddr).Port)}
+}
+
+// A reply of a flow the host opened that lost its conntrack entry passes on
+// socket proof at each drop that a reply skips, and only there. A reply that
+// passes anyway costs no socket lookup, so no entry is written for it, and a
+// forged ACK stays dropped.
+func TestKernelMapFullReplyProofAtDrops(t *testing.T) {
+	families := []struct {
+		adoptFamily
+		host, forged, everyone string
+	}{
+		{adoptFamilies[0], "203.0.113.7", "203.0.113.99", "0.0.0.0/0"},
+		{adoptFamilies[1], "2001:db8:2::7", "2001:db8:2::99", "::/0"},
+	}
+	conntrackOn := func(t *testing.T, extra GlobalConfig) *cebpf.Collection {
+		c := packetTestCollection(t)
+		extra.Enabled, extra.EnableConntrack = 1, 1
+		putPacketMap(t, c, mapConfig, uint32(0), extra)
+		return c
+	}
+	for _, fam := range families {
+		for _, tc := range []struct {
+			name  string
+			setup func(t *testing.T) *cebpf.Collection
+			// budget: replies that pass on the check's own terms first.
+			budget int
+			proof  bool // the check drops a packet that is not a reply
+		}{
+			{"passes anyway", func(t *testing.T) *cebpf.Collection { return conntrackOn(t, GlobalConfig{}) }, 0, false},
+			{"family-wide block", func(t *testing.T) *cebpf.Collection {
+				c := conntrackOn(t, GlobalConfig{})
+				putListEntry(t, c, false, fam.everyone)
+				return c
+			}, 0, true},
+			{"geo allow mode", func(t *testing.T) *cebpf.Collection { return geoAllowCollection(t, 0, true) }, 0, true},
+			{"ingress default deny", func(t *testing.T) *cebpf.Collection {
+				c := conntrackOn(t, GlobalConfig{})
+				putPacketMap(t, c, mapPortPolicyConfig, uint32(0), PortPolicyConfig{Enabled: 1, DefaultIngress: 1})
+				return c
+			}, 0, true},
+			{"rate limit", func(t *testing.T) *cebpf.Collection {
+				c := conntrackOn(t, GlobalConfig{EnableRatelimit: 1})
+				// 60 packets a window and source, then drop.
+				putPacketMap(t, c, mapRateConfig, uint32(0), RateConfig{WindowNs: 60_000_000_000, MaxPPS: 1, Action: 1})
+				return c
+			}, 60, true},
+		} {
+			t.Run(fam.name+"/"+tc.name, func(t *testing.T) {
+				lc := publicLoopback(t, fam.network, fam.host)
+				c := tc.setup(t)
+				reply := fam.pkt(lc.host, lc.host, lc.srvPort, lc.cliPort, 0x10)
+				out := connKey4(lc.host, lc.host, lc.cliPort, lc.srvPort)
+				var cv ConnVal
+				for i := 0; i <= tc.budget; i++ {
+					if got := runPacket(t, c, reply); got != xdpPas {
+						t.Fatalf("reply %d: verdict %d, want pass", i, got)
+					}
+					err := c.Maps[mapConntrack].Lookup(out, &cv)
+					if i < tc.budget || !tc.proof {
+						if !errors.Is(err, cebpf.ErrKeyNotExist) {
+							t.Fatalf("reply %d passed without a drop to skip, yet the outbound entry is there (%v): the socket lookup ran", i, err)
+						}
+					} else if err != nil || cv.FlagsSeen&ConnOutbound == 0 {
+						t.Fatalf("reply %d passed on socket proof, but the outbound entry %+v is missing (%v)", i, cv, err)
+					}
+				}
+				if !tc.proof {
+					return
+				}
+				forged := fam.pkt(fam.forged, lc.host, 55555, freeTCPPort(t), 0x10)
+				var got uint32
+				for i := 0; i <= tc.budget; i++ {
+					got = runPacket(t, c, forged)
+				}
+				if got != xdpDrp {
+					t.Errorf("forged ACK without a socket: verdict %d, want drop", got)
+				}
+			})
+		}
 	}
 }
 

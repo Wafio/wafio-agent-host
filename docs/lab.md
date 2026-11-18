@@ -90,6 +90,11 @@ its capacity with distinct sources:
   ingress Deny All; then the reply of a real host-opened connection (IPv4 and
   IPv6) passes by socket proof and its entry comes back, an ACK to a denied
   listening port stays dropped, an ACK with no socket stays dropped.
+- Socket proof (`TestKernelMapFullReplyProofAtDrops`): in a network namespace of
+  the test thread, with a public address on its loopback, a reply that lost its
+  entry passes at each drop that replies skip (family-wide block, geo allow mode,
+  ingress default deny, rate limit) and gets its entry back; a forged ACK stays
+  dropped; a reply that passes anyway runs no socket lookup and writes no entry.
 - Jail: filled to the floor, the next add fails with `ErrJailFull`; entries past
   their TTL make room; jailed sources stay dropped.
 - Geoip and bandwidth (LRU): an evicted geoip address escapes the reactive geo

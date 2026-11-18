@@ -200,7 +200,7 @@ protection goes off without a signal.
 
 | Map | When full |
 |---|---|
-| `wafio_conntrack` (LRU) | Evicts the flows used least recently. A host-opened TCP flow that lost its entry passes again by socket proof: an ACK (no SYN, no RST) with no usable outbound entry passes as a reply when the kernel holds an established connection for exactly its 4-tuple and no listener owns the local port. A forged ACK finds no such socket. |
+| `wafio_conntrack` (LRU) | Evicts the flows used least recently. A host-opened TCP flow that lost its entry passes again by socket proof: an ACK (no SYN, no RST) that a check replies skip would drop (the family-wide block, geo allow mode, the ingress default deny, the rate limit) passes as a reply when the kernel holds an established connection for exactly its 4-tuple and no listener owns the local port. A forged ACK finds no such socket. The proof runs only at such a drop, so a packet that passes anyway costs no socket lookup. |
 | `wafio_syn_state`, `wafio_rate_state`, `wafio_portscan` (hash) | The insert is refused. The packet passes and the per-source check is skipped, with no event. A source already tracked stays tracked, so a known abuser stays limited. The refusals count in `state_table_full` and in `wafio_state_full`. |
 | `wafio_bandwidth` (LRU) | Evicts. The accounting is incomplete; no verdict depends on it. |
 | `wafio_geoip` (LRU) | Evicts. An evicted address escapes the reactive geo block until the enricher resolves it again. The enricher clears its own cache when it reaches the size of the map. The geo CIDR tries are not affected. |

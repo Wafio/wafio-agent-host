@@ -1241,6 +1241,64 @@ update_conntrack(struct ip_key *src, struct ip_key *dst,
                          pkt_len);
 }
 
+/* conntrack_reply: 1 when an inbound packet answers a fresh outbound flow
+ * this host opened (CONN_OUTBOUND entry at the reverse key, written by TC
+ * egress). Stale or foreign entries are removed. Inbound packets never renew
+ * the authorization; only outbound packets do. */
+/* Out of line, key in wafio_xdp_ct_buf (TestXDPStackHeadroom); arguments
+ * packed as for update_conntrack_ool: ports = sport << 16 | dport (wire
+ * order), meta = proto | tcp_flags << 8. */
+static __noinline int
+conntrack_reply_ool(struct ip_key *src_key, struct ip_key *dst_key, __u32 ports,
+                    __u32 meta, __u32 pkt_len) {
+    __be16 sport = (__be16)(ports >> 16);
+    __be16 dport = (__be16)ports;
+    __u8 proto = meta & 0xff;
+    __u8 tcp_flags = (meta >> 8) & 0xff;
+    __u64 now_ns = bpf_ktime_get_ns();
+    __u32 zero = 0;
+    struct xdp_ct_scratch *b = bpf_map_lookup_elem(&wafio_xdp_ct_buf, &zero);
+    if (!b)
+        return 0;
+    struct conn_key *reply_ck = &b->ck;
+    __builtin_memset(reply_ck, 0, sizeof(*reply_ck));
+    __builtin_memcpy(&reply_ck->src, dst_key, sizeof(*dst_key)); /* our IP */
+    __builtin_memcpy(&reply_ck->dst, src_key, sizeof(*src_key)); /* remote IP */
+    reply_ck->sport = dport;  /* our port = dport of the incoming reply */
+    reply_ck->dport = sport;  /* remote port = sport of the incoming reply */
+    reply_ck->proto = proto;
+
+    struct conn_val *reply_cv = bpf_map_lookup_elem(&wafio_conntrack, reply_ck);
+    if (!reply_cv)
+        return 0;
+    __u64 ttl = proto == IPPROTO_TCP ? CONN_TCP_TTL_NS : CONN_UDP_TTL_NS;
+    if (!(reply_cv->flags_seen & CONN_OUTBOUND) || !ct_fresh(now_ns, reply_cv->last_seen_ns, ttl)) {
+        bpf_map_delete_elem(&wafio_conntrack, reply_ck);
+        return 0;
+    }
+    if (proto == IPPROTO_UDP ||
+        ((tcp_flags & 0x12) == 0x12 && reply_cv->tcp_state == 0) ||
+        ((tcp_flags & 0x10) && reply_cv->tcp_state == 1)) {
+        if (proto == IPPROTO_TCP)
+            reply_cv->tcp_state = 1; /* idempotent established transition */
+        __sync_fetch_and_add(&reply_cv->packets, 1);
+        __sync_fetch_and_add(&reply_cv->bytes, pkt_len);
+        if (tcp_flags & 0x05)
+            bpf_map_delete_elem(&wafio_conntrack, reply_ck);
+        return 1;
+    }
+    return 0;
+}
+
+static __always_inline int
+conntrack_reply(struct ip_key *src_key, struct ip_key *dst_key,
+                __be16 sport, __be16 dport, __u8 proto, __u8 tcp_flags,
+                __u32 pkt_len, __u64 now_ns) {
+    (void)now_ns;
+    return conntrack_reply_ool(src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
+                               (__u32)proto | (__u32)tcp_flags << 8, pkt_len);
+}
+
 /* xdp_socket_state: the state of the socket the kernel holds for a TCP tuple
  * as the receiving side sees it (saddr = the packet's source), or -1 for none.
  * remote_port 0 matches the listener only. The tuple lives in the per-CPU
@@ -1270,19 +1328,34 @@ xdp_socket_state(struct xdp_md *ctx, struct xdp_ct_scratch *b, struct ip_key *sr
     return state;
 }
 
-/* conntrack_socket_proof: an ACK (no SYN, no RST) for which conntrack holds no
- * usable outbound entry answers a flow this host opened when the kernel holds
- * a connection for exactly its tuple in an established-side state (the set
- * tc_inbound_socket uses) and no listener owns the local port (a listener
- * would make it an inbound connection). A restart or an evicted entry lost the
+/* conntrack_reply_proof: 1 when a TCP ACK (no SYN, no RST) that conntrack_reply
+ * did not recognise answers a flow this host opened. The kernel must hold a
+ * connection for exactly its tuple in an established-side state (the set
+ * tc_inbound_socket uses), and no listener may own the local port (a listener
+ * makes it an inbound connection). A restart or an evicted entry lost the
  * state; the kernel still knows the connection. The outbound entry is written
  * again, as TC egress writes it; a FIN writes none (the flow ends). A forged
- * ACK finds no such socket and keeps the verdict it had. */
-static __always_inline int
-conntrack_socket_proof(struct xdp_md *ctx, struct xdp_ct_scratch *b, struct ip_key *src,
-                       struct ip_key *dst, __be16 sport, __be16 dport, __u8 proto,
-                       __u8 tcp_flags, __u64 now_ns, __u32 pkt_len) {
-    if (proto != IPPROTO_TCP || !(tcp_flags & 0x10) || (tcp_flags & 0x06))
+ * ACK finds no such socket.
+ * The two socket lookups cost too much for every packet of every inbound
+ * connection, so the callers ask only at a drop that a reply would skip: the
+ * family-wide block, geo allow mode, the ingress default deny and the rate
+ * limit. A packet that passes anyway never gets here.
+ * Out of line, key and tuple in wafio_xdp_ct_buf (TestXDPStackHeadroom);
+ * arguments packed as for conntrack_reply_ool. The packet length comes from
+ * ctx, which keeps the call within five arguments. */
+static __noinline int
+conntrack_reply_proof_ool(struct xdp_md *ctx, struct ip_key *src, struct ip_key *dst,
+                          __u32 ports, __u32 meta) {
+    __be16 sport = (__be16)(ports >> 16);
+    __be16 dport = (__be16)ports;
+    __u8 proto = meta & 0xff;
+    __u8 tcp_flags = (meta >> 8) & 0xff;
+    if (proto != IPPROTO_TCP || sport == 0 || dport == 0 ||
+        !(tcp_flags & 0x10) || (tcp_flags & 0x06))
+        return 0;
+    __u32 zero = 0;
+    struct xdp_ct_scratch *b = bpf_map_lookup_elem(&wafio_xdp_ct_buf, &zero);
+    if (!b)
         return 0;
     int state = xdp_socket_state(ctx, b, src, dst, sport, dport);
     if (state != BPF_TCP_ESTABLISHED && state != BPF_TCP_CLOSE_WAIT &&
@@ -1293,11 +1366,18 @@ conntrack_socket_proof(struct xdp_md *ctx, struct xdp_ct_scratch *b, struct ip_k
         return 0;
     if (tcp_flags & 0x01)
         return 1;
+    __builtin_memset(&b->ck, 0, sizeof(b->ck));
+    __builtin_memcpy(&b->ck.src, dst, sizeof(*dst)); /* our IP */
+    __builtin_memcpy(&b->ck.dst, src, sizeof(*src)); /* remote IP */
+    b->ck.sport = dport;
+    b->ck.dport = sport;
+    b->ck.proto = proto;
     __builtin_memset(&b->cv, 0, sizeof(b->cv));
+    __u64 now_ns = bpf_ktime_get_ns();
     b->cv.first_seen_ns = now_ns;
     b->cv.last_seen_ns = now_ns;
     b->cv.packets = 1;
-    b->cv.bytes = pkt_len;
+    b->cv.bytes = (__u32)((long)ctx->data_end - (long)ctx->data);
     b->cv.tcp_state = 1;
     b->cv.flags_seen = CONN_OUTBOUND;
     if (bpf_map_update_elem(&wafio_conntrack, &b->ck, &b->cv, BPF_ANY) == 0) {
@@ -1307,65 +1387,11 @@ conntrack_socket_proof(struct xdp_md *ctx, struct xdp_ct_scratch *b, struct ip_k
     return 1;
 }
 
-/* conntrack_reply: 1 when an inbound packet answers a fresh outbound flow
- * this host opened (CONN_OUTBOUND entry at the reverse key, written by TC
- * egress, or by conntrack_socket_proof when that entry is missing or stale).
- * Stale or foreign entries are removed. Inbound packets never renew
- * the authorization; only outbound packets do. */
-/* Out of line, key in wafio_xdp_ct_buf (TestXDPStackHeadroom); arguments
- * packed as for update_conntrack_ool: ports = sport << 16 | dport (wire
- * order), meta = proto | tcp_flags << 8. The packet length comes from ctx,
- * which keeps the call within five arguments. */
-static __noinline int
-conntrack_reply_ool(struct xdp_md *ctx, struct ip_key *src_key, struct ip_key *dst_key,
-                    __u32 ports, __u32 meta) {
-    __be16 sport = (__be16)(ports >> 16);
-    __be16 dport = (__be16)ports;
-    __u8 proto = meta & 0xff;
-    __u8 tcp_flags = (meta >> 8) & 0xff;
-    __u32 pkt_len = (__u32)((long)ctx->data_end - (long)ctx->data);
-    __u64 now_ns = bpf_ktime_get_ns();
-    __u32 zero = 0;
-    struct xdp_ct_scratch *b = bpf_map_lookup_elem(&wafio_xdp_ct_buf, &zero);
-    if (!b)
-        return 0;
-    struct conn_key *reply_ck = &b->ck;
-    __builtin_memset(reply_ck, 0, sizeof(*reply_ck));
-    __builtin_memcpy(&reply_ck->src, dst_key, sizeof(*dst_key)); /* our IP */
-    __builtin_memcpy(&reply_ck->dst, src_key, sizeof(*src_key)); /* remote IP */
-    reply_ck->sport = dport;  /* our port = dport of the incoming reply */
-    reply_ck->dport = sport;  /* remote port = sport of the incoming reply */
-    reply_ck->proto = proto;
-
-    struct conn_val *reply_cv = bpf_map_lookup_elem(&wafio_conntrack, reply_ck);
-    if (!reply_cv)
-        return conntrack_socket_proof(ctx, b, src_key, dst_key, sport, dport, proto,
-                                      tcp_flags, now_ns, pkt_len);
-    __u64 ttl = proto == IPPROTO_TCP ? CONN_TCP_TTL_NS : CONN_UDP_TTL_NS;
-    if (!(reply_cv->flags_seen & CONN_OUTBOUND) || !ct_fresh(now_ns, reply_cv->last_seen_ns, ttl)) {
-        bpf_map_delete_elem(&wafio_conntrack, reply_ck);
-        return conntrack_socket_proof(ctx, b, src_key, dst_key, sport, dport, proto,
-                                      tcp_flags, now_ns, pkt_len);
-    }
-    if (proto == IPPROTO_UDP ||
-        ((tcp_flags & 0x12) == 0x12 && reply_cv->tcp_state == 0) ||
-        ((tcp_flags & 0x10) && reply_cv->tcp_state == 1)) {
-        if (proto == IPPROTO_TCP)
-            reply_cv->tcp_state = 1; /* idempotent established transition */
-        __sync_fetch_and_add(&reply_cv->packets, 1);
-        __sync_fetch_and_add(&reply_cv->bytes, pkt_len);
-        if (tcp_flags & 0x05)
-            bpf_map_delete_elem(&wafio_conntrack, reply_ck);
-        return 1;
-    }
-    return 0;
-}
-
 static __always_inline int
-conntrack_reply(struct xdp_md *ctx, struct ip_key *src_key, struct ip_key *dst_key,
-                __be16 sport, __be16 dport, __u8 proto, __u8 tcp_flags) {
-    return conntrack_reply_ool(ctx, src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
-                               (__u32)proto | (__u32)tcp_flags << 8);
+conntrack_reply_proof(struct xdp_md *ctx, struct ip_key *src_key, struct ip_key *dst_key,
+                      __be16 sport, __be16 dport, __u8 proto, __u8 tcp_flags) {
+    return conntrack_reply_proof_ool(ctx, src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
+                                     (__u32)proto | (__u32)tcp_flags << 8);
 }
 
 /* xdp_dhcp4_reply: a DHCPv4 BOOTREPLY (67→68) passes the ingress default
@@ -1674,6 +1700,14 @@ xdp_l4_stage(struct xdp_md *ctx) {
     if (a->dport != 0) {
         __u16 dport_host = bpf_ntohs(a->dport);
         action = check_port_policy_ingress(dport_host, a->proto, a->now_ns, a->is_reply || a->dhcp_reply);
+        /* The default deny (no rule for the port) spares replies: one that
+         * lost its conntrack entry passes on socket proof. */
+        if (action == ACTION_DROP && !a->is_reply && cfg->enable_conntrack &&
+            !match_port_rule(dport_host, a->proto, PORT_DIR_INGRESS, a->now_ns) &&
+            conntrack_reply_proof(ctx, &a->src, &a->dst, a->sport, a->dport, a->proto, a->tcp_flags)) {
+            a->is_reply = 1;
+            action = ACTION_ALLOW;
+        }
         if (action == ACTION_DROP) {
             struct metrics_val *metrics = get_metrics();
             if (metrics) {
@@ -1692,6 +1726,13 @@ xdp_l4_stage(struct xdp_md *ctx) {
     if (cfg->enable_ratelimit &&
         rate_limited_flow(&a->src, &a->dst, a->sport, a->dport, a->proto, a->is_reply)) {
         action = check_rate_limit(&a->src, a->pkt_len, a->now_ns);
+        /* Replies are not rate limited: one that lost its conntrack entry
+         * passes on socket proof. */
+        if (action == ACTION_DROP && cfg->enable_conntrack &&
+            conntrack_reply_proof(ctx, &a->src, &a->dst, a->sport, a->dport, a->proto, a->tcp_flags)) {
+            a->is_reply = 1;
+            action = ACTION_ALLOW;
+        }
         if (action == ACTION_DROP) {
             struct metrics_val *metrics = get_metrics();
             if (metrics) {
@@ -1810,8 +1851,8 @@ process_ipv4(struct xdp_md *ctx, void *data, void *data_end,
     int cp_peer = control_plane_peer(&src_key, sport, iph->protocol);
     int is_reply = 0;
     if ((cfg->enable_conntrack || cp_peer) && sport != 0 && dport != 0)
-        is_reply = conntrack_reply(ctx, &src_key, &dst_key, sport, dport,
-                                   iph->protocol, tcp_flags);
+        is_reply = conntrack_reply(&src_key, &dst_key, sport, dport,
+                                   iph->protocol, tcp_flags, pkt_len, now_ns);
     if (cp_peer && is_reply)
         return XDP_PASS;
     /* DHCPv4 BOOTREPLYs answering this host's pending broadcast request
@@ -1825,6 +1866,16 @@ process_ipv4(struct xdp_md *ctx, void *data, void *data_end,
     /* A port-scoped allowlist entry passes only TCP/UDP to its ports; the
      * rest of the source's traffic continues below. */
     action = check_ip_lists(&src_key, now_ns, is_reply, iph->protocol, dport);
+    if (action == ACTION_DROP && !is_reply && cfg->enable_conntrack) {
+        /* The family-wide block spares replies: one that lost its
+         * conntrack entry passes on socket proof. */
+        int as_reply = check_ip_lists(&src_key, now_ns, 1, iph->protocol, dport);
+        if (as_reply != ACTION_DROP &&
+            conntrack_reply_proof(ctx, &src_key, &dst_key, sport, dport, iph->protocol, tcp_flags)) {
+            is_reply = 1;
+            action = as_reply;
+        }
+    }
     if (action == ACTION_ALLOW) {
         struct metrics_val *metrics = get_metrics();
         if (metrics) __sync_fetch_and_add(&metrics->allowlist_passes, 1);
@@ -1882,6 +1933,13 @@ process_ipv4(struct xdp_md *ctx, void *data, void *data_end,
                                            &src_key, &dst_key, sport, dport,
                                            iph->protocol, tcp_flags,
                                            gc->allow_since_ns, now_ns);
+            }
+            /* Allow mode passes replies: one that lost its conntrack entry
+             * passes on socket proof. */
+            if (action == ACTION_DROP && cfg->enable_conntrack &&
+                conntrack_reply_proof(ctx, &src_key, &dst_key, sport, dport, iph->protocol, tcp_flags)) {
+                is_reply = 1;
+                action = ACTION_ALLOW;
             }
         }
         if (action == ACTION_DROP) {
@@ -2000,8 +2058,8 @@ process_ipv6(struct xdp_md *ctx, void *data, void *data_end,
     int cp_peer = control_plane_peer(&src_key, sport, headers->proto);
     int is_reply = 0;
     if ((cfg->enable_conntrack || cp_peer) && sport != 0 && dport != 0)
-        is_reply = conntrack_reply(ctx, &src_key, &dst_key, sport, dport,
-                                   headers->proto, tcp_flags);
+        is_reply = conntrack_reply(&src_key, &dst_key, sport, dport,
+                                   headers->proto, tcp_flags, pkt_len, now_ns);
     if (cp_peer && is_reply)
         return XDP_PASS;
     /* DHCPv6 replies from a link-local server (never routed, so on-link)
@@ -2012,6 +2070,14 @@ process_ipv6(struct xdp_md *ctx, void *data, void *data_end,
 
     /* ── 1. Allowlist / Blocklist (scoped entries: see IPv4) ─────────── */
     action = check_ip_lists(&src_key, now_ns, is_reply, headers->proto, dport);
+    if (action == ACTION_DROP && !is_reply && cfg->enable_conntrack) { /* as IPv4 */
+        int as_reply = check_ip_lists(&src_key, now_ns, 1, headers->proto, dport);
+        if (as_reply != ACTION_DROP &&
+            conntrack_reply_proof(ctx, &src_key, &dst_key, sport, dport, headers->proto, tcp_flags)) {
+            is_reply = 1;
+            action = as_reply;
+        }
+    }
     if (action == ACTION_ALLOW) {
         struct metrics_val *metrics = get_metrics();
         if (metrics) __sync_fetch_and_add(&metrics->allowlist_passes, 1);
@@ -2064,6 +2130,11 @@ process_ipv6(struct xdp_md *ctx, void *data, void *data_end,
                                            &src_key, &dst_key, sport, dport,
                                            headers->proto, tcp_flags,
                                            gc->allow_since_ns, now_ns);
+            }
+            if (action == ACTION_DROP && cfg->enable_conntrack && /* as IPv4 */
+                conntrack_reply_proof(ctx, &src_key, &dst_key, sport, dport, headers->proto, tcp_flags)) {
+                is_reply = 1;
+                action = ACTION_ALLOW;
             }
         }
         if (action == ACTION_DROP) {
