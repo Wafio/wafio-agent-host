@@ -31,7 +31,6 @@ import (
 // ────────────────────────────────────────────────────────────────────────────
 
 const (
-	traceMapEvents    = "trace_events"
 	traceMapConfig    = "trace_config_map"
 	traceMapStats     = "trace_stats"
 	traceMapEnforce   = "trace_enforce_map"
@@ -124,9 +123,18 @@ type TraceManager struct {
 	// Open results (trace_open_result_linux.go): openCtlMap arms the kernel to
 	// hold open events for their result, openStatsMap counts how they left;
 	// both nil with objects that predate it. openResultArmed: armed.
+	// openPendingMap holds the opens waiting for their result.
 	openCtlMap      *ebpf.Map
 	openStatsMap    *ebpf.Map
+	openPendingMap  *ebpf.Map
 	openResultArmed bool
+
+	// Map capacity (map_capacity_linux.go): sampled by traceLossLoop, read by Status.
+	capMu     sync.Mutex
+	capSample []MapCapacity
+	capAt     time.Time
+	fullTrack mapFullTracker
+	counter   entryCounter
 
 	// BPF-LSM proactive blocking
 	lsmColl       *ebpf.Collection
@@ -216,6 +224,10 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load trace BPF object %s: %w", tm.cfg.ObjectPath, err)
 	}
+
+	// The ring and the open-result map are sized before the load, from the
+	// host memory (see ComputeMapSizes).
+	applyMapSizes(spec.Maps, tm.cfg.MapSizes)
 
 	// User-string syscall hooks on a kernel whose tracepoints copy user
 	// memory (6.19+/7.0) attach as kprobes (trace_probes_kprobe.go); the
@@ -374,6 +386,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	// reports open results.
 	tm.openCtlMap = coll.Maps[traceMapOpenCtl]
 	tm.openStatsMap = coll.Maps[traceMapOpenStats]
+	tm.openPendingMap = coll.Maps[traceMapOpenPending]
 	tm.armOpenResult()
 
 	// Kill-candidate priority ring: read by its own goroutine, so a
@@ -514,7 +527,7 @@ func (tm *TraceManager) Stop() error {
 		tm.coll.Close()
 		tm.coll = nil
 	}
-	tm.openCtlMap, tm.openStatsMap, tm.openResultArmed = nil, nil, false
+	tm.openCtlMap, tm.openStatsMap, tm.openPendingMap, tm.openResultArmed = nil, nil, nil, false
 
 	tm.running = false
 	tm.log.Printf("trace manager stopped (processed %d events)", tm.totalEvents.Load())
@@ -948,7 +961,7 @@ func (tm *TraceManager) GetStats() (*TraceStats, error) {
 		EventCounts: make(map[string]uint64),
 		BySeverity:  make(map[string]uint64),
 		ByCategory:  make(map[string]uint64),
-		BufferTotal: 1 << 24, // 16MB
+		BufferTotal: tm.ringSize(),
 	}
 
 	if !tm.running {
@@ -1089,7 +1102,7 @@ func (tm *TraceManager) Status() TraceStatus {
 		ProbeNames:             make([]string, len(tm.linkNames)),
 		EventsTotal:            tm.totalEvents.Load(),
 		EventsDropped:          tm.droppedEvents.Load(),
-		RingbufSizeMB:          16,
+		RingbufSizeMB:          int(tm.ringSize() >> 20),
 		Enforcement:            tm.enforceMap != nil,
 		UserspaceKillSupported: tm.pidfdOK || tm.deferredMap != nil,
 		TerminationMode:        tm.terminationMode(),
@@ -1127,6 +1140,7 @@ func (tm *TraceManager) Status() TraceStatus {
 
 	if tm.running {
 		s.UptimeMs = time.Since(tm.startedAt).Milliseconds()
+		s.MapSizing = tm.mapSizingStatus()
 	}
 
 	return s

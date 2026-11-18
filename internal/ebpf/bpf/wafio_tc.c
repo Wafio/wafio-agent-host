@@ -110,12 +110,16 @@ struct {
     __type(value, struct port_policy_config);
 } wafio_port_policy_config SEC(".maps");
 
-/* Egress IP blocklist — block outbound connections to specific IPs */
+/* Egress IP blocklist: blocks outbound connections to specific IPs. Entries
+ * are allocated on insert (BPF_F_NO_PREALLOC), so the map costs memory only
+ * for its content. The programs read and delete; the agent writes. Shared with
+ * XDP: both declarations carry the same flags. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH); /* never evicts an operator entry */
     __uint(max_entries, MAX_EGRESS_BLOCKLIST);
     __type(key, struct ip_key);
     __type(value, struct ip_list_val);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } wafio_egress_blocklist SEC(".maps");
 
 /* Egress Subnet CIDR blocklist LPM trie for IPv4 */

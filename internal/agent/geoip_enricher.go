@@ -69,14 +69,10 @@ func (e *GeoIPEnricher) EnrichIP(ip string) {
 	if ip == "" || e.lookup == nil || e.ebpfMgr == nil {
 		return
 	}
-	e.mu.Lock()
-	if _, ok := e.seen[ip]; ok {
-		e.mu.Unlock()
+	// optimistic mark so concurrent callers don't duplicate work
+	if !e.reserve(ip, int(e.ebpfMgr.GeoIPMaxEntries())) {
 		return
 	}
-	// optimistic mark so concurrent callers don't duplicate work
-	e.seen[ip] = ""
-	e.mu.Unlock()
 
 	parsed := net.ParseIP(ip)
 	if parsed == nil || isPrivateOrBogon(parsed) {
@@ -96,6 +92,24 @@ func (e *GeoIPEnricher) EnrichIP(ip string) {
 	e.mu.Lock()
 	e.seen[ip] = country
 	e.mu.Unlock()
+}
+
+// reserve marks ip as being looked up and reports whether the caller should
+// look it up (false: already known). A cache that has reached limit entries,
+// the size of the kernel map (0: no limit), is cleared first: the kernel map
+// evicts at that size, so an address the cache still holds may be gone from
+// the map, and the cache must not grow without bound.
+func (e *GeoIPEnricher) reserve(ip string, limit int) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.seen[ip]; ok {
+		return false
+	}
+	if limit > 0 && len(e.seen) >= limit {
+		clear(e.seen)
+	}
+	e.seen[ip] = ""
+	return true
 }
 
 // HasDataset reports whether a GeoIP country database is loaded, so the

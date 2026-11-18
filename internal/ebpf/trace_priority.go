@@ -243,8 +243,9 @@ const (
 	// hide activity does not.
 	traceShedHighStreak = 6
 	// traceShedHighCount: events shed in one check that make the event HIGH
-	// at once (10,000/s over 10 s, about the ring's whole capacity per
-	// second).
+	// at once, a rate of 10,000 events a second over the 10 s between checks.
+	// It is a rate threshold, not a share of the ring: the size of the ring
+	// follows the memory of the host (ComputeMapSizes).
 	traceShedHighCount = 100_000
 )
 

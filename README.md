@@ -140,6 +140,110 @@ journalctl -u wafio-host-agent -b | grep 'protected-process self-check'
 `kernel_set=present` means the kernel side protects them too. `proc_access=denied`
 means the unit lacks `CAP_SYS_PTRACE`.
 
+### Memory use and map sizes
+
+The firewall keeps its state in BPF maps that the kernel preallocates when the
+agent loads them, whatever the traffic. Every host used to pay about 190 MB of
+kernel memory for them. The agent now sizes the maps from the memory of the host
+when it loads them, so a small server does not pay for the capacity of a large one.
+
+**Formula.** The memory basis R is `MemTotal` from `/proc/meminfo`, lowered to
+the smallest numeric `memory.max` on the agent's cgroup v2 path up to the root
+(kernels from 5.11 charge map memory to the cgroup; cgroup v1 is ignored). If
+`MemTotal` cannot be read the agent uses the full sizes and logs a WARN. The
+scale is `s = min(1, R / 8 GiB)`. Each hash or LRU map gets
+`clamp(trunc(ceiling * s), floor, ceiling)`: the ceiling is the size the object
+declares, the floor is what a small server still needs. An LRU map keeps at least
+1024 entries for each possible CPU (at most its ceiling), because every CPU holds
+free nodes back and eviction starts before the map is full. `trace_events` is the
+largest power of two at most 16 MiB * s, between 4 and 16 MiB. No size is ever
+above its ceiling, and the same formula applies to every map.
+
+| Map | Type | Ceiling | Floor |
+|---|---|---|---|
+| `wafio_conntrack` | LRU | 500000 | 65536 |
+| `wafio_syn_state` | hash | 200000 | 16384 |
+| `wafio_rate_state` | hash | 100000 | 16384 |
+| `wafio_portscan` | hash | 100000 | 16384 |
+| `wafio_bandwidth` | LRU | 100000 | 8192 |
+| `wafio_geoip` | LRU | 100000 | 16384 |
+| `wafio_jail` | hash | 65536 | 16384 |
+| `trace_open_pending` | hash | 2048 | 512 |
+| `trace_events` | ring buffer | 16 MiB | 4 MiB |
+
+`wafio_egress_blocklist` is not scaled: it is allocated on insert, so its memory
+follows its content, and its capacity stays 100000. The maps of 1 MB or less keep
+their fixed sizes. The memory the sized maps preallocate (key, value and about 64
+bytes an entry, estimated):
+
+| Host memory | 1 GB | 2 GB | 4 GB | 8 GB and more |
+|---|---|---|---|---|
+| Sized maps | 28 MB | 45 MB | 90 MB | 180 MB |
+
+At the smallest scale the sized maps take about 26 MB, at full scale about 180 MB.
+The LPM tries (allow, block, geo CIDR, egress subnets) are allocated on insert and
+grow with their content.
+
+**Setting.** `--ebpf-map-scale` takes `auto` (the default) or a number above 0 and
+at most 1, which replaces `s`: `1` gives every host the full sizes, `0.001` every
+map its floor. `WAFIO_EBPF_MAP_SCALE` is read when the flag is not set, so the
+unit's `ExecStart` stays as it is. Any other value stops the start with
+`invalid --ebpf-map-scale "1.5" (or WAFIO_EBPF_MAP_SCALE): want auto or a number above 0 and at most 1`.
+Every start logs the sizes in use, for example:
+
+```
+eBPF map sizing: scale=0.240 source=auto memory=1962MiB (meminfo) wafio_conntrack=119750 wafio_syn_state=47900 wafio_rate_state=23950 wafio_portscan=23950 wafio_bandwidth=23950 wafio_geoip=23950 wafio_jail=16384 trace_open_pending=512 trace_events=4MiB est=41MiB
+```
+
+**When a map is full.** A full map never makes legitimate traffic drop, and no
+protection goes off without a signal.
+
+| Map | When full |
+|---|---|
+| `wafio_conntrack` (LRU) | Evicts the flows used least recently. A host-opened TCP flow that lost its entry passes again by socket proof: an ACK (no SYN, no RST) with no usable outbound entry passes as a reply when the kernel holds an established connection for exactly its 4-tuple and no listener owns the local port. A forged ACK finds no such socket. |
+| `wafio_syn_state`, `wafio_rate_state`, `wafio_portscan` (hash) | The insert is refused. The packet passes and the per-source check is skipped, with no event. A source already tracked stays tracked, so a known abuser stays limited. The refusals count in `state_table_full` and in `wafio_state_full`. |
+| `wafio_bandwidth` (LRU) | Evicts. The accounting is incomplete; no verdict depends on it. |
+| `wafio_geoip` (LRU) | Evicts. An evicted address escapes the reactive geo block until the enricher resolves it again. The enricher clears its own cache when it reaches the size of the map. The geo CIDR tries are not affected. |
+| `wafio_jail` (hash) | Refuses a new address. The agent first deletes the entries past their TTL and tries once more; if the jail is still full the local API answers `409 IP_LIST_FULL` and the refusal is counted. A jailed address is never evicted, and the WAF agent still blocks at L7. |
+| `trace_open_pending` (hash) | The open result is unknown. The event leaves without a result and counts in `open_result_unknown`. |
+| `trace_events` (ring) | Low-severity events are shed at 6/8 full and the losses are counted. |
+
+**What the operator sees.** The status carries `map_sizing` (`ebpf_status` for the
+firewall maps, `trace_status` for the trace maps): the scale and where it came
+from, the memory it came from, and for each sized map `max_entries`, the size the
+object declares, the live `entries` (sampled every 30 s), `full_count` (inserts
+refused since start; absent for the LRU maps) and `last_full_at`. For an LRU map,
+`last_full_at` is the last sample within one eviction margin of full. While a
+firewall map was full in the last 10 minutes the status adds one coverage warning,
+`eBPF maps full in the last 10 minutes: <names>. Map scale <s> (<source>): raise WAFIO_EBPF_MAP_SCALE (at most 1) or look for a flood.`,
+which marks the host degraded in the fleet view. The agent logs a WARN when a map
+becomes full, at most once every 10 minutes for each map. A full map during a flood
+is the table doing its job: raise the scale only when it is full without one.
+
+**Restart and upgrade.** Nothing is pinned: every start creates its maps at the
+size it computes, so a change of size or of the agent version cannot meet an old
+map. Every restart loses the conntrack table, the detection counters, the jail,
+the bandwidth accounting and the geoip cache, whatever the size; the policy comes
+back from the last good state. Inbound flows to allowed ports pass and TC adopts
+them again. Host-opened TCP passes by socket proof. Host-opened UDP recovers on
+the host's next outbound packet. Jail entries return when the WAF agent jails the
+address again. Geo allow mode starts its grace again. The last good restore cannot
+fail on size, because the egress capacity does not depend on the scale. TC takes
+size and flags of every shared map from the XDP map, so a size difference between
+two objects cannot switch the firewall off. On a kernel that attaches TC through a
+legacy clsact filter (before 6.6), a start removes the `wafio_` filters that a
+killed agent left behind. Between the old programs detaching and the new ones
+attaching the host runs unfiltered; `docs/lab.md` has the measured time.
+
+**Known limits.** Under egress Deny All, a DNAT or container flow whose entry was
+evicted or lost is cut until the client reconnects: the socket proof sees only
+sockets of the host namespace, and a fix needs the netfilter conntrack kfuncs
+(kernel 6.0 and later). Host-opened UDP has no proof and recovers only on the
+host's next outbound packet. An agent with old objects ignores the setting, and a
+new agent with old objects sizes the maps by name but keeps an LRU jail (no full
+signal) and has no socket proof; the bundle ships the objects with the binary, so
+this happens only on a mixed manual install.
+
 ### eBPF objects ship with the binary
 
 The release bundle carries the compiled objects next to the binary

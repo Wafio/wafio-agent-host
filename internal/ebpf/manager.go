@@ -35,12 +35,7 @@ const (
 	mapAllowScopes      = "wafio_allow_scopes" // marker: the walk matches port scopes
 	mapBlock4           = "wafio_block4"
 	mapBlock6           = "wafio_block6"
-	mapJail             = "wafio_jail" // WAF-agent jail
 	mapRateConfig       = "wafio_rate_config"
-	mapRateState        = "wafio_rate_state"
-	mapSynState         = "wafio_syn_state"
-	mapConntrack        = "wafio_conntrack"
-	mapGeoIP            = "wafio_geoip"
 	mapGeoBlocked       = "wafio_geo_blocked"
 	mapGeoCIDR4         = "wafio_geo_cidr4"
 	mapGeoCIDR6         = "wafio_geo_cidr6"
@@ -49,9 +44,7 @@ const (
 	mapGeoLocal6        = "wafio_geo_local6"
 	mapMetrics          = "wafio_metrics"
 	mapEvents           = "wafio_events"
-	mapPortscan         = "wafio_portscan"
 	mapPortscanCfg      = "wafio_portscan_config"
-	mapBandwidth        = "wafio_bandwidth"
 	mapAnomalyConfig    = "wafio_anomaly_config"
 	mapPortPolicy       = "wafio_port_policy"
 	mapPortPolicyConfig = "wafio_port_policy_config"
@@ -114,6 +107,7 @@ type Manager struct {
 	egressSubnetV4Map  *ebpf.Map
 	egressSubnetV6Map  *ebpf.Map
 	cpEndpointsMap     *ebpf.Map // nil on objects without the exemptions
+	stateFullMap       *ebpf.Map // refused inserts of the per-source state maps; nil on older objects
 
 	// lockoutExemptions: both objects carry the reply and control-plane
 	// exemptions (the shared wafio_cp_endpoints map is their ABI marker).
@@ -166,6 +160,15 @@ type Manager struct {
 	lastMetricsMu sync.RWMutex
 	prevMetrics   *MetricsVal
 	prevMetricsAt time.Time
+
+	// ── map capacity (sampled by the poller, read by Status) ──
+	capMu     sync.Mutex
+	capSample []MapCapacity
+	capAt     time.Time
+	fullTrack mapFullTracker
+	counter   entryCounter
+	// jailFull counts the jail entries refused because the jail was full.
+	jailFull atomic.Uint64
 
 	// ── background goroutines ──
 	cancel context.CancelFunc
@@ -384,6 +387,12 @@ func (m *Manager) Status() Status {
 	if !s.TCEgress {
 		s.CoverageWarnings = append(s.CoverageWarnings, "TC egress is not attached")
 	}
+	if m.running {
+		s.MapSizing = m.mapSizingStatus()
+		if w := mapFullWarning(s.MapSizing, time.Now()); w != "" {
+			s.CoverageWarnings = append(s.CoverageWarnings, w)
+		}
+	}
 
 	if m.running {
 		s.StartedAt = m.startedAt
@@ -475,6 +484,17 @@ func (m *Manager) Status() Status {
 	return s
 }
 
+// GeoIPMaxEntries is the size of the wafio_geoip cache map, 0 while it is not
+// loaded.
+func (m *Manager) GeoIPMaxEntries() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.geoipMap == nil {
+		return 0
+	}
+	return m.geoipMap.MaxEntries()
+}
+
 // Events returns a read-only channel of decoded perf events.
 func (m *Manager) Events() <-chan Event {
 	return m.events
@@ -495,6 +515,7 @@ func (m *Manager) loadXDP() error {
 	if pa := spec.Maps["wafio_xdp_progs"]; pa != nil {
 		pa.Pinning = ebpf.PinNone
 	}
+	applyMapSizes(spec.Maps, m.cfg.MapSizes)
 
 	opts := ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{
@@ -536,6 +557,7 @@ func (m *Manager) loadXDP() error {
 	m.portPolicyCfgMap = coll.Maps[mapPortPolicyConfig]
 	m.egressBlocklistMap = coll.Maps[mapEgressBlocklist]
 	m.cpEndpointsMap = coll.Maps[mapCPEndpoints]
+	m.stateFullMap = coll.Maps[mapStateFull]
 
 	// Populate the tail-call PROG_ARRAY: entry dispatches to per-family
 	// sub-programs. Each gets its own verifier budget (kernel 5.15).
@@ -561,12 +583,20 @@ func (m *Manager) loadTC() error {
 	// Reuse shared maps from XDP collection. A replacement must exist in the
 	// TC spec (cilium/ebpf rejects unknown names), so a TC object older than
 	// the XDP object still loads — without the maps it does not know.
+	//
+	// Size and flags of each replacement are those of the XDP map: the
+	// objects may declare other sizes or flags (an older TC object, another
+	// scale), and cilium/ebpf refuses a replacement that differs, which would
+	// leave the firewall without TC.
+	applyMapSizes(spec.Maps, m.cfg.MapSizes)
 	replacements := make(map[string]*ebpf.Map)
 	shared := []string{mapConfig, mapConntrack, mapEvents, mapMetrics,
 		mapPortPolicy, mapPortPolicyConfig, mapEgressBlocklist, mapCPEndpoints,
 		mapDHCPPending, mapDHCPServers}
 	for _, name := range shared {
 		if xm := m.xdpColl.Maps[name]; xm != nil && spec.Maps[name] != nil {
+			spec.Maps[name].MaxEntries = xm.MaxEntries()
+			spec.Maps[name].Flags = xm.Flags()
 			replacements[name] = xm
 		}
 	}
@@ -657,7 +687,7 @@ func (m *Manager) attachTC() error {
 		}
 		m.log.Printf("TCX %s unavailable: %v; trying legacy clsact", hook.name, err)
 		if m.legacyTC == nil {
-			m.legacyTC = &legacyTCAttachment{ifIndex: m.ifIndex}
+			m.legacyTC = &legacyTCAttachment{ifIndex: m.ifIndex, logf: m.log.Printf}
 		}
 		if legacyErr := m.legacyTC.attach(hook.parent, prog); legacyErr != nil {
 			return fmt.Errorf("attach %s: TCX: %v; clsact: %w", hook.name, err, legacyErr)
@@ -743,12 +773,16 @@ func (m *Manager) metricsPollerLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(m.cfg.MetricsPollMs) * time.Millisecond)
 	defer ticker.Stop()
 
+	ticks := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			m.pruneDetectionState()
+			if ticks++; ticks%mapSampleEveryTicks == 0 {
+				m.sampleMaps(time.Now())
+			}
 			snap, err := m.readRawMetrics()
 			if err != nil {
 				continue
@@ -1338,6 +1372,7 @@ func (m *Manager) cleanup() {
 	m.egressSubnetV4Map = nil
 	m.egressSubnetV6Map = nil
 	m.cpEndpointsMap = nil
+	m.stateFullMap = nil
 	m.lockoutExemptions = false
 	m.cpPort = 0
 }

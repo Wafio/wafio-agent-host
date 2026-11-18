@@ -186,6 +186,7 @@ func (tm *TraceManager) traceLossLoop(ctx context.Context) {
 	prevAgent := tm.lossTotals(prev.BulkLost)
 	prevShed := tm.readShedCounters()
 	shedStreak := 0
+	ticks := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -194,6 +195,9 @@ func (tm *TraceManager) traceLossLoop(ctx context.Context) {
 		}
 		cur := tm.readLossCounters()
 		now := time.Now()
+		if ticks++; ticks%traceMapSampleEveryTicks == 0 {
+			tm.sampleMaps(now)
+		}
 		if evt, ok := traceLossAlert(prev, cur, now); ok {
 			evt.EventID = fmt.Sprintf("%s-loss-%d", tm.eventPrefix, now.UnixNano())
 			evt.PID = agentPID()

@@ -76,9 +76,11 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } wafio_block6 SEC(".maps");
 
-/* Jail (wafio_common.h): addresses jailed by the WAF agent. */
+/* Jail (wafio_common.h): addresses jailed by the WAF agent. A HASH map, so a
+ * full jail refuses the next entry (the agent sees E2BIG and counts it) instead
+ * of evicting a jailed address. */
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_JAIL_SIZE);
     __type(key, struct ip_key);
     __type(value, struct ip_list_val);
@@ -107,6 +109,21 @@ struct {
     __type(key, struct ip_key);
     __type(value, struct syn_state);
 } wafio_syn_state SEC(".maps");
+
+/* Inserts the three per-source state maps above refused because they were
+ * full, per CPU: slot 0 rate limit, 1 SYN flood, 2 port scan (the port scan
+ * map is declared further down). The packet passes unchecked when its source
+ * cannot be tracked; sources already tracked stay limited. Optional: an agent
+ * tolerates an object without it. */
+#define STATE_FULL_RATE     0
+#define STATE_FULL_SYN      1
+#define STATE_FULL_PORTSCAN 2
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 3);
+    __type(key, __u32);
+    __type(value, __u64);
+} wafio_state_full SEC(".maps");
 
 /* Global SYN pressure (per-CPU window) — stateless-ish flood detector that
  * costs no shared memory and cannot be exhausted by spoofed sources. */
@@ -310,12 +327,16 @@ struct {
     __type(value, struct port_policy_config);
 } wafio_port_policy_config SEC(".maps");
 
-/* Egress IP blocklist — block outbound connections to specific IPs */
+/* Egress IP blocklist: blocks outbound connections to specific IPs. Entries
+ * are allocated on insert (BPF_F_NO_PREALLOC), so the map costs memory only
+ * for its content. The programs read and delete; the agent writes. Shared with
+ * TC: both declarations carry the same flags. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH); /* never evicts an operator entry */
     __uint(max_entries, MAX_EGRESS_BLOCKLIST);
     __type(key, struct ip_key);
     __type(value, struct ip_list_val);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } wafio_egress_blocklist SEC(".maps");
 
 /* Control-plane endpoints — shared with TC; see wafio_common.h. */
@@ -380,6 +401,7 @@ struct {
 struct xdp_ct_scratch {
     struct conn_key ck;
     struct conn_val cv;
+    struct bpf_sock_tuple t; /* socket lookup tuple (conntrack_socket_proof) */
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -446,6 +468,16 @@ static __always_inline struct metrics_val *
 get_metrics(void) {
     __u32 key = 0;
     return bpf_map_lookup_elem(&wafio_metrics, &key);
+}
+
+/* state_full: a per-source state map refused a new source. Counted in
+ * state_table_full and in the map's own slot of wafio_state_full. */
+static __always_inline void
+state_full(__u32 slot) {
+    struct metrics_val *metrics = get_metrics();
+    if (metrics) __sync_fetch_and_add(&metrics->state_table_full, 1);
+    __u64 *cnt = bpf_map_lookup_elem(&wafio_state_full, &slot);
+    if (cnt) __sync_fetch_and_add(cnt, 1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -714,9 +746,11 @@ check_rate_limit(struct ip_key *src_ip, __u32 pkt_len, __u64 now_ns) {
         bpf_map_update_elem(&wafio_rate_state, src_ip, &initial, BPF_NOEXIST);
         state = bpf_map_lookup_elem(&wafio_rate_state, src_ip);
         if (!state) {
-            struct metrics_val *metrics = get_metrics();
-            if (metrics) __sync_fetch_and_add(&metrics->state_table_full, 1);
-            return ACTION_LOG;
+            /* Full: this source is not tracked, so the packet passes. A
+             * logged "detection" here would flood the event ring during the
+             * very attack that filled the table. */
+            state_full(STATE_FULL_RATE);
+            return ACTION_ALLOW;
         }
     }
     int result = ACTION_ALLOW;
@@ -870,9 +904,8 @@ check_syn_flood(struct ip_key *src_ip, struct ip_key *dst_ip, __u32 ports,
         bpf_map_update_elem(&wafio_syn_state, src_ip, &initial, BPF_NOEXIST);
         state = bpf_map_lookup_elem(&wafio_syn_state, src_ip);
         if (!state) {
-            struct metrics_val *metrics = get_metrics();
-            if (metrics) __sync_fetch_and_add(&metrics->state_table_full, 1);
-            return ACTION_LOG;
+            state_full(STATE_FULL_SYN); /* as in check_rate_limit */
+            return ACTION_ALLOW;
         }
     }
     int result = ACTION_ALLOW;
@@ -1208,20 +1241,89 @@ update_conntrack(struct ip_key *src, struct ip_key *dst,
                          pkt_len);
 }
 
+/* xdp_socket_state: the state of the socket the kernel holds for a TCP tuple
+ * as the receiving side sees it (saddr = the packet's source), or -1 for none.
+ * remote_port 0 matches the listener only. The tuple lives in the per-CPU
+ * conntrack scratch value (TestXDPStackHeadroom). */
+static __always_inline int
+xdp_socket_state(struct xdp_md *ctx, struct xdp_ct_scratch *b, struct ip_key *src,
+                 struct ip_key *dst, __be16 remote_port, __be16 local_port) {
+    struct bpf_sock *sk;
+    __builtin_memset(&b->t, 0, sizeof(b->t));
+    if (src->family == AF_INET) {
+        b->t.ipv4.saddr = src->addr.v4;
+        b->t.ipv4.daddr = dst->addr.v4;
+        b->t.ipv4.sport = remote_port;
+        b->t.ipv4.dport = local_port;
+        sk = bpf_sk_lookup_tcp(ctx, &b->t, sizeof(b->t.ipv4), BPF_F_CURRENT_NETNS, 0);
+    } else {
+        __builtin_memcpy(b->t.ipv6.saddr, &src->addr.v6, 16);
+        __builtin_memcpy(b->t.ipv6.daddr, &dst->addr.v6, 16);
+        b->t.ipv6.sport = remote_port;
+        b->t.ipv6.dport = local_port;
+        sk = bpf_sk_lookup_tcp(ctx, &b->t, sizeof(b->t.ipv6), BPF_F_CURRENT_NETNS, 0);
+    }
+    if (!sk)
+        return -1;
+    int state = sk->state;
+    bpf_sk_release(sk);
+    return state;
+}
+
+/* conntrack_socket_proof: an ACK (no SYN, no RST) for which conntrack holds no
+ * usable outbound entry answers a flow this host opened when the kernel holds
+ * a connection for exactly its tuple in an established-side state (the set
+ * tc_inbound_socket uses) and no listener owns the local port (a listener
+ * would make it an inbound connection). A restart or an evicted entry lost the
+ * state; the kernel still knows the connection. The outbound entry is written
+ * again, as TC egress writes it; a FIN writes none (the flow ends). A forged
+ * ACK finds no such socket and keeps the verdict it had. */
+static __always_inline int
+conntrack_socket_proof(struct xdp_md *ctx, struct xdp_ct_scratch *b, struct ip_key *src,
+                       struct ip_key *dst, __be16 sport, __be16 dport, __u8 proto,
+                       __u8 tcp_flags, __u64 now_ns, __u32 pkt_len) {
+    if (proto != IPPROTO_TCP || !(tcp_flags & 0x10) || (tcp_flags & 0x06))
+        return 0;
+    int state = xdp_socket_state(ctx, b, src, dst, sport, dport);
+    if (state != BPF_TCP_ESTABLISHED && state != BPF_TCP_CLOSE_WAIT &&
+        state != BPF_TCP_FIN_WAIT1 && state != BPF_TCP_FIN_WAIT2 &&
+        state != BPF_TCP_CLOSING && state != BPF_TCP_LAST_ACK)
+        return 0;
+    if (xdp_socket_state(ctx, b, src, dst, 0, dport) == BPF_TCP_LISTEN)
+        return 0;
+    if (tcp_flags & 0x01)
+        return 1;
+    __builtin_memset(&b->cv, 0, sizeof(b->cv));
+    b->cv.first_seen_ns = now_ns;
+    b->cv.last_seen_ns = now_ns;
+    b->cv.packets = 1;
+    b->cv.bytes = pkt_len;
+    b->cv.tcp_state = 1;
+    b->cv.flags_seen = CONN_OUTBOUND;
+    if (bpf_map_update_elem(&wafio_conntrack, &b->ck, &b->cv, BPF_ANY) == 0) {
+        struct metrics_val *cm = get_metrics();
+        if (cm) __sync_fetch_and_add(&cm->conntrack_entries, 1);
+    }
+    return 1;
+}
+
 /* conntrack_reply: 1 when an inbound packet answers a fresh outbound flow
  * this host opened (CONN_OUTBOUND entry at the reverse key, written by TC
- * egress). Stale or foreign entries are removed. Inbound packets never renew
+ * egress, or by conntrack_socket_proof when that entry is missing or stale).
+ * Stale or foreign entries are removed. Inbound packets never renew
  * the authorization; only outbound packets do. */
 /* Out of line, key in wafio_xdp_ct_buf (TestXDPStackHeadroom); arguments
  * packed as for update_conntrack_ool: ports = sport << 16 | dport (wire
- * order), meta = proto | tcp_flags << 8. */
+ * order), meta = proto | tcp_flags << 8. The packet length comes from ctx,
+ * which keeps the call within five arguments. */
 static __noinline int
-conntrack_reply_ool(struct ip_key *src_key, struct ip_key *dst_key, __u32 ports,
-                    __u32 meta, __u32 pkt_len) {
+conntrack_reply_ool(struct xdp_md *ctx, struct ip_key *src_key, struct ip_key *dst_key,
+                    __u32 ports, __u32 meta) {
     __be16 sport = (__be16)(ports >> 16);
     __be16 dport = (__be16)ports;
     __u8 proto = meta & 0xff;
     __u8 tcp_flags = (meta >> 8) & 0xff;
+    __u32 pkt_len = (__u32)((long)ctx->data_end - (long)ctx->data);
     __u64 now_ns = bpf_ktime_get_ns();
     __u32 zero = 0;
     struct xdp_ct_scratch *b = bpf_map_lookup_elem(&wafio_xdp_ct_buf, &zero);
@@ -1237,11 +1339,13 @@ conntrack_reply_ool(struct ip_key *src_key, struct ip_key *dst_key, __u32 ports,
 
     struct conn_val *reply_cv = bpf_map_lookup_elem(&wafio_conntrack, reply_ck);
     if (!reply_cv)
-        return 0;
+        return conntrack_socket_proof(ctx, b, src_key, dst_key, sport, dport, proto,
+                                      tcp_flags, now_ns, pkt_len);
     __u64 ttl = proto == IPPROTO_TCP ? CONN_TCP_TTL_NS : CONN_UDP_TTL_NS;
     if (!(reply_cv->flags_seen & CONN_OUTBOUND) || !ct_fresh(now_ns, reply_cv->last_seen_ns, ttl)) {
         bpf_map_delete_elem(&wafio_conntrack, reply_ck);
-        return 0;
+        return conntrack_socket_proof(ctx, b, src_key, dst_key, sport, dport, proto,
+                                      tcp_flags, now_ns, pkt_len);
     }
     if (proto == IPPROTO_UDP ||
         ((tcp_flags & 0x12) == 0x12 && reply_cv->tcp_state == 0) ||
@@ -1258,12 +1362,10 @@ conntrack_reply_ool(struct ip_key *src_key, struct ip_key *dst_key, __u32 ports,
 }
 
 static __always_inline int
-conntrack_reply(struct ip_key *src_key, struct ip_key *dst_key,
-                __be16 sport, __be16 dport, __u8 proto, __u8 tcp_flags,
-                __u32 pkt_len, __u64 now_ns) {
-    (void)now_ns;
-    return conntrack_reply_ool(src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
-                               (__u32)proto | (__u32)tcp_flags << 8, pkt_len);
+conntrack_reply(struct xdp_md *ctx, struct ip_key *src_key, struct ip_key *dst_key,
+                __be16 sport, __be16 dport, __u8 proto, __u8 tcp_flags) {
+    return conntrack_reply_ool(ctx, src_key, dst_key, (__u32)sport << 16 | (__u32)dport,
+                               (__u32)proto | (__u32)tcp_flags << 8);
 }
 
 /* xdp_dhcp4_reply: a DHCPv4 BOOTREPLY (67→68) passes the ingress default
@@ -1343,9 +1445,8 @@ check_port_scan(struct ip_key *src_ip, __be16 dport, __u64 now_ns) {
             return ACTION_ALLOW;
         ps = bpf_map_lookup_elem(&wafio_portscan, src_ip);
         if (!ps) {
-            struct metrics_val *metrics = get_metrics();
-            if (metrics) __sync_fetch_and_add(&metrics->state_table_full, 1);
-            return ACTION_LOG;
+            state_full(STATE_FULL_PORTSCAN); /* as in check_rate_limit */
+            return ACTION_ALLOW;
         }
     }
     int result = ACTION_ALLOW;
@@ -1709,8 +1810,8 @@ process_ipv4(struct xdp_md *ctx, void *data, void *data_end,
     int cp_peer = control_plane_peer(&src_key, sport, iph->protocol);
     int is_reply = 0;
     if ((cfg->enable_conntrack || cp_peer) && sport != 0 && dport != 0)
-        is_reply = conntrack_reply(&src_key, &dst_key, sport, dport,
-                                   iph->protocol, tcp_flags, pkt_len, now_ns);
+        is_reply = conntrack_reply(ctx, &src_key, &dst_key, sport, dport,
+                                   iph->protocol, tcp_flags);
     if (cp_peer && is_reply)
         return XDP_PASS;
     /* DHCPv4 BOOTREPLYs answering this host's pending broadcast request
@@ -1899,8 +2000,8 @@ process_ipv6(struct xdp_md *ctx, void *data, void *data_end,
     int cp_peer = control_plane_peer(&src_key, sport, headers->proto);
     int is_reply = 0;
     if ((cfg->enable_conntrack || cp_peer) && sport != 0 && dport != 0)
-        is_reply = conntrack_reply(&src_key, &dst_key, sport, dport,
-                                   headers->proto, tcp_flags, pkt_len, now_ns);
+        is_reply = conntrack_reply(ctx, &src_key, &dst_key, sport, dport,
+                                   headers->proto, tcp_flags);
     if (cp_peer && is_reply)
         return XDP_PASS;
     /* DHCPv6 replies from a link-local server (never routed, so on-link)

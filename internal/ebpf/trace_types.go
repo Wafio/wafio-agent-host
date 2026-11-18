@@ -27,6 +27,11 @@ type TraceManagerConfig struct {
 	ProtectedProcessNames    []string
 	ProtectedExePaths        []string
 	ProtectedReplaceDefaults bool
+
+	// MapSizes sizes trace_events and trace_open_pending at load (see
+	// ComputeMapSizes). The zero value leaves them at the sizes the object
+	// declares.
+	MapSizes MapSizes
 }
 
 // ProtectedConfig returns the protected-process part of the configuration.
@@ -706,6 +711,9 @@ type TraceStatus struct {
 	RingbufSizeMB         int      `json:"ringbuf_size_mb"` // ring buffer size in MB
 	Enforcement           bool     `json:"enforcement"`     // enforcement engine active
 	PoliciesTotal         int      `json:"policies_total"`  // number of loaded policies
+	// MapSizing: the scale the trace maps were sized with and how full each
+	// one is. Absent when the maps were not sized.
+	MapSizing *MapSizing `json:"map_sizing,omitempty"`
 	// ProtectedKernelSet: the loaded object has trace_protected_tgids, so the
 	// kernel kill paths also skip protected processes (not only pid<=1/agent).
 	ProtectedKernelSet bool `json:"protected_kernel_set"`

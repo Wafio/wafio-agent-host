@@ -23,6 +23,13 @@ func packetTestCollection(t *testing.T) *cebpf.Collection {
 }
 
 func packetObjectCollection(t *testing.T, object string) *cebpf.Collection {
+	return sizedObjectCollection(t, object, MapSizes{})
+}
+
+// sizedObjectCollection loads an object with its maps capped at 4096 entries,
+// except the sized maps (see ComputeMapSizes), which get the sizes of sizes. A
+// zero MapSizes sizes none.
+func sizedObjectCollection(t *testing.T, object string, sizes MapSizes) *cebpf.Collection {
 	t.Helper()
 	dir := os.Getenv("WAFIO_TEST_BPF_DIR")
 	if dir == "" {
@@ -41,6 +48,7 @@ func packetObjectCollection(t *testing.T, object string) *cebpf.Collection {
 			m.MaxEntries = 4096
 		}
 	}
+	applyMapSizes(spec.Maps, sizes)
 	coll, err := cebpf.NewCollection(spec)
 	if err != nil {
 		t.Fatalf("%+v", err)
