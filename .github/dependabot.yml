@@ -1,0 +1,15 @@
+# Dependabot keeps the Go modules and the pinned actions of the workflows current. It leaves out the BPF C sources,
+# which have no package manager, and the tools that ci.yml and scripts/ci-local.sh download at a fixed version
+# (gitleaks, golangci-lint, govulncheck).
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

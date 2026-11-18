@@ -1,5 +1,7 @@
 # wafio-agent-host
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16870/badge)](https://www.bestpractices.dev/projects/16870) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Wafio/wafio-agent-host/badge)](https://scorecard.dev/viewer/?uri=github.com/Wafio/wafio-agent-host)
+
 The Wafio host agent. It runs as root on one Linux host and does two things:
 an eBPF firewall (XDP and TC programs for L3 and L4 filtering, block and allow
 lists, geo rules, rate limits) and runtime security tracing (syscall events,
