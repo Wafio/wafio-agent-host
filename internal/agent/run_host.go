@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	cebpf "github.com/cilium/ebpf"
 	"github.com/valyala/fasthttp"
 	wafebpf "github.com/wafio/wafio-agent-host/internal/ebpf"
 	"github.com/wafio/wafio-cp-backend/shared/geo"
@@ -26,6 +28,10 @@ type HostConfig struct {
 	EBPFTCObject  string
 	EBPFPinPath   string
 	EBPFXDPMode   string // auto|skb|driver|hw
+	// EBPFMapScale sizes the preallocated BPF maps: "auto" or empty sizes
+	// them by the host memory, a number above 0 and at most 1 forces the
+	// scale (see wafebpf.ComputeMapSizes).
+	EBPFMapScale string
 	// eBPF runtime security tracing (Linux only)
 	TraceEnabled    bool
 	TraceObjectPath string
@@ -111,6 +117,23 @@ func warnAgentAPIKey(cfg HostConfig) {
 func RunHost(ctx context.Context, cfg HostConfig) error {
 	warnAgentAPIKey(cfg)
 
+	// The preallocated BPF maps are sized once, from the host memory, before
+	// either manager loads its objects.
+	var mapSizes wafebpf.MapSizes
+	if runtime.GOOS == "linux" && (cfg.EBPFEnabled || cfg.TraceEnabled) {
+		cpus, err := cebpf.PossibleCPU()
+		if err != nil {
+			cpus = runtime.NumCPU()
+		}
+		if mapSizes, err = wafebpf.ResolveMapSizes(cfg.EBPFMapScale, "/", cpus); err != nil {
+			return fmt.Errorf("invalid --ebpf-map-scale %q (or %s): %w", cfg.EBPFMapScale, EnvEBPFMapScale, err)
+		}
+		if mapSizes.Warning != "" {
+			log.Printf("WARN: %s", mapSizes.Warning)
+		}
+		log.Print(mapSizes.LogLine())
+	}
+
 	// ── eBPF kernel-level firewall (Linux only) ──
 	var ebpfMgr *wafebpf.Manager
 	if cfg.EBPFEnabled && runtime.GOOS == "linux" {
@@ -129,6 +152,7 @@ func RunHost(ctx context.Context, cfg HostConfig) error {
 			TCObjectPath:  cfg.EBPFTCObject,
 			PinPath:       cfg.EBPFPinPath,
 			XDPMode:       xdpMode,
+			MapSizes:      mapSizes,
 		}, nil)
 		if err := mgr.Start(ctx); err != nil {
 			log.Printf("eBPF start failed: %v (continuing without kernel firewall)", err)
@@ -174,6 +198,8 @@ func RunHost(ctx context.Context, cfg HostConfig) error {
 			ProtectedProcessNames:    cfg.ProtectedProcessNames,
 			ProtectedExePaths:        cfg.ProtectedExePaths,
 			ProtectedReplaceDefaults: cfg.ProtectedReplaceDefaults,
+
+			MapSizes: mapSizes,
 		}, nil)
 		if err := tmgr.Start(ctx); err != nil {
 			log.Printf("trace start failed: %v (continuing without runtime tracing)", err)

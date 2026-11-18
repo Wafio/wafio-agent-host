@@ -23,8 +23,15 @@ func TestXDPGeoAllowHelpers(t *testing.T) {
 		bpfSourceStruct(t, "wafio_common.h", "ip_key") +
 		bpfSourceStruct(t, "wafio_common.h", "conn_key") +
 		bpfSourceStruct(t, "wafio_common.h", "conn_val") +
-		bpfSourceStruct(t, "wafio_xdp.c", "geo_config") +
-		bpfSourceStruct(t, "wafio_xdp.c", "xdp_ct_scratch") + `
+		bpfSourceStruct(t, "wafio_xdp.c", "geo_config") + `
+/* The socket lookup tuple of the conntrack scratch value (linux/bpf.h). */
+struct bpf_sock_tuple {
+  union {
+    struct { __be32 saddr; __be32 daddr; __be16 sport; __be16 dport; } ipv4;
+    struct { __be32 saddr[4]; __be32 daddr[4]; __be16 sport; __be16 dport; } ipv6;
+  };
+};
+` + bpfSourceStruct(t, "wafio_xdp.c", "xdp_ct_scratch") + `
 struct geo_cidr_v4_key { __u32 prefixlen; __be32 addr; };
 struct geo_cidr_v6_key { __u32 prefixlen; __u8 addr[16]; };
 static int wafio_conntrack, wafio_geo_config, wafio_geo_local4, wafio_geo_local6, wafio_xdp_ct_buf;

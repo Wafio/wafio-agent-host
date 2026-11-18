@@ -317,6 +317,7 @@ func (h *FastHTTPHandler) addBlocklist(ctx *fasthttp.RequestCtx) {
 func (h *FastHTTPHandler) addJail(ctx *fasthttp.RequestCtx, entries []IPEntry) {
 	var errs []string
 	added := 0
+	full := false
 	for _, entry := range entries {
 		if entry.TTLMs <= 0 {
 			errs = append(errs, entry.IP+": a jail entry needs ttl_ms")
@@ -324,6 +325,7 @@ func (h *FastHTTPHandler) addJail(ctx *fasthttp.RequestCtx, entries []IPEntry) {
 		}
 		if err := h.Manager.AddToJail(entry.IP, time.Duration(entry.TTLMs)*time.Millisecond); err != nil {
 			errs = append(errs, entry.IP+": "+err.Error())
+			full = full || errors.Is(err, ErrIPListCapacity)
 		} else {
 			added++
 		}
@@ -331,6 +333,11 @@ func (h *FastHTTPHandler) addJail(ctx *fasthttp.RequestCtx, entries []IPEntry) {
 	resp := map[string]any{"added": added}
 	if len(errs) > 0 {
 		resp["errors"] = errs
+	}
+	if full { // the jail refused an address; nothing was evicted for it
+		resp["code"] = "IP_LIST_FULL"
+		writeJSON(ctx, fasthttp.StatusConflict, resp)
+		return
 	}
 	writeJSON(ctx, fasthttp.StatusOK, resp)
 }

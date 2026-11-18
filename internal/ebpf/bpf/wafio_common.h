@@ -148,8 +148,9 @@ struct allow_val {      /* 88 bytes (ebpf.AllowVal) */
 /* Jail: single addresses the WAF agent jails after repeated L7 blocks,
  * kept apart from the operator lists in wafio_jail
  * (ip_key -> ip_list_val, expiry always set). A control-plane push never
- * touches it, so a jail keeps its TTL; it is an LRU table, so a flood of
- * jailed sources evicts only other jail entries, never an operator entry. */
+ * touches it, so a jail keeps its TTL. It is a HASH table: a full jail
+ * refuses a new entry (the agent reports it) and never evicts one, so a jailed
+ * address stays jailed until its TTL ends. */
 #define MAX_JAIL_SIZE 65536
 
 struct block_val {      /* 40 bytes (ebpf.BlockVal) */

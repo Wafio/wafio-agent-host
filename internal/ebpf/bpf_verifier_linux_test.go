@@ -77,3 +77,74 @@ func TestBPFObjectsPassVerifier(t *testing.T) {
 		})
 	}
 }
+
+// TestBPFObjectMapSizes reads the objects, not the kernel: the size each
+// sized map declares is the ceiling of the sizing table, the egress blocklist
+// is allocated on insert in both objects that declare it, and the jail is a
+// hash map that refuses a new entry when full. Needs the compiled objects but
+// no privileges.
+func TestBPFObjectMapSizes(t *testing.T) {
+	dir := os.Getenv("WAFIO_TEST_BPF_DIR")
+	if dir == "" {
+		t.Skip("set WAFIO_TEST_BPF_DIR to the compiled objects")
+	}
+	specs := map[string]*cebpf.CollectionSpec{}
+	for _, obj := range []string{"wafio_xdp.o", "wafio_tc.o", "wafio_trace.o"} {
+		spec, err := cebpf.LoadCollectionSpec(filepath.Join(dir, obj))
+		if err != nil {
+			t.Fatalf("parse %s: %+v", obj, err)
+		}
+		specs[obj] = spec
+	}
+	find := func(name string) (string, *cebpf.MapSpec) {
+		for _, obj := range []string{"wafio_xdp.o", "wafio_tc.o", "wafio_trace.o"} {
+			if ms := specs[obj].Maps[name]; ms != nil {
+				return obj, ms
+			}
+		}
+		return "", nil
+	}
+	for _, m := range sizedMaps {
+		obj, ms := find(m.name)
+		if ms == nil {
+			t.Errorf("%s is in the sizing table but no object declares it", m.name)
+			continue
+		}
+		if ms.MaxEntries != m.ceiling {
+			t.Errorf("%s declares %d entries in %s, the sizing ceiling is %d", m.name, ms.MaxEntries, obj, m.ceiling)
+		}
+		want := cebpf.Hash
+		if m.lru {
+			want = cebpf.LRUHash
+		}
+		if ms.Type != want {
+			t.Errorf("%s is a %s map in %s, want %s", m.name, ms.Type, obj, want)
+		}
+		if ms.Flags&bpfFNoPrealloc != 0 {
+			t.Errorf("%s is allocated on insert: the sizing sizes preallocated maps", m.name)
+		}
+	}
+	// TC holds its own declaration of the shared conntrack map: the same size.
+	if ms := specs["wafio_tc.o"].Maps[mapConntrack]; ms == nil || ms.MaxEntries != 500000 {
+		t.Errorf("wafio_tc.o conntrack declaration: %+v", ms)
+	}
+	if ms := specs["wafio_trace.o"].Maps[traceMapEvents]; ms == nil || ms.Type != cebpf.RingBuf || ms.MaxEntries != traceRingMax {
+		t.Errorf("trace_events: %+v, want a %d byte ring buffer", ms, traceRingMax)
+	}
+	for _, obj := range []string{"wafio_xdp.o", "wafio_tc.o"} {
+		ms := specs[obj].Maps[mapEgressBlocklist]
+		if ms == nil {
+			t.Errorf("%s has no egress blocklist", obj)
+			continue
+		}
+		if ms.Flags&bpfFNoPrealloc == 0 || ms.Type != cebpf.Hash || ms.MaxEntries != egressBlocklistCapacity {
+			t.Errorf("%s egress blocklist %s flags %#x entries %d: want a hash map allocated on insert, %d entries", obj, ms.Type, ms.Flags, ms.MaxEntries, egressBlocklistCapacity)
+		}
+	}
+	if ms := specs["wafio_xdp.o"].Maps[mapJail]; ms == nil || ms.Type != cebpf.Hash {
+		t.Errorf("jail: %+v, want a hash map", ms)
+	}
+	if ms := specs["wafio_xdp.o"].Maps[mapStateFull]; ms == nil || ms.Type != cebpf.PerCPUArray || ms.MaxEntries != 3 || ms.ValueSize != 8 || ms.KeySize != 4 {
+		t.Errorf("wafio_state_full: %+v, want a per-CPU array of three u64", ms)
+	}
+}

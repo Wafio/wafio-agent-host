@@ -5,6 +5,7 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
@@ -23,6 +24,7 @@ type legacyTCAttachment struct {
 	ownedQdisc bool
 	ingress    *legacyTCFilter
 	egress     *legacyTCFilter
+	logf       func(format string, args ...any) // nil: no log
 }
 
 func (a *legacyTCAttachment) attach(parent uint32, prog *ebpf.Program) error {
@@ -57,6 +59,7 @@ func (a *legacyTCAttachment) attach(parent uint32, prog *ebpf.Program) error {
 		Name:         name,
 		DirectAction: true,
 	}
+	a.removeStaleFilters(iface, parent, handle)
 	if err := netlink.FilterAdd(f); err != nil {
 		return fmt.Errorf("add %s filter: %w", name, err)
 	}
@@ -70,6 +73,35 @@ func (a *legacyTCAttachment) attach(parent uint32, prog *ebpf.Program) error {
 		return fmt.Errorf("%s filter not visible after attach", name)
 	}
 	return nil
+}
+
+// removeStaleFilters deletes the filters of an agent that was killed before it
+// detached: on this parent, with our handle and a name that starts with
+// "wafio_". The kernel keeps a legacy filter after its process ends, and a
+// second filter with the same handle makes FilterAdd fail, so the new run
+// would start without TC. A failure is logged; FilterAdd then reports it.
+func (a *legacyTCAttachment) removeStaleFilters(iface netlink.Link, parent, handle uint32) {
+	filters, err := netlink.FilterList(iface, parent)
+	if err != nil {
+		return
+	}
+	for _, candidate := range filters {
+		f, ok := candidate.(*netlink.BpfFilter)
+		if !ok || f.Handle != handle || !strings.HasPrefix(f.Name, "wafio_") {
+			continue
+		}
+		if err := netlink.FilterDel(f); err != nil {
+			a.log("remove stale TC filter %s: %v", f.Name, err)
+			continue
+		}
+		a.log("removed stale TC filter %s left by a run that did not detach", f.Name)
+	}
+}
+
+func (a *legacyTCAttachment) log(format string, args ...any) {
+	if a.logf != nil {
+		a.logf(format, args...)
+	}
 }
 
 func (a *legacyTCAttachment) ensureClsact(iface netlink.Link) error {

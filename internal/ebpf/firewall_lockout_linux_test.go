@@ -33,8 +33,15 @@ const (
 // packetPair loads XDP and TC the way Manager does: TC reuses XDP's shared
 // maps, so a TC egress run and an XDP ingress run see the same conntrack.
 func packetPair(t *testing.T) (xdp, tc *cebpf.Collection) {
+	return packetPairSized(t, MapSizes{})
+}
+
+// packetPairSized is packetPair with the sized maps at the sizes of sizes. The
+// TC spec takes size and flags of every replaced map from the XDP map, as
+// Manager.loadTC does.
+func packetPairSized(t *testing.T, sizes MapSizes) (xdp, tc *cebpf.Collection) {
 	t.Helper()
-	xdp = packetObjectCollection(t, "wafio_xdp.o")
+	xdp = sizedObjectCollection(t, "wafio_xdp.o", sizes)
 	spec, err := cebpf.LoadCollectionSpec(filepath.Join(os.Getenv("WAFIO_TEST_BPF_DIR"), "wafio_tc.o"))
 	if err != nil {
 		t.Fatalf("%+v", err)
@@ -45,9 +52,12 @@ func packetPair(t *testing.T) (xdp, tc *cebpf.Collection) {
 			m.MaxEntries = 4096
 		}
 	}
+	applyMapSizes(spec.Maps, sizes)
 	repl := make(map[string]*cebpf.Map)
 	for _, name := range []string{mapConfig, mapConntrack, mapEvents, mapMetrics, mapPortPolicy, mapPortPolicyConfig, mapEgressBlocklist, mapCPEndpoints, mapDHCPPending, mapDHCPServers} {
 		if xm := xdp.Maps[name]; xm != nil && spec.Maps[name] != nil {
+			spec.Maps[name].MaxEntries = xm.MaxEntries()
+			spec.Maps[name].Flags = xm.Flags()
 			repl[name] = xm
 		}
 	}

@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	cebpf "github.com/cilium/ebpf"
+	"github.com/vishvananda/netlink"
 	"github.com/wafio/wafio-agent-host/internal/ebpf"
 	"github.com/wafio/wafio-cp-backend/shared/hostpolicy"
 )
@@ -793,5 +797,363 @@ func TestVMScenarioKillNarrowAndBroad(t *testing.T) {
 	}
 	if n := len(tm.ListPolicies()); n != 0 {
 		t.Fatalf("final snapshot kept %d policies", n)
+	}
+}
+
+// ── map sizing ──────────────────────────────────────────────────────────
+
+// The three scenarios below run on a private veth pair (labNet), not on the
+// primary interface: they need root and the objects, not the SSH session.
+
+// startLabFirewall starts a Manager on the host end of n with the given map
+// sizes and registers its stop. tag keeps the pin directories of two managers
+// of one test apart.
+func startLabFirewall(t *testing.T, n *labNet, sizes ebpf.MapSizes, tag string) *ebpf.Manager {
+	t.Helper()
+	dir := os.Getenv("WAFIO_TEST_BPF_DIR")
+	if dir == "" {
+		t.Fatal("WAFIO_TEST_BPF_DIR required")
+	}
+	pin := fmt.Sprintf("/sys/fs/bpf/wafio-vmtest-%d-%s", os.Getpid(), tag)
+	ctx, cancel := context.WithCancel(context.Background())
+	m := ebpf.NewManager(ebpf.ManagerConfig{
+		Interface:     n.hostIf,
+		XDPObjectPath: filepath.Join(dir, "wafio_xdp.o"),
+		TCObjectPath:  filepath.Join(dir, "wafio_tc.o"),
+		PinPath:       pin,
+		XDPMode:       ebpf.XDPModeSKB,
+		MetricsPollMs: 250,
+		MapSizes:      sizes,
+	}, nil)
+	if err := m.Start(ctx); err != nil {
+		cancel()
+		t.Fatalf("start the firewall (%s): %v", tag, err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = m.Stop()
+		_ = os.RemoveAll(pin)
+	})
+	if st := m.Status(); !st.XDPAttached || !st.TCIngress || !st.TCEgress || !st.LockoutExemptions {
+		t.Fatalf("firewall attached incompletely: %+v", st)
+	}
+	return m
+}
+
+func labCPUs(t *testing.T) int {
+	t.Helper()
+	n, err := cebpf.PossibleCPU()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// watchXDP polls whether an XDP program is attached to the interface and
+// returns, when called, the longest time none was: the window in which the
+// host runs without its firewall.
+func watchXDP(t *testing.T, ifName string) (longestGap func() time.Duration) {
+	t.Helper()
+	stop := make(chan struct{})
+	done := make(chan time.Duration, 1)
+	go func() {
+		var gap, longest time.Duration
+		var since time.Time
+		for {
+			select {
+			case <-stop:
+				done <- longest
+				return
+			default:
+			}
+			link, err := netlink.LinkByName(ifName)
+			attached := err == nil && link.Attrs().Xdp != nil && link.Attrs().Xdp.Attached
+			switch {
+			case !attached && since.IsZero():
+				since = time.Now()
+			case attached && !since.IsZero():
+				if gap = time.Since(since); gap > longest {
+					longest = gap
+				}
+				since = time.Time{}
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+	return func() time.Duration {
+		close(stop)
+		return <-done
+	}
+}
+
+// denyAllIngress is the policy of the restart scenarios: ingress Deny All with
+// the SSH ports the lockout guard asks for, egress open.
+func denyAllIngress() fwState {
+	rules := []ebpf.PortPolicyAPI{allowRule(22, "tcp", "ingress")}
+	for _, p := range ebpf.DetectSSHDPorts() {
+		if p != 22 {
+			rules = append(rules, allowRule(p, "tcp", "ingress"))
+		}
+	}
+	return fwState{
+		cfg:   enforcingConfig(),
+		pp:    ebpf.PortPolicyConfigAPI{Enabled: true, DefaultIngress: "deny", DefaultEgress: "allow"},
+		rules: rules,
+	}
+}
+
+// TestVMScenarioMapScaleRestartKeepsServerPush: a connection the host opened
+// to a server that only pushes data (the host sends nothing after it connects)
+// keeps working across an agent restart with another map scale, under ingress
+// Deny All. The restart loses every conntrack entry; the socket proof lets the
+// server's next segment in. The time between stopping the first firewall and
+// attaching the second, the fail-open window, is logged.
+func TestVMScenarioMapScaleRestartKeepsServerPush(t *testing.T) {
+	if !vmScenariosEnabled() {
+		t.Skip("set WAFIO_EBPF_VM_SCENARIOS=1 inside the disposable VM")
+	}
+	n := newLabNet(t)
+	cpus := labCPUs(t)
+	m1 := startLabFirewall(t, n, ebpf.ComputeMapSizes(1, cpus), "full")
+	applyState(t, m1, denyAllIngress())
+
+	n.send("push %s", net.JoinHostPort(n.peerAddr.String(), "7100"))
+	n.expect("push-listening", 5*time.Second)
+	conn, err := net.DialTimeout("tcp4", net.JoinHostPort(n.peerAddr.String(), "7100"), 3*time.Second)
+	if err != nil {
+		t.Fatalf("the host-opened connection under ingress Deny All: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	n.expect("push-accepted", 3*time.Second)
+	var received atomic.Int64
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			k, err := conn.Read(buf)
+			received.Add(int64(k))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	waitReceived := func(atLeast int64, what string) {
+		t.Helper()
+		deadline := time.Now().Add(4 * time.Second)
+		for received.Load() < atLeast {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: received %d bytes, want %d: the pushed data does not arrive", what, received.Load(), atLeast)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	n.send("pushnow")
+	n.expect("pushed", 3*time.Second)
+	waitReceived(5, "before the restart")
+
+	// The restart: the scale changes from 1 to the smallest.
+	gap := watchXDP(t, n.hostIf)
+	stopped := time.Now()
+	if err := m1.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	m2 := startLabFirewall(t, n, ebpf.ComputeMapSizes(0.001, cpus), "floor")
+	total := time.Since(stopped)
+	applyState(t, m2, denyAllIngress())
+	time.Sleep(50 * time.Millisecond)
+	t.Logf("fail-open window: XDP detached for %v; stop and start took %v in all", gap().Round(time.Millisecond), total.Round(time.Millisecond))
+
+	sizing := m2.Status().MapSizing
+	if sizing == nil || sizing.Scale != 0.001 {
+		t.Fatalf("map_sizing after the restart: %+v", sizing)
+	}
+	want, _ := ebpf.ComputeMapSizes(0.001, cpus).Size("wafio_conntrack")
+	found := false
+	for _, mc := range sizing.Maps {
+		if mc.Name == "wafio_conntrack" {
+			found = true
+			if mc.MaxEntries != want || mc.DefaultMaxEntries != 500000 {
+				t.Errorf("conntrack %+v after the restart, want %d of 500000", mc, want)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("map_sizing lists no conntrack: %+v", sizing.Maps)
+	}
+
+	// Nothing but the server speaks now.
+	before := received.Load()
+	n.send("pushnow")
+	n.expect("pushed", 3*time.Second)
+	waitReceived(before+5, "after the restart")
+}
+
+// TestVMScenarioKilledAgentRestartAttachesTC: on a kernel that attaches TC
+// through a legacy clsact filter (before 6.6), an agent that is killed leaves
+// its filters behind, and the next start removes them instead of failing to
+// add its own. XDP and TCX attach through links, which end with the process.
+func TestVMScenarioKilledAgentRestartAttachesTC(t *testing.T) {
+	if !vmScenariosEnabled() {
+		t.Skip("set WAFIO_EBPF_VM_SCENARIOS=1 inside the disposable VM")
+	}
+	if major, minor := kernelVersionForTest(t); major > 6 || major == 6 && minor >= 6 {
+		t.Skip("TCX attaches TC on this kernel; the filters of a killed agent go with its links")
+	}
+	n := newLabNet(t)
+	cpus := labCPUs(t)
+
+	pin := fmt.Sprintf("/sys/fs/bpf/wafio-vmchild-%d", os.Getpid())
+	t.Cleanup(func() { _ = os.RemoveAll(pin) })
+	child := exec.Command(os.Args[0], "-test.run=^TestVMAgentChild$", "-test.timeout=1h")
+	child.Env = append(os.Environ(), "WAFIO_VM_AGENT_CHILD=1", "WAFIO_VM_AGENT_IF="+n.hostIf, "WAFIO_VM_AGENT_PIN="+pin,
+		fmt.Sprintf("WAFIO_VM_AGENT_CPUS=%d", cpus))
+	out, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill() })
+	ready := make(chan bool, 1)
+	go func() {
+		sc := bufio.NewScanner(out)
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "AGENT attached") {
+				ready <- true
+				return
+			}
+		}
+		ready <- false
+	}()
+	select {
+	case ok := <-ready:
+		if !ok {
+			t.Fatal("the agent child ended before it attached")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the agent child did not attach in 30 s")
+	}
+	link, err := netlink.LinkByName(n.hostIf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wafioFilters := func(parent uint32) []*netlink.BpfFilter {
+		t.Helper()
+		filters, err := netlink.FilterList(link, parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []*netlink.BpfFilter
+		for _, f := range filters {
+			if bf, ok := f.(*netlink.BpfFilter); ok && strings.HasPrefix(bf.Name, "wafio_") {
+				out = append(out, bf)
+			}
+		}
+		return out
+	}
+	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
+		if got := wafioFilters(parent); len(got) != 1 {
+			t.Fatalf("the running agent has %d wafio filters on parent %#x, want 1", len(got), parent)
+		}
+	}
+
+	// The agent dies without detaching.
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
+		if got := wafioFilters(parent); len(got) != 1 {
+			t.Fatalf("after the kill: %d wafio filters on parent %#x; the kernel is expected to keep the one of the dead agent", len(got), parent)
+		}
+	}
+
+	// The next start attaches TC again, and the stale filters are gone.
+	m := startLabFirewall(t, n, ebpf.ComputeMapSizes(0.001, cpus), "restart")
+	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
+		if got := wafioFilters(parent); len(got) != 1 {
+			t.Errorf("after the restart: %d wafio filters on parent %#x, want 1", len(got), parent)
+		}
+	}
+	if st := m.Status(); !st.TCIngress || !st.TCEgress {
+		t.Errorf("TC not attached after the restart: %+v", st)
+	}
+}
+
+// TestVMAgentChild is the agent of TestVMScenarioKilledAgentRestartAttachesTC:
+// the test binary run again, attached until it is killed.
+func TestVMAgentChild(t *testing.T) {
+	if os.Getenv("WAFIO_VM_AGENT_CHILD") != "1" {
+		t.Skip("run by the kill scenario")
+	}
+	cpus := atoi(os.Getenv("WAFIO_VM_AGENT_CPUS"))
+	dir := os.Getenv("WAFIO_TEST_BPF_DIR")
+	m := ebpf.NewManager(ebpf.ManagerConfig{
+		Interface:     os.Getenv("WAFIO_VM_AGENT_IF"),
+		XDPObjectPath: filepath.Join(dir, "wafio_xdp.o"),
+		TCObjectPath:  filepath.Join(dir, "wafio_tc.o"),
+		PinPath:       os.Getenv("WAFIO_VM_AGENT_PIN"),
+		XDPMode:       ebpf.XDPModeSKB,
+		MapSizes:      ebpf.ComputeMapSizes(0.001, cpus),
+	}, nil)
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("AGENT attached")
+	select {} // until the parent kills this process
+}
+
+// TestVMScenarioLastGoodEgressListAtFloorScale: the egress list of a saved
+// policy, at the 100000 entries the control plane allows, applies on a firewall
+// sized at the smallest scale. The egress blocklist is allocated on insert and
+// does not follow the scale, so no scale can refuse it.
+func TestVMScenarioLastGoodEgressListAtFloorScale(t *testing.T) {
+	if !vmScenariosEnabled() {
+		t.Skip("set WAFIO_EBPF_VM_SCENARIOS=1 inside the disposable VM")
+	}
+	n := newLabNet(t)
+	m := startLabFirewall(t, n, ebpf.ComputeMapSizes(0.001, labCPUs(t)), "lastgood")
+
+	const entries = 100000
+	list := make([]ebpf.EgressBlocklistEntry, entries)
+	ips := make([]string, entries)
+	for i := range list {
+		ips[i] = fmt.Sprintf("11.%d.%d.%d", i>>16&255, i>>8&255, i&255)
+		list[i] = ebpf.EgressBlocklistEntry{IP: ips[i]}
+	}
+	if err := ebpf.ValidateEgressBlocklistCapacity(ips); err != nil {
+		t.Fatalf("the control plane check refuses %d egress entries: %v", entries, err)
+	}
+	unlock := ebpf.LockFirewallWrites()
+	err := ebpf.ReplaceIPLists(m, ebpf.IPListUpdate{Egress: list}, time.Now())
+	unlock()
+	if err != nil {
+		t.Fatalf("restore %d egress entries at the smallest scale: %v", entries, err)
+	}
+	live, err := m.ListEgressBlocklist(2 * entries)
+	if err != nil || len(live) != entries {
+		t.Fatalf("egress list holds %d entries, %v; want %d", len(live), err, entries)
+	}
+	// The same list again changes nothing, and one entry more is refused as capacity.
+	unlock = ebpf.LockFirewallWrites()
+	err = ebpf.ReplaceIPLists(m, ebpf.IPListUpdate{Egress: list}, time.Now())
+	if err != nil {
+		t.Errorf("the same list again: %v", err)
+	}
+	over := append(slices.Clone(list), ebpf.EgressBlocklistEntry{IP: "12.0.0.1"})
+	err = ebpf.ReplaceIPLists(m, ebpf.IPListUpdate{Egress: over}, time.Now())
+	unlock()
+	if !errors.Is(err, ebpf.ErrIPListCapacity) {
+		t.Errorf("%d entries: %v, want ErrIPListCapacity", entries+1, err)
+	}
+	if sz := m.Status().MapSizing; sz == nil {
+		t.Error("no map_sizing in the status")
+	} else {
+		for _, mc := range sz.Maps {
+			if mc.Name == "wafio_egress_blocklist" {
+				t.Errorf("the egress blocklist is in the sized maps: %+v", mc)
+			}
+		}
 	}
 }

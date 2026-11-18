@@ -31,6 +31,7 @@ const (
 	flagProtectedProcesses       = "protected-processes"
 	flagProtectedExePaths        = "protected-exe-paths"
 	flagProtectedReplaceDefaults = "protected-replace-defaults"
+	flagMapScale                 = "ebpf-map-scale"
 )
 
 var rootCmd = &cobra.Command{
@@ -59,6 +60,8 @@ func init() {
 	rootCmd.Flags().StringVar(&cfg.EBPFTCObject, "tc-obj", "internal/ebpf/bpf/wafio_tc.o", "path to compiled TC BPF object")
 	rootCmd.Flags().StringVar(&cfg.EBPFPinPath, "pin-path", "/sys/fs/bpf/wafio", "bpffs pin path for eBPF maps")
 	rootCmd.Flags().StringVar(&cfg.EBPFXDPMode, "xdp-mode", "auto", "XDP attach mode: auto|skb|driver|hw")
+	rootCmd.Flags().StringVar(&cfg.EBPFMapScale, flagMapScale, "auto",
+		"size of the preallocated eBPF maps: auto (by host memory) or a number above 0 and at most 1 (env "+agent.EnvEBPFMapScale+")")
 
 	// eBPF runtime security tracing.
 	rootCmd.Flags().BoolVar(&cfg.TraceEnabled, "trace", false, "enable eBPF runtime security tracing")
@@ -162,6 +165,9 @@ func run(cmd *cobra.Command, _ []string) error {
 		ReplaceDefaults: flags.Changed(flagProtectedReplaceDefaults),
 	}); err != nil {
 		return fmt.Errorf("invalid protected-process configuration: %w", err)
+	}
+	if err := cfg.LoadMapScale(os.Getenv, flags.Changed(flagMapScale)); err != nil {
+		return err
 	}
 	if !cfg.EBPFEnabled && !cfg.TraceEnabled {
 		return fmt.Errorf("neither --ebpf nor --trace is enabled; nothing to do")

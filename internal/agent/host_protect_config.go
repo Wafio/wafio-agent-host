@@ -23,6 +23,25 @@ const (
 	EnvProtectedReplaceDefaults = "WAFIO_PROTECTED_REPLACE_DEFAULTS"
 )
 
+// EnvEBPFMapScale is the environment fallback of --ebpf-map-scale: "auto"
+// (the default) or a number above 0 and at most 1. It is read only when the
+// flag was not given, like the protected-process settings above.
+const EnvEBPFMapScale = "WAFIO_EBPF_MAP_SCALE"
+
+// LoadMapScale resolves the eBPF map scale: the flag when it was given, else
+// the environment. An invalid value stops the agent at startup.
+func (c *HostConfig) LoadMapScale(getenv func(string) string, flagSet bool) error {
+	if !flagSet {
+		if v := strings.TrimSpace(getenv(EnvEBPFMapScale)); v != "" {
+			c.EBPFMapScale = v
+		}
+	}
+	if _, _, err := wafebpf.ParseMapScale(c.EBPFMapScale); err != nil {
+		return fmt.Errorf("invalid --ebpf-map-scale %q (or %s): %w", c.EBPFMapScale, EnvEBPFMapScale, err)
+	}
+	return nil
+}
+
 // ProtectedFlagsSet records which protected-process settings were given on
 // the command line. Those win over the environment.
 type ProtectedFlagsSet struct {

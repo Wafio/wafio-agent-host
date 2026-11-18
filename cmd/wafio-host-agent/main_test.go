@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -83,5 +85,43 @@ func TestHostFetchDataRefusesWAFComponents(t *testing.T) {
 		if err := runHostFetchData(nil, nil); err == nil {
 			t.Errorf("profile %q only %q: want an error", tc.profile, tc.only)
 		}
+	}
+}
+
+// --ebpf-map-scale parses into the agent config and, being set, wins over
+// WAFIO_EBPF_MAP_SCALE; without it the environment decides.
+func TestMapScaleFlagBeatsEnv(t *testing.T) {
+	saved := cfg
+	t.Cleanup(func() { cfg = saved })
+	fs := rootCmd.Flags()
+	t.Cleanup(func() {
+		_ = fs.Set(flagMapScale, "auto")
+		fs.Lookup(flagMapScale).Changed = false
+	})
+	t.Setenv(agent.EnvEBPFMapScale, "0.25")
+
+	if err := cfg.LoadMapScale(os.Getenv, fs.Changed(flagMapScale)); err != nil || cfg.EBPFMapScale != "0.25" {
+		t.Fatalf("env only: scale %q, error %v, want 0.25", cfg.EBPFMapScale, err)
+	}
+	if err := fs.Parse([]string{"--" + flagMapScale + "=0.5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.LoadMapScale(os.Getenv, fs.Changed(flagMapScale)); err != nil || cfg.EBPFMapScale != "0.5" {
+		t.Fatalf("flag and env: scale %q, error %v, want 0.5", cfg.EBPFMapScale, err)
+	}
+}
+
+// An invalid value stops the start before anything is loaded.
+func TestInvalidMapScaleStopsTheStart(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("run stops on the OS check first")
+	}
+	saved := cfg
+	t.Cleanup(func() { cfg = saved })
+	t.Setenv(agent.EnvEBPFMapScale, "1.5")
+	err := run(rootCmd, nil)
+	want := `invalid --ebpf-map-scale "1.5" (or WAFIO_EBPF_MAP_SCALE): want auto or a number above 0 and at most 1`
+	if err == nil || err.Error() != want {
+		t.Fatalf("run returned %v, want %q", err, want)
 	}
 }

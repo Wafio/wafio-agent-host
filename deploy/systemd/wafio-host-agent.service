@@ -10,8 +10,9 @@
 # WAFIO_GRPC_* values from its environment, so the host key never appears on the
 # command line (readable by every local user through /proc/<pid>/cmdline).
 # WAFIO_PROTECTED_PROCESSES, WAFIO_PROTECTED_EXE_PATHS,
-# WAFIO_PROTECTED_REPLACE_DEFAULTS, WAFIO_LOCAL_API_TOKEN_FILE and
-# WAFIO_LOCAL_API_TOKEN_GROUP are read the same way.
+# WAFIO_PROTECTED_REPLACE_DEFAULTS, WAFIO_LOCAL_API_TOKEN_FILE,
+# WAFIO_LOCAL_API_TOKEN_GROUP and WAFIO_EBPF_MAP_SCALE (the size of the
+# preallocated BPF maps, see the README) are read the same way.
 #
 # systemd expands ${VAR} only in Exec*= lines. BindReadOnlyPaths= and
 # ReadWritePaths= below name the default paths; a host that keeps its files

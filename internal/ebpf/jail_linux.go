@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 // The jail: addresses the WAF agent jails after repeated L7 blocks
@@ -49,7 +50,49 @@ func (m *Manager) AddToJail(ipStr string, ttl time.Duration) error {
 	if err := m.jailMap.Lookup(key, &old); err == nil {
 		val.HitCount = old.HitCount
 	}
-	return m.jailMap.Update(key, &val, ebpf.UpdateAny)
+	err = m.jailMap.Update(key, &val, ebpf.UpdateAny)
+	if errors.Is(err, unix.E2BIG) && m.claimJailSweep(time.Now()) {
+		// Full: the entries past their TTL still hold slots until XDP meets
+		// the address again. Free them and try once more.
+		m.deleteExpiredJailLocked(now)
+		err = m.jailMap.Update(key, &val, ebpf.UpdateAny)
+	}
+	if errors.Is(err, unix.E2BIG) {
+		m.jailFull.Add(1)
+		return fmt.Errorf("%w: %s not jailed", ErrJailFull, a)
+	}
+	return err
+}
+
+// jailSweepEvery spaces the sweeps of a full jail. A sweep reads every entry,
+// and during an attack the WAF agent may jail many addresses a second: with
+// the jail full of live entries, a sweep per request would cost a CPU.
+const jailSweepEvery = time.Second
+
+// claimJailSweep reports whether a full jail may be swept now: the first call
+// after jailSweepEvery since the last sweep wins.
+func (m *Manager) claimJailSweep(now time.Time) bool {
+	last := m.jailSweptAt.Load()
+	return now.UnixNano()-last >= int64(jailSweepEvery) && m.jailSweptAt.CompareAndSwap(last, now.UnixNano())
+}
+
+// deleteExpiredJailLocked removes the jail entries whose TTL ended before now
+// (bpf_ktime_get_ns() nanoseconds). The caller holds m.mu.
+func (m *Manager) deleteExpiredJailLocked(now uint64) {
+	var expired []IPKey
+	var key IPKey
+	var val IPListVal
+	iter := m.jailMap.Iterate()
+	for iter.Next(&key, &val) {
+		if val.ExpiresNs != 0 && val.ExpiresNs <= now {
+			expired = append(expired, key)
+		}
+	}
+	for _, k := range expired {
+		if err := m.jailMap.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return
+		}
+	}
 }
 
 // listJailLocked returns up to limit live jail entries (latest expiry first)

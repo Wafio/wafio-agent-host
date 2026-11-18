@@ -52,6 +52,7 @@ func (m *Manager) DrainRecentEvents(_ int) []Event               { return nil }
 func (m *Manager) PendingEvents() int                            { return 0 }
 func (m *Manager) GetRecentEvents(_ int) []Event                 { return nil }
 func (m *Manager) LoadGeoIPEntry(_ net.IP, _ string) error       { return ErrNotSupported }
+func (m *Manager) GeoIPMaxEntries() uint32                       { return 0 }
 func (m *Manager) GeoAllowSupported() bool                       { return false }
 func (m *Manager) GeoState() GeoRangeState                       { return GeoRangeState{Mode: GeoModeBlock} }
 func (m *Manager) CaptureGeo() (*GeoSnapshot, error)             { return nil, nil }

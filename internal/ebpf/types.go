@@ -452,6 +452,9 @@ type ManagerConfig struct {
 	EventBufferSize int           `json:"event_buffer_size" yaml:"event_buffer_size"` // perf ring pages (default 128)
 	EventChanSize   int           `json:"event_chan_size" yaml:"event_chan_size"`     // Go channel buffer (default 4096)
 	MetricsPollMs   int           `json:"metrics_poll_ms" yaml:"metrics_poll_ms"`     // metrics polling interval (default 1000)
+	// MapSizes sizes the preallocated maps at load (see ComputeMapSizes). The
+	// zero value leaves each map at the size its object declares.
+	MapSizes MapSizes `json:"-" yaml:"-"`
 }
 
 // Status reports the runtime state of the eBPF subsystem.
@@ -475,6 +478,9 @@ type Status struct {
 	KernelVersion       string                `json:"kernel_version,omitempty"`
 	Config              *FullConfigAPI        `json:"config,omitempty"`
 	PortPolicies        *PortPoliciesSnapshot `json:"port_policies,omitempty"`
+	// MapSizing: the scale the firewall maps were sized with and how full each
+	// one is. Absent when the maps were not sized.
+	MapSizing *MapSizing `json:"map_sizing,omitempty"`
 
 	// LockoutExemptions: the attached XDP and TC objects carry the
 	// reply and control-plane exemptions. Without them the agent
