@@ -190,7 +190,7 @@ jobs:
       - name: Load the objects in kernel ${{ matrix.kernel }}
         # v0.0.31: its install step tolerates a missing /var/lib/man-db/auto-update
         # (v0.0.26 failed on current ubuntu-latest).
-        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        uses: cilium/little-vm-helper@c8b0bfbae3bdda7bc69fb9cd370e4b74ce84986d # v0.0.33
         with:
           test-name: wafio-bpf-${{ matrix.kernel }}
           image: complexity-test
