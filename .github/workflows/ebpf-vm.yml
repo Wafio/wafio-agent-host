@@ -144,6 +144,10 @@ jobs:
           rm -f /host/build/vm-warnings.log
           WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_TEST_BPF_DIR=/tmp/wafio-bpf/ebpf WAFIO_VM_WARN_FILE=/host/build/vm-warnings.log \
             ./build/ebpf-vm-scenarios.test -test.count=1 -test.v -test.timeout=8m -test.run '^TestVMScenario' 2>&1 | tee /host/build/vm-scenarios.log
+          # The detection checks at the smallest map sizes, against real traffic on a
+          # private veth pair (about two minutes).
+          WAFIO_EBPF_FLOOR_LOAD=1 WAFIO_TEST_BPF_DIR=/tmp/wafio-bpf/ebpf \
+            ./build/ebpf-vm-scenarios.test -test.count=1 -test.v -test.timeout=12m -test.run '^TestMapFloorLoad$' 2>&1 | tee /host/build/vm-floor-load.log
           echo 'vm-scenarios: complete'
           SH
       - name: Start the scenario peer and make ssh fail fast
@@ -205,7 +209,7 @@ jobs:
               sed 's/^/- /' build/vm-warnings.log
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          tail -n 300 build/vm-scenarios.log build/vm-peer.log build/raise-qemu-nofile.log || true
+          tail -n 300 build/vm-scenarios.log build/vm-floor-load.log build/vm-peer.log build/raise-qemu-nofile.log || true
           # SIGTERM to sudo is relayed to the peer; no pattern kill (it would
           # match this very command line).
           sudo kill "$(cat build/vm-peer.pid)" || true

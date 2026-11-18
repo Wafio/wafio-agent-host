@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 
 	"github.com/wafio/wafio-agent-host/internal/ebpf"
@@ -33,6 +34,11 @@ func traceLab(t testing.TB) *ebpf.TraceManager {
 // names `allowMissing` accepts (an object from before open results has no open
 // exit probes).
 func traceLabWithout(t testing.TB, allowMissing func(string) bool) *ebpf.TraceManager {
+	return traceLabSized(t, allowMissing, ebpf.MapSizes{})
+}
+
+// traceLabSized is traceLabWithout with the trace maps sized as sizes says.
+func traceLabSized(t testing.TB, allowMissing func(string) bool, sizes ebpf.MapSizes) *ebpf.TraceManager {
 	t.Helper()
 	if os.Getenv("WAFIO_EBPF_INTEGRATION") != "1" {
 		t.Skip("set WAFIO_EBPF_INTEGRATION=1 on an authorized Linux lab")
@@ -44,8 +50,11 @@ func traceLabWithout(t testing.TB, allowMissing func(string) bool) *ebpf.TraceMa
 	if object == "" {
 		t.Fatal("WAFIO_TRACE_OBJECT is required")
 	}
+	if err := rlimit.RemoveMemlock(); err != nil { // kernels before 5.11 charge maps to it
+		t.Fatalf("remove memlock: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	tm := ebpf.NewTraceManager(ebpf.TraceManagerConfig{ObjectPath: object}, nil)
+	tm := ebpf.NewTraceManager(ebpf.TraceManagerConfig{ObjectPath: object, MapSizes: sizes}, nil)
 	if err := tm.Start(ctx); err != nil {
 		cancel()
 		t.Fatal(err)
@@ -345,11 +354,58 @@ func pidsAvailable() int {
 // missing. A full map costs results, never events.
 func TestTraceOpenResultPendingFull(t *testing.T) {
 	const slots = 2048 // TRACE_OPEN_PENDING_MAX
+	pendingFull(t, openResultLab(t), slots)
+}
+
+// The same at the smallest size of the map: 512 entries, a ring of 4 MiB. The
+// status names the sizes and counts the opens the full map refused.
+func TestTraceOpenResultPendingFullAtFloor(t *testing.T) {
+	sizes := ebpf.ComputeMapSizes(0.001, 1)
+	slots, _ := sizes.Size("trace_open_pending")
+	tm := traceLabSized(t, nil, sizes)
+	if status := tm.Status(); !status.OpenResult || status.RingbufSizeMB != 4 {
+		t.Fatalf("open results armed %v, ring %d MiB, want armed and 4: %+v", status.OpenResult, status.RingbufSizeMB, status)
+	}
+	if stats, err := tm.GetStats(); err != nil || stats.BufferTotal != 4<<20 {
+		t.Fatalf("trace stats buffer_total %v (%v), want the 4 MiB ring", stats, err)
+	}
+	pendingFull(t, tm, int(slots))
+	var pending, ring ebpf.MapCapacity
+	deadline := time.Now().Add(60 * time.Second) // the sampler runs every 30 s
+	for time.Now().Before(deadline) {
+		sizing := tm.Status().MapSizing
+		if sizing == nil {
+			t.Fatal("no map_sizing in the trace status")
+		}
+		for _, m := range sizing.Maps {
+			switch m.Name {
+			case "trace_open_pending":
+				pending = m
+			case "trace_events":
+				ring = m
+			}
+		}
+		if pending.FullCount != nil && *pending.FullCount > 0 {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if pending.MaxEntries != slots || pending.DefaultMaxEntries != 2048 || pending.FullCount == nil || *pending.FullCount == 0 || pending.LastFullAt == nil {
+		t.Errorf("trace_open_pending in the status: %+v, want %d of 2048 entries and a count of refused opens", pending, slots)
+	}
+	if ring.MaxEntries != 4<<20 || ring.DefaultMaxEntries != 16<<20 || ring.Entries != nil || ring.FullCount == nil {
+		t.Errorf("trace_events in the status: %+v, want a ring of 4 MiB of 16 with no entry count", ring)
+	}
+}
+
+// pendingFull runs the full-map check against a trace manager whose
+// trace_open_pending holds slots entries.
+func pendingFull(t *testing.T, tm *ebpf.TraceManager, slots int) {
+	t.Helper()
 	const extra = 64
 	if free := pidsAvailable(); free >= 0 && free < slots+extra+512 {
 		t.Skipf("the cgroup of this process allows %d more tasks, the test needs %d threads", free, slots+extra)
 	}
-	tm := openResultLab(t)
 	fifo := filepath.Join(t.TempDir(), "result-fifo")
 	if err := unix.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
