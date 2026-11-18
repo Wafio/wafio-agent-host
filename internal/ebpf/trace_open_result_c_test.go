@@ -179,12 +179,12 @@ int main(void) {
     trace_open_exit(TRACE_OPEN_KIND_OPENAT, 3);
     EXPECT(trace_priority_events.n + trace_events.n == 1, "kernel Kill open exported again at exit");
   }
-  /* The other actions wait: a Block shows the errno the LSM returned. */
+  /* The other actions wait: an Alert open shows the errno of the open. */
   setup(1);
-  enter_open_kind("/etc/shadow", SEV_HIGH, TRACE_ACTION_BLOCK, TRACE_OPEN_KIND_OPENAT);
-  EXPECT(pending_count() == 1, "blocked open not held");
+  enter_open_kind("/etc/shadow", SEV_HIGH, TRACE_ACTION_ALERT, TRACE_OPEN_KIND_OPENAT);
+  EXPECT(pending_count() == 1, "alert open not held");
   trace_open_exit(TRACE_OPEN_KIND_OPENAT, -1);
-  EXPECT(trace_events.n == 1 && trace_events.ret[0] == -1 && (trace_events.flags[0] & TRACE_EVT_OPEN_RESULT), "blocked open lost its errno");
+  EXPECT(trace_events.n == 1 && trace_events.ret[0] == -1 && (trace_events.flags[0] & TRACE_EVT_OPEN_RESULT), "alert open lost its errno");
 
   /* kind 0: the exit probe of this open will not run (x32 task on a kprobe
    * twin). It leaves at entry like an unarmed open, and does not disturb a

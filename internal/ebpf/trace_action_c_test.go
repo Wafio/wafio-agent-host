@@ -17,12 +17,9 @@ func TestTraceActionConstantsMatchCHeaders(t *testing.T) {
 		"TRACE_ACTION_ALERT":    ActionAlert,
 		"TRACE_ACTION_KILL":     ActionKill,
 		"TRACE_ACTION_SIMULATE": ActionSimulate,
-		"TRACE_ACTION_BLOCK":    ActionBlock,
 	}
 	define := regexp.MustCompile(`(?m)^\s*#define\s+(TRACE_ACTION_[A-Z_]+)\s+(\d+)\b`)
-	// wafio_lsm.c carries its own copy of the defines (it does not include
-	// wafio_trace.h), so both sources are checked.
-	for _, file := range []string{"bpf/wafio_trace.h", "bpf/wafio_lsm.c"} {
+	for _, file := range []string{"bpf/wafio_trace.h"} {
 		src, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
@@ -53,7 +50,7 @@ func TestTraceActionConstantsMatchCHeaders(t *testing.T) {
 	}
 	// Names userspace shows for each action are distinct.
 	names := map[string]uint32{}
-	for _, a := range []uint32{ActionMonitor, ActionAlert, ActionKill, ActionSimulate, ActionBlock} {
+	for _, a := range []uint32{ActionMonitor, ActionAlert, ActionKill, ActionSimulate} {
 		n := actionName(a)
 		if prev, dup := names[n]; dup || n == "" {
 			t.Errorf("action %d name %q collides with %d", a, n, prev)

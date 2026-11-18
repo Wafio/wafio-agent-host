@@ -17,18 +17,6 @@ func TestSubnetStructSizes(t *testing.T) {
 	}
 }
 
-func TestLSMStructSizes(t *testing.T) {
-	if sz := unsafe.Sizeof(LSMRule{}); sz != 24 {
-		t.Errorf("LSMRule size = %d; want 24", sz)
-	}
-	if sz := unsafe.Sizeof(LSMConfig{}); sz != 16 {
-		t.Errorf("LSMConfig size = %d; want 16", sz)
-	}
-	if sz := unsafe.Sizeof(WafioLSMEvent{}); sz != 344 {
-		t.Errorf("WafioLSMEvent size = %d; want 344", sz)
-	}
-}
-
 func TestParseCIDR(t *testing.T) {
 	tests := []struct {
 		name      string

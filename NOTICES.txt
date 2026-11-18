@@ -37,8 +37,8 @@ Generated from kernel BTF. Derived from the Linux kernel, licensed under
 GPL-2.0. The BPF programs themselves carry the SPDX identifier GPL-2.0.
 
 ───────────────────────────────────────────────────────────────────────────────
-THE eBPF OBJECTS (ebpf/wafio_xdp.o, wafio_tc.o, wafio_trace.o, wafio_lsm.o)
-The four objects are licensed under GPL-2.0. Their C source, including the
+THE eBPF OBJECTS (ebpf/wafio_xdp.o, wafio_tc.o, wafio_trace.o)
+The three objects are licensed under GPL-2.0. Their C source, including the
 headers and vmlinux.h, is in ebpf/src/ of this bundle, and the licence text is
 ebpf/COPYING. The Go program that loads them is a separate program and is not
 covered by that licence.

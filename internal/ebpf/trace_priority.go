@@ -26,12 +26,8 @@ import (
 // killCandidateRoutes returns, per trace event type, the lowest severity at
 // which an enabled Kill policy could select an event of that type. Only
 // connect and sendto carry a destination, so a policy with match_dest_ip
-// selects nothing else. A connect the BPF-LSM blocklist denies in the kernel
-// needs no userspace kill: with an object that has the marker (mapped) every
-// connect that reaches the policy's IPv4 address is denied there, so the
-// blocklist's policies leave connect out — and sendto too while the
-// socket_sendmsg hook is wired (sendWired) and the policy selects it.
-func killCandidateRoutes(policies map[uint32]*EnforcementPolicy, connectAvail, mapped, sendWired bool) map[uint32]uint32 {
+// selects nothing else.
+func killCandidateRoutes(policies map[uint32]*EnforcementPolicy) map[uint32]uint32 {
 	nameToType := make(map[string]uint32, len(TraceEventTypes))
 	for et, info := range TraceEventTypes {
 		nameToType[info.Name] = et
@@ -54,15 +50,9 @@ func killCandidateRoutes(policies map[uint32]*EnforcementPolicy, connectAvail, m
 			}
 		}
 		destIP := strings.TrimSpace(p.MatchDestIP) != ""
-		onBlocklist := p.KernelEnforce && connectBlockEnforces(p, connectAvail)
-		blocklisted := mapped && onBlocklist
-		sendDenied := sendWired && onBlocklist && policySelectsSend(p)
 		sev := ParseSeverityName(p.MinSeverity)
 		for _, et := range types {
 			if destIP && et != TraceConnect && et != TraceSendto {
-				continue
-			}
-			if (blocklisted && et == TraceConnect) || (sendDenied && et == TraceSendto) {
 				continue
 			}
 			if cur, ok := routes[et]; !ok || sev < cur {
@@ -165,19 +155,10 @@ func (pe *PolicyEngine) syncKillRoutingLocked() {
 		return
 	}
 	pe.killRouting(killRoutes{
-		Types:     killCandidateRoutes(pe.policies, pe.connectBlockAvailableLocked(), pe.connectMapped, pe.pushConnectSend != nil),
+		Types:     killCandidateRoutes(pe.policies),
 		OpenNames: killCandidateOpenNames(pe.policies),
 		KeepNames: shedKeepNames(pe.policies),
 	})
-}
-
-// syncDerivedMapsLocked reconciles what follows from the policy set after the
-// kernel rules: the connect blocklist, then kill-candidate routing.
-// Must be called with pe.mu held.
-func (pe *PolicyEngine) syncDerivedMapsLocked() error {
-	err := pe.syncConnectBlocksLocked()
-	pe.syncKillRoutingLocked()
-	return err
 }
 
 // traceLossCounters are the kernel drop counters of the trace object:

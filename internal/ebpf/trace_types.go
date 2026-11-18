@@ -14,10 +14,7 @@ import (
 // ────────────────────────────────────────────────────────────────────────────
 
 type TraceManagerConfig struct {
-	ObjectPath      string // path to compiled wafio_trace.o
-	LSMObjectPath   string // path to compiled wafio_lsm.o (optional; auto-detected if empty)
-	LSMEnabled      bool   // enable proactive BPF-LSM blocking if supported by kernel
-	LSMBlockConnect bool   // LSM: -EPERM on blocklisted socket_connect (kernel ≥ 5.7 hook)
+	ObjectPath string // path to compiled wafio_trace.o
 
 	// Protected processes are never killed by enforcement. Names are added to
 	// DefaultProtectedProcessNames and match the executable basename in a
@@ -41,53 +38,6 @@ func (c TraceManagerConfig) ProtectedConfig() ProtectedProcessConfig {
 		ExePaths:        c.ProtectedExePaths,
 		ReplaceDefaults: c.ProtectedReplaceDefaults,
 	}
-}
-
-// LSMRule mirrors struct lsm_rule in wafio_lsm.c (24 bytes).
-type LSMRule struct {
-	Action   uint32
-	PolicyID uint32
-	Enabled  uint32
-	Flags    uint32 // LSMRuleSend…; was padding (objects before the sendmsg hook ignore it)
-	HitCount uint64
-}
-
-// LSMRuleSend (LSM_RULE_SEND) marks a connect-blocklist entry whose
-// enforcing policy also selects sendto: the socket_sendmsg hook then denies
-// addressed sends to the IP too.
-const LSMRuleSend uint32 = 1 << 0
-
-// LSMConfig mirrors struct lsm_config in wafio_lsm.c (16 bytes).
-type LSMConfig struct {
-	Enabled      uint32
-	BlockConnect uint32 // -EPERM on blocklisted socket_connect matches
-	AgentPID     uint32
-	Pad          uint32
-}
-
-// LSM hook IDs (must match LSM_HOOK_* in wafio_lsm.c).
-const (
-	LSMHookConnect uint32 = 2
-	LSMHookSendmsg uint32 = 3
-)
-
-// WafioLSMEvent mirrors struct wafio_lsm_event in wafio_lsm.c (344 bytes).
-type WafioLSMEvent struct {
-	TimestampNs uint64
-	CgroupID    uint64
-	PID         uint32
-	UID         uint32
-	GID         uint32
-	Action      uint32
-	PolicyID    uint32
-	RetCode     int32
-	Hook        uint32
-	Comm        [16]byte
-	Path        [256]byte
-	Addr        [16]byte
-	Port        uint16
-	Family      uint16 // connect/sendmsg: destination address family; unset by older objects
-	Pad         uint64
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -246,8 +196,6 @@ func severityName(s uint32) string {
 
 func actionName(a uint32) string {
 	switch a {
-	case ActionBlock:
-		return "block"
 	case ActionMonitor:
 		return "monitor"
 	case ActionAlert:
@@ -755,16 +703,6 @@ type TraceStatus struct {
 	// instead of the syscall tracepoint, because this kernel's tracepoint
 	// copies user strings before the program runs (Linux 6.19+/7.0).
 	KprobeProbes []string `json:"kprobe_probes,omitempty"`
-	// LSMReportsSuppressed: BPF-LSM connect/send deny reports dropped by the
-	// per-CPU rate limit (32/s per CPU); the denials themselves still apply
-	// and still count as policy hits.
-	LSMReportsSuppressed uint64 `json:"lsm_reports_suppressed"`
-	// LSMActive: the BPF-LSM programs are attached. LSMState says why not
-	// (LSMState* values: "kernel_lacks_bpf" when bpf is not in the kernel's
-	// active LSM list, "disabled", "failed") or how far to trust it
-	// ("active", "unverified" when the kernel's list could not be read).
-	LSMActive bool   `json:"lsm_active"`
-	LSMState  string `json:"lsm_state,omitempty"`
 	// OpenResult: file open events leave the kernel with the result of the
 	// open (the exit probes of openat, openat2, open and creat are attached
 	// and armed), so a failed open reads as failure and a successful one as
@@ -784,19 +722,13 @@ type TraceStatus struct {
 // ────────────────────────────────────────────────────────────────────────────
 
 // ActionPriority returns the ordering used to pick the "best" matching policy
-// action when multiple policies fire on the same event: kill trumps block
-// trumps alert trumps simulate trumps monitor. Block acts only through the
-// BPF-LSM hooks before the event (the IP blocklist); from a
-// traced event neither trace_enforce_map nor userspace can block, so a Block
-// match must never suppress a Kill that can still act (it used to rank first).
-// The raw uint32 constants cannot be used directly because ActionSimulate=3
-// must not outrank ActionKill=2 (the numeric values are constrained to match
-// the BPF ABI where alert=1/kill=2).
+// action when multiple policies fire on the same event: kill trumps alert
+// trumps simulate trumps monitor. The raw uint32 constants cannot be used
+// directly because ActionSimulate=3 must not outrank ActionKill=2 (the numeric
+// values are constrained to match the BPF ABI where alert=1/kill=2).
 func ActionPriority(a uint32) int {
 	switch a {
 	case ActionKill:
-		return 4
-	case ActionBlock:
 		return 3
 	case ActionAlert:
 		return 2

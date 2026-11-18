@@ -39,7 +39,7 @@ jobs:
         run: ./scripts/build-ebpf.sh
       - name: Check every object was produced
         run: |
-          for o in wafio_xdp.o wafio_tc.o wafio_trace.o wafio_lsm.o; do
+          for o in wafio_xdp.o wafio_tc.o wafio_trace.o; do
             test -s "build/ebpf/$o" || { echo "missing build/ebpf/$o"; exit 1; }
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -75,7 +75,7 @@ ai_material() {
 ebpf_objects() {
   ./scripts/build-ebpf.sh || return 1
   local o
-  for o in wafio_xdp.o wafio_tc.o wafio_trace.o wafio_lsm.o; do
+  for o in wafio_xdp.o wafio_tc.o wafio_trace.o; do
     test -s "build/ebpf/$o" || { echo "missing build/ebpf/$o"; return 1; }
   done
 }

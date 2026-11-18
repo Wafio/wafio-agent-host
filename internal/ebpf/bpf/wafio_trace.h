@@ -60,7 +60,6 @@
 #define TRACE_ACTION_ALERT        1   /* observe + flag as alert               */
 #define TRACE_ACTION_KILL         2   /* send SIGKILL via bpf_send_signal()    */
 #define TRACE_ACTION_SIMULATE     3   /* simulate / dry run                    */
-#define TRACE_ACTION_BLOCK        4   /* deny connect to a blocked IP (BPF-LSM) */
 
 #define MAX_ENFORCE_RULES         64
 

@@ -53,7 +53,7 @@ func TestTraceEventIsNoise(t *testing.T) {
 		{"file,security low", TraceEvent{Category: "file,security", Severity: SevLow}, false},
 		{"file info alerted", TraceEvent{Category: "file", Severity: SevInfo, Action: ActionAlert}, false},
 		{"file info simulated", TraceEvent{Category: "file", Severity: SevInfo, Action: ActionSimulate}, false},
-		{"network info blocked", TraceEvent{Category: "network", Severity: SevInfo, Action: ActionBlock}, false},
+		{"network info killed", TraceEvent{Category: "network", Severity: SevInfo, Action: ActionKill}, false},
 		{"kill outcome update", TraceEvent{Category: "file", Severity: SevInfo, OutcomeUpdate: true}, false},
 	}
 	for _, tc := range cases {

@@ -5,7 +5,7 @@
 #
 # Output, in dist/host-agent/:
 #   wafio-host-agent                    the agent, linux/amd64, static
-#   ebpf/wafio_{xdp,tc,trace,lsm}.o     the CO-RE objects
+#   ebpf/wafio_{xdp,tc,trace}.o         the CO-RE objects
 #   ebpf/COPYING, ebpf/src/             the GPL-2.0 text and the C source the objects were built from
 #   systemd/wafio-host-agent.service    the unit
 #   NOTICES.txt
@@ -38,7 +38,7 @@ mkdir -p "$out/ebpf/src" "$out/systemd"
   -o "$out/wafio-host-agent" ./cmd/wafio-host-agent)
 
 echo "[3/3] $out"
-for o in wafio_xdp.o wafio_tc.o wafio_trace.o wafio_lsm.o; do
+for o in wafio_xdp.o wafio_tc.o wafio_trace.o; do
   install -m 0644 "$root/build/ebpf/$o" "$out/ebpf/$o"
 done
 # The objects are GPL-2.0: they ship with the source they were built from and the licence text.

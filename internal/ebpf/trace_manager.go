@@ -3,16 +3,13 @@
 package ebpf
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -27,7 +24,7 @@ import (
 )
 
 // ────────────────────────────────────────────────────────────────────────────
-//  BPF Map Names (must match SEC(".maps") in wafio_trace.c / wafio_lsm.c)
+//  BPF Map Names (must match SEC(".maps") in wafio_trace.c)
 // ────────────────────────────────────────────────────────────────────────────
 
 const (
@@ -43,10 +40,6 @@ const (
 	// optional: objects built before the fork-insert budget lack it (no fork
 	// inheritance budget; such objects are not shipped with this agent).
 	traceMapProtectedBudget = "trace_protected_budget"
-
-	lsmMapConfig      = "wafio_lsm_config"
-	lsmMapIPBlocklist = "wafio_lsm_ip_blocklist"
-	lsmMapEvents      = "wafio_lsm_events"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -135,20 +128,6 @@ type TraceManager struct {
 	capAt     time.Time
 	fullTrack mapFullTracker
 	counter   entryCounter
-
-	// BPF-LSM proactive blocking
-	lsmColl       *ebpf.Collection
-	lsmLink       link.Link
-	lsmExtraLinks []link.Link // socket_connect / socket_sendmsg hook links
-	lsmConfigMap  *ebpf.Map
-	lsmIPBlockMap *ebpf.Map
-	lsmEventsMap  *ebpf.Map
-	// lsmSuppressedMap: per-CPU count of network deny reports the object
-	// rate-limited (nil for older objects).
-	lsmSuppressedMap *ebpf.Map
-	lsmReader        *ringbuf.Reader
-	lsmActive        bool
-	lsmState         string // LSMState* value reported in the trace status
 
 	// events: the newest-5000 query ring, per-category rings (1000 each, so
 	// low-frequency categories are not drowned out by file/openat) and the
@@ -459,34 +438,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 		go tm.protectedRefreshLoop(childCtx.Done())
 	}
 
-	tm.startLSM(childCtx, kernelLSMListPath)
-
 	return nil
-}
-
-// startLSM attaches the proactive BPF-LSM blocking programs when the kernel
-// runs them. A kernel without bpf in its LSM list (read from listPath)
-// accepts the attach and never calls the programs, so nothing is attached
-// there. A failure is logged, never returned: the agent works without LSM.
-func (tm *TraceManager) startLSM(ctx context.Context, listPath string) {
-	plan := planLSM(tm.cfg.LSMEnabled, listPath)
-	tm.lsmState = plan.State
-	switch {
-	case !plan.Attach && plan.Note != "":
-		tm.log.Printf("INFO: %s; enforcement is reactive only: kernel-rule kills via bpf_send_signal at the traced syscall, userspace-matched kills via %s", plan.Note, tm.terminationMode())
-	case plan.Attach:
-		if plan.Note != "" {
-			tm.log.Printf("INFO: %s", plan.Note)
-		}
-		if err := tm.loadLSM(ctx); err != nil {
-			tm.lsmState = LSMStateFailed
-			tm.log.Printf("INFO: BPF-LSM unavailable or not active (%v); enforcement is reactive only: kernel-rule kills via bpf_send_signal at the traced syscall, userspace-matched kills via %s", err, tm.terminationMode())
-		} else if plan.State == LSMStateUnverified {
-			tm.log.Printf("INFO: BPF-LSM hooks attached; the kernel LSM list was unreadable, so whether they run is unverified")
-		} else {
-			tm.log.Printf("INFO: BPF-LSM enabled for outbound connect and addressed-send blocking by IP")
-		}
-	}
 }
 
 func (tm *TraceManager) Stop() error {
@@ -507,21 +459,9 @@ func (tm *TraceManager) Stop() error {
 	}
 	tm.priorityMaps.Store(nil) // not SetKillCandidateRouting: never pe.mu under tm.mu here
 	tm.keepMap.Store(nil)
-	if tm.lsmReader != nil {
-		_ = tm.lsmReader.Close() // unblocks the reader loop; nothing to report on shutdown
-		tm.lsmReader = nil
-	}
 	tm.wg.Wait()
 
 	tm.closeLinks()
-
-	tm.closeLSMLinks()
-	if tm.lsmColl != nil {
-		tm.lsmColl.Close()
-		tm.lsmColl = nil
-	}
-	tm.lsmActive = false
-	tm.lsmState = ""
 
 	if tm.coll != nil {
 		tm.coll.Close()
@@ -532,267 +472,6 @@ func (tm *TraceManager) Stop() error {
 	tm.running = false
 	tm.log.Printf("trace manager stopped (processed %d events)", tm.totalEvents.Load())
 	return nil
-}
-
-// closeLSMLinks detaches the LSM programs; the kernel drops each link with its fd.
-func (tm *TraceManager) closeLSMLinks() {
-	if tm.lsmLink != nil {
-		_ = tm.lsmLink.Close() // nothing to do if detaching fails
-		tm.lsmLink = nil
-	}
-	for _, l := range tm.lsmExtraLinks {
-		_ = l.Close() // nothing to do if detaching fails
-	}
-	tm.lsmExtraLinks = nil
-}
-
-func (tm *TraceManager) resolveLSMPath() string {
-	if tm.cfg.LSMObjectPath != "" {
-		return tm.cfg.LSMObjectPath
-	}
-	if tm.cfg.ObjectPath != "" {
-		candidate := filepath.Join(filepath.Dir(tm.cfg.ObjectPath), "wafio_lsm.o")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	return ""
-}
-
-func (tm *TraceManager) loadLSM(ctx context.Context) error {
-	lsmPath := tm.resolveLSMPath()
-	if lsmPath == "" {
-		return fmt.Errorf("wafio_lsm.o not found")
-	}
-
-	spec, err := ebpf.LoadCollectionSpec(lsmPath)
-	if err != nil {
-		return fmt.Errorf("load LSM spec from %s: %w", lsmPath, err)
-	}
-
-	// socket_sendmsg is optional: a kernel that rejects it keeps connect
-	// blocking.
-	coll, dropped, err := createDroppingOptional(spec.Programs, []string{lsmProgSendmsg},
-		func() (*ebpf.Collection, error) { return ebpf.NewCollection(spec) })
-	if err != nil {
-		return fmt.Errorf("create LSM collection: %w", err)
-	}
-	if why, ok := dropped[lsmProgSendmsg]; ok {
-		tm.log.Printf("LSM program %s not loaded (%v) — addressed sends to blocklisted IPs enforced from userspace", lsmProgSendmsg, why)
-	}
-	tm.lsmColl = coll
-	tm.lsmConfigMap = coll.Maps[lsmMapConfig]
-	tm.lsmIPBlockMap = coll.Maps[lsmMapIPBlocklist]
-	tm.lsmEventsMap = coll.Maps[lsmMapEvents]
-	tm.lsmSuppressedMap = coll.Maps["wafio_lsm_reports_suppressed"]
-
-	// Attach every LSM program present in the object. socket_connect is the
-	// required one; socket_sendmsg is optional.
-	var attached []string
-	for _, name := range []string{lsmProgConnect, lsmProgSendmsg} {
-		prog := coll.Programs[name]
-		if prog == nil {
-			continue
-		}
-		lsmLink, err := link.AttachLSM(link.LSMOptions{Program: prog})
-		if err != nil {
-			tm.log.Printf("LSM attach %s skipped: %v", name, err)
-			continue
-		}
-		if tm.lsmLink == nil {
-			tm.lsmLink = lsmLink
-		} else {
-			tm.lsmExtraLinks = append(tm.lsmExtraLinks, lsmLink)
-		}
-		attached = append(attached, name)
-	}
-	// socket_sendmsg alone denies nothing: its rules are written only when
-	// socket_connect denies too.
-	if !slices.Contains(attached, lsmProgConnect) {
-		tm.closeLSMLinks()
-		coll.Close()
-		return fmt.Errorf("%s could not be attached", lsmProgConnect)
-	}
-	tm.log.Printf("BPF-LSM hooks attached: %v", attached)
-
-	// Set initial LSM config. Without it lsm_gate() allows everything, so a
-	// failed write must keep dest-IP policies out of the connect blocklist.
-	configErr := fmt.Errorf("LSM config map %s missing", lsmMapConfig)
-	if tm.lsmConfigMap != nil {
-		zero := uint32(0)
-		cfg := LSMConfig{
-			Enabled:      1,
-			BlockConnect: boolToU32(tm.cfg.LSMBlockConnect),
-			AgentPID:     agentPID(),
-		}
-		configErr = tm.lsmConfigMap.Update(zero, &cfg, ebpf.UpdateAny)
-	}
-	if configErr != nil {
-		tm.log.Printf("LSM config write failed — LSM hooks allow everything: %v", configErr)
-	}
-
-	// Start ringbuf reader for LSM blocked events
-	if tm.lsmEventsMap != nil {
-		reader, err := ringbuf.NewReader(tm.lsmEventsMap)
-		if err == nil {
-			tm.lsmReader = reader
-			tm.wg.Add(1)
-			go tm.lsmRingbufLoop(ctx, reader)
-		}
-	}
-
-	tm.lsmActive = true
-
-	// Wire the policy engine's dest-IP path here, not in Start (map may exist
-	// while attach failed), and only when the kernel really denies: the engine
-	// skips userspace action for connects it believes the blocklist enforced,
-	// so report-only mode, a failed socket_connect attach or a failed
-	// config write would turn a kill policy into a no-op. Any of those keeps
-	// dest-IP policies in userspace.
-	denies, reason := connectBlocklistDenies(tm.lsmIPBlockMap != nil,
-		slices.Contains(attached, lsmProgConnect), tm.cfg.LSMBlockConnect, configErr)
-	// Only an object with the marker denies IPv4-mapped AF_INET6
-	// connects; with an older one userspace keeps enforcing them.
-	mapped := coll.Maps[lsmMapConnectV4Mapped] != nil
-	tm.policyEngine.SetConnectBlocklistIPv4Mapped(denies && mapped)
-	if denies && !mapped {
-		tm.log.Printf("LSM object predates the IPv4-mapped connect check: IPv4-mapped IPv6 connects to blocklisted addresses are enforced in userspace")
-	}
-	if denies {
-		tm.policyEngine.SetConnectCallbacks(tm.pushConnectBlock, tm.removeConnectBlock)
-		tm.log.Printf("LSM connect blocklist loaded — dest-IP policies kernel-enforceable")
-		// Addressed sends (unconnected UDP sendto, sendmsg
-		// with a destination, MSG_FASTOPEN) meet the same blocklist.
-		if slices.Contains(attached, lsmProgSendmsg) {
-			if err := tm.policyEngine.SetSendBlocklist(tm.pushConnectBlockSend); err != nil {
-				tm.log.Printf("LSM send blocklist sync: %v", err)
-			}
-			tm.log.Printf("LSM socket_sendmsg hook attached — addressed sends to blocklisted IPs denied in the kernel")
-		} else {
-			tm.log.Printf("LSM socket_sendmsg hook not attached — addressed sends to blocklisted IPs enforced from userspace")
-		}
-	} else {
-		tm.log.Printf("LSM connect blocklist not used (%s) — dest-IP policies enforced in userspace", reason)
-	}
-	return nil
-}
-
-func (tm *TraceManager) lsmRingbufLoop(ctx context.Context, reader *ringbuf.Reader) {
-	defer tm.wg.Done()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		rec, err := reader.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return
-			}
-			continue
-		}
-
-		if len(rec.RawSample) < 344 {
-			continue
-		}
-
-		var evt WafioLSMEvent
-		if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &evt); err != nil {
-			continue
-		}
-
-		pathStr := strings.TrimRight(string(evt.Path[:]), "\x00")
-		commStr := strings.TrimRight(string(evt.Comm[:]), "\x00")
-
-		// Hook-specific presentation: connect and send both name an IP.
-		eventType, eventName, category := TraceConnect, "socket_connect", "network"
-		subject := net.IP(evt.Addr[:4]).String()
-		description := "BPF-LSM blocked outbound connect"
-		if evt.Hook == LSMHookSendmsg {
-			eventType, eventName = TraceSendto, "socket_sendmsg"
-			description = "BPF-LSM blocked outbound send"
-		}
-		addrFamily, familyNote := lsmConnectFamily(evt)
-		description += familyNote
-		if evt.Port != 0 {
-			subject = fmt.Sprintf("%s:%d", subject, evt.Port)
-		}
-
-		traceEvt := TraceEvent{
-			EventID:         fmt.Sprintf("%s-lsm-%d", tm.eventPrefix, evt.TimestampNs),
-			EventType:       eventType,
-			EventName:       eventName,
-			Category:        category,
-			Severity:        SevCritical,
-			SeverityName:    severityName(SevCritical),
-			PID:             evt.PID,
-			UID:             evt.UID,
-			GID:             evt.GID,
-			Comm:            commStr,
-			Filename:        pathStr,
-			Addr:            net.IP(evt.Addr[:4]).String(),
-			AddrFamily:      addrFamily,
-			Port:            evt.Port,
-			RetVal:          int64(evt.RetCode),
-			Action:          ActionBlock,
-			ActionName:      actionName(ActionBlock),
-			PolicyID:        evt.PolicyID,
-			Timestamp:       time.Unix(0, i64FromU64(evt.TimestampNs)+int64(tm.bootTimeOffset)).UTC().Format(time.RFC3339),
-			TimestampNs:     i64FromU64(evt.TimestampNs),
-			ActivityOutcome: "blocked",
-			Description:     fmt.Sprintf("%s: %s (PID %d, comm %s)", description, subject, evt.PID, commStr),
-		}
-
-		// Store in the recent and category rings and the push queue
-		tm.events.record(traceEvt, category)
-	}
-}
-
-// BlockConnectIP adds a destination IPv4 to the BPF-LSM socket_connect
-// blocklist: outbound connects are denied synchronously in-kernel (-EPERM)
-// before any packet leaves the host.
-func (tm *TraceManager) BlockConnectIP(ipStr string, policyID uint32) error {
-	return tm.blockConnectIP(ipStr, policyID, false)
-}
-
-// blockConnectIP writes the blocklist entry; send also marks it for the
-// socket_sendmsg hook (LSMRuleSend).
-func (tm *TraceManager) blockConnectIP(ipStr string, policyID uint32, send bool) error {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if !tm.lsmActive || tm.lsmIPBlockMap == nil {
-		return fmt.Errorf("BPF-LSM is not active")
-	}
-	ip := net.ParseIP(strings.TrimSpace(ipStr))
-	if ip == nil || ip.To4() == nil {
-		return fmt.Errorf("connect blocklist requires an IPv4 address, got %q", ipStr)
-	}
-	var key [4]byte
-	copy(key[:], ip.To4())
-	rule := LSMRule{Action: ActionBlock, PolicyID: policyID, Enabled: 1}
-	if send {
-		rule.Flags |= LSMRuleSend
-	}
-	return tm.lsmIPBlockMap.Update(key, &rule, ebpf.UpdateAny)
-}
-
-// UnblockConnectIP removes a destination IPv4 from the connect blocklist.
-func (tm *TraceManager) UnblockConnectIP(ipStr string) error {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if !tm.lsmActive || tm.lsmIPBlockMap == nil {
-		return fmt.Errorf("BPF-LSM is not active")
-	}
-	ip := net.ParseIP(strings.TrimSpace(ipStr))
-	if ip == nil || ip.To4() == nil {
-		return fmt.Errorf("connect blocklist requires an IPv4 address, got %q", ipStr)
-	}
-	var key [4]byte
-	copy(key[:], ip.To4())
-	return tm.lsmIPBlockMap.Delete(key)
 }
 
 func (tm *TraceManager) closeLinks() {
@@ -1023,20 +702,6 @@ func (tm *TraceManager) pushKernelRule(eventType uint32, rule TraceEnforceRuleBP
 	return tm.enforceMap.Update(eventType, val, ebpf.UpdateAny)
 }
 
-// pushConnectBlock reconciles the LSM ip blocklist on behalf of the policy
-// engine (dest-IP-only kernel-enforce policies).
-func (tm *TraceManager) pushConnectBlock(ip string, policyID uint32) error {
-	return tm.BlockConnectIP(ip, policyID)
-}
-
-func (tm *TraceManager) pushConnectBlockSend(ip string, policyID uint32, send bool) error {
-	return tm.blockConnectIP(ip, policyID, send)
-}
-
-func (tm *TraceManager) removeConnectBlock(ip string) error {
-	return tm.UnblockConnectIP(ip)
-}
-
 func (tm *TraceManager) removeKernelRule(eventType uint32) error {
 	if tm.enforceMap == nil {
 		return nil
@@ -1114,9 +779,6 @@ func (tm *TraceManager) Status() TraceStatus {
 		PriorityEventsRouted:   sumPerCPU(tm.priorityStatsMap, tracePrioRouted),
 		PriorityEventsFull:     sumPerCPU(tm.priorityStatsMap, tracePrioFull),
 		PriorityEventsLost:     sumPerCPU(tm.priorityStatsMap, tracePrioLost),
-		LSMReportsSuppressed:   sumPerCPU(tm.lsmSuppressedMap, 0),
-		LSMActive:              tm.lsmActive,
-		LSMState:               tm.lsmState,
 		KprobeProbes:           slices.Clone(tm.kprobeNames),
 		OpenResult:             tm.openResultArmed,
 	}

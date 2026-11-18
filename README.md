@@ -45,7 +45,7 @@ The agent only builds and runs on Linux (the loader and the tracer carry
 `//go:build linux`). Build and test on a Linux machine.
 
 ```sh
-scripts/build-ebpf.sh                    # build/ebpf/wafio_{xdp,tc,trace,lsm}.o
+scripts/build-ebpf.sh                    # build/ebpf/wafio_{xdp,tc,trace}.o
 CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o build/wafio-host-agent ./cmd/wafio-host-agent
 ```
 
@@ -252,7 +252,7 @@ this happens only on a mixed manual install.
 ### eBPF objects ship with the binary
 
 The release bundle carries the compiled objects next to the binary
-(`ebpf/wafio_{xdp,tc,trace,lsm}.o`). Install them together: a binary and objects
+(`ebpf/wafio_{xdp,tc,trace}.o`). Install them together: a binary and objects
 from different builds can disagree on map layouts. Nothing pushes an object to a
 host at run time. The first start after an upgrade needs the new objects in
 `/etc/wafio/ebpf/`.
