@@ -192,13 +192,17 @@ A file is trusted only if root owns it and neither its group nor others can
 write it, and the same holds for its directory. An account that owns the file or
 the directory could rename a copy of its own over a trusted path, and the agent
 would then take the copy for the daemon. The agent reads the paths inside the
-root of PID 1, not its own: a symlink in a configured path is followed inside
-that root, and a process is matched by the file the symlink leads to now,
-because `/proc/<pid>/exe` shows the resolved path (a symlink moved to another
-release leaves the process of the old one unprotected until it restarts). The
-system directories a protected name is searched in must not be symlinks and the
-file itself is never a symlink (on a host where `/bin` points to `usr/bin` the
-file is found as `/usr/bin/<name>`). Without `openat2` (before Linux 5.6, or a
+root of PID 1, not its own: a symlink in a configured path, in a directory or as
+the file itself (`/usr/local/bin/agentd` pointing to `/opt/agentd/agentd`), is
+followed inside that root, and a process is matched by the file the symlink
+leads to now, because `/proc/<pid>/exe` shows the resolved path (a symlink
+moved to another release leaves the process of the old one unprotected until it
+restarts). A configured path that is itself a symlink is not in the list of
+files the `exec` trusts: the file it leads to joins the list once a refresh has
+seen a process run it. The system directories a protected name is searched in must not
+be symlinks, and a protected name found there is never a symlink (on a host
+where `/bin` points to `usr/bin` the file is found as `/usr/bin/<name>`).
+Without `openat2` (before Linux 5.6, or a
 seccomp filter that refuses it) no path with a symlink is trusted. A directory
 that is group-writable, as `/usr/local/bin` is on some Debian hosts
 (`root:staff`, mode 2775), makes the files in it untrusted until it is set to

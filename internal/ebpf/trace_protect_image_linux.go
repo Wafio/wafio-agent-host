@@ -211,32 +211,59 @@ func systemDirOnly(img protectedImage) bool {
 	return img.Flags&^protectedImageKeepOnSetuid == protectedImageRoot
 }
 
+// openFollowingIn opens path inside the root rootFD refers to as an O_PATH
+// descriptor, following every symlink, the last one too: ".." and an absolute
+// target stop at that root (openat2 with RESOLVE_IN_ROOT). It fails where
+// openat2 is missing or refused.
+func openFollowingIn(rootFD int, path string) (int, error) {
+	if noOpenat2 {
+		return -1, unix.ENOSYS
+	}
+	return unix.Openat2(rootFD, path, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
+	})
+}
+
+// leadOf returns where the configured path p leads inside the root rootFD refers
+// to, symlinks in the directory part and in the file name followed. d_path shows
+// a file relative to the reader's root; prefix is the part to cut off (nothing
+// when the roots are the same).
+func leadOf(root int, prefix, p string) (string, bool) {
+	read := func(fd int) (string, bool) {
+		resolved, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+		_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+		return filepath.Join("/", strings.TrimPrefix(resolved, prefix)), err == nil
+	}
+	if fd, err := openFollowingIn(root, p); err == nil {
+		return read(fd)
+	}
+	// No file at p (a replaced binary still runs from there), or no openat2: the
+	// directory says where the file was.
+	fd, err := openDirIn(root, filepath.Dir(p), true)
+	if err != nil {
+		return "", false
+	}
+	dir, ok := read(fd)
+	return filepath.Join(dir, filepath.Base(p)), ok
+}
+
 // refreshExeLeads records where each configured exe path that goes through a
-// symlink leads inside PID 1's root (configuredLink matches a process by it).
-// The directory is resolved with the same walk as the image set and the watch;
-// it need not be trusted here, so a writable one is still reported as such by
-// the scan. A root that cannot be opened leaves no entries.
+// symlink, in its directory or as the file itself, leads inside PID 1's root
+// (configuredLink matches a process by it). The path is resolved with the same
+// walk as the image set and the watch; it need not be trusted here, so a
+// writable directory is still reported as such by the scan. A root that cannot
+// be opened leaves no entries.
 func (s *ProtectedProcessSet) refreshExeLeads(procRoot string) {
 	if s == nil {
 		return
 	}
 	leads := make(map[string]string)
 	if root, err := unix.Open(filepath.Join(procRoot, "1", "root"), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
-		// d_path shows a file relative to the reader's root; the root descriptor
-		// gives the part to cut off (nothing when the roots are the same).
 		prefix, _ := os.Readlink("/proc/self/fd/" + strconv.Itoa(root))
 		for p := range s.exes {
-			dir, err := openDirIn(root, filepath.Dir(p), true)
-			if err != nil {
-				continue
-			}
-			resolved, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(dir))
-			_ = unix.Close(dir) // an O_PATH descriptor holds no data to flush
-			if err != nil {
-				continue
-			}
-			target := filepath.Join("/", strings.TrimPrefix(resolved, prefix), filepath.Base(p))
-			if _, listed := s.exes[target]; target != p && !listed {
+			target, ok := leadOf(root, prefix, p)
+			if _, listed := s.exes[target]; ok && target != p && !listed {
 				leads[target] = p
 			}
 		}
