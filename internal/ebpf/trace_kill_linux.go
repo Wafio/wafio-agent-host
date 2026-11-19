@@ -180,16 +180,23 @@ func bootTicksNow() (uint64, error) {
 	return startNsToTicks(u64FromInt64(ts.Nano())), nil
 }
 
+// protectedChangeGap is the shortest time between two refreshes that file
+// changes start: each reads every trusted path, and anyone who can rename a file
+// with a protected name in a watched directory starts one.
+const protectedChangeGap = time.Second
+
 // protectedRefreshLoop mirrors the protected set into trace_protected_tgids
 // so the kernel kill paths (enforce_check, check_deferred_signal) skip those
 // processes too. The kernel also inserts children forked by a
 // protected process (and by PID 1) at fork, keeps an entry across exec only
-// for a trusted image (trace_protected_images) and drops it at exit; the
-// refresh verifies what the kernel inherited and removes the rest. The first
-// sync runs synchronously in Start (runProtectedSelfCheck). A change to a file
-// that could be a trusted image refreshes the image set at once, between two
-// ticks. Directories of those files that did not exist, or were moved, are
-// watched again before each refresh.
+// for a trusted image (trace_protected_images), drops it at the exit of setuid,
+// setreuid and setresuid when a child gives up root without an exec, and at
+// exit; the refresh verifies what the kernel inherited and removes the rest.
+// The first sync runs synchronously in Start (runProtectedSelfCheck). A change
+// to a file that could be a trusted image refreshes the image set between two
+// ticks, at most once per protectedChangeGap: the last change of a burst is
+// applied up to that much late. Directories of those files that did not exist,
+// or were moved, are watched again before each refresh.
 func (tm *TraceManager) protectedRefreshLoop(done <-chan struct{}) {
 	defer tm.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
@@ -205,6 +212,12 @@ func (tm *TraceManager) protectedRefreshLoop(done <-chan struct{}) {
 			watch, changed = w, w.changed
 		}
 	}
+	var lastChange time.Time
+	var later <-chan time.Time // the refresh a change inside the gap waits for
+	refreshChange := func() {
+		tm.refreshOnChange(watch)
+		lastChange = time.Now()
+	}
 	for {
 		select {
 		case <-done:
@@ -212,7 +225,17 @@ func (tm *TraceManager) protectedRefreshLoop(done <-chan struct{}) {
 		case <-ticker.C:
 			tm.refreshOnTick(watch)
 		case <-changed:
-			tm.refreshOnChange(watch)
+			if later != nil {
+				continue // the timer's refresh runs after this change
+			}
+			if wait := protectedChangeGap - time.Since(lastChange); wait > 0 {
+				later = time.After(wait)
+				continue
+			}
+			refreshChange()
+		case <-later:
+			later = nil
+			refreshChange()
 		}
 	}
 }

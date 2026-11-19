@@ -29,6 +29,7 @@ type fakeKernelMap struct {
 	maxEntries uint32 // the budget map of the current object: 3 slots
 	ops        *[]string
 	data       map[any]any
+	iterations int // how many times the map was iterated
 }
 
 func newFakeKernelMap(name string, valueSize uint32, ops *[]string) *fakeKernelMap {
@@ -69,6 +70,7 @@ type fakeIterator struct {
 }
 
 func (m *fakeKernelMap) Iterate() mapIterator {
+	m.iterations++
 	it := &fakeIterator{}
 	for k, v := range m.data {
 		it.keys, it.values = append(it.keys, k), append(it.values, v)
@@ -297,6 +299,57 @@ func TestRefreshOnTickRearmsTheWatch(t *testing.T) {
 	tm.refreshOnChange(w)
 	if len(images.data) != 1 {
 		t.Fatalf("after the replacement the map holds %d images, want the new one alone", len(images.data))
+	}
+}
+
+// A burst of renames of a trusted file refreshes the images a few times, not
+// once per rename, and the image of the last file is in the map when it ends.
+func TestProtectedRefreshLoopLimitsChangeRefreshes(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	agent := writeFile(t, filepath.Join(dir, "agentd"), "agent", 0o755)
+	const renames = 20
+	for i := range renames {
+		writeFile(t, fmt.Sprintf("%s.%d", agent, i), fmt.Sprintf("agent %d", i), 0o755)
+	}
+	set := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{agent}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	var ops []string
+	images := newFakeKernelMap("images", uint32(len(protectedImage{}.Unit))+8, &ops)
+	tm := &TraceManager{
+		log:                log.New(io.Discard, "", 0),
+		protected:          set,
+		procRoot:           proc,
+		execKeep:           true,
+		protectedMap:       newFakeKernelMap("tgids", 8, &ops),
+		protectedImagesMap: images,
+		protectedBudgetMap: newFakeKernelMap("budget", 8, &ops),
+	}
+	done := make(chan struct{})
+	tm.wg.Add(1)
+	go tm.protectedRefreshLoop(done)
+	time.Sleep(100 * time.Millisecond) // the loop arms its watch first
+	for i := range renames {
+		if err := os.Rename(fmt.Sprintf("%s.%d", agent, i), agent); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	close(done)
+	tm.wg.Wait()
+
+	if images.iterations > 3 {
+		t.Errorf("%d refreshes for %d renames in 200 ms, want at most 3", images.iterations, renames)
+	}
+	want := set.kernelImages(proc, nil)
+	if len(want) != 1 {
+		t.Fatalf("the last file has %d images, want 1", len(want))
+	}
+	for key := range want {
+		if _, ok := images.data[key]; !ok {
+			t.Errorf("the image of the last file is not in the map after %d refreshes: %v", images.iterations, images.data)
+		}
 	}
 }
 
