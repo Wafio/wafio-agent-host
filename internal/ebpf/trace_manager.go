@@ -71,17 +71,18 @@ type TraceManager struct {
 	// when the loaded object provides it. protectedTGIDs and
 	// protectedOverflowLogged are owned by protectedRefreshLoop.
 	protected               *ProtectedProcessSet
-	protectedMap            *ebpf.Map
+	protectedMap            kernelMap
 	protectedTGIDs          map[uint32]uint64 // tgid → value written to protectedMap
 	protectedOverflowLogged bool
 	protectedCount          atomic.Int32 // len(protectedTGIDs), readable by Status
 	// protectedImagesMap is trace_protected_images: the file identities an exec
-	// may keep an entry for. protectedImages is what was last written to it and
+	// may keep an entry for, each with the condition (root, a unit) the exec must
+	// meet. protectedImages is what was last written to it and
 	// protectedVerified the processes of the last scan, which feed it;
 	// protectedImagesErr is the last failure logged. All four are owned like
 	// protectedTGIDs.
-	protectedImagesMap *ebpf.Map
-	protectedImages    map[protectedImageKey]uint8
+	protectedImagesMap kernelMap
+	protectedImages    map[protectedImageKey]protectedImage
 	protectedVerified  []protectedTGID
 	protectedImagesErr string
 	// execKeep: the kernel can keep an entry across exec by image (the object
@@ -91,8 +92,10 @@ type TraceManager struct {
 	execKeep bool
 	// protectedBudgetMap bounds the kernel's fork inserts; refused
 	// inserts since load, readable by Status.
-	protectedBudgetMap *ebpf.Map
+	protectedBudgetMap kernelMap
 	protectedRefused   atomic.Uint64
+	// procRoot is where /proc is mounted; tests point it at a fake tree.
+	procRoot string
 	// pidfdOK: pidfd_open + pidfd_send_signal usable → immediate verified kill.
 	pidfdOK bool
 
@@ -255,12 +258,16 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	tm.enforceMap = coll.Maps[traceMapEnforce]
 	tm.deferredMap = coll.Maps[traceMapDeferred]
 	tm.deferredEvents = make(map[uint32]TraceEvent)
-	tm.protectedMap = coll.Maps[traceMapProtected]
+	tm.protectedMap = kernelMapOf(coll.Maps[traceMapProtected])
 	tm.protectedTGIDs = make(map[uint32]uint64)
 	tm.protectedCount.Store(0)
-	tm.protectedBudgetMap = coll.Maps[traceMapProtectedBudget]
+	tm.protectedBudgetMap = kernelMapOf(coll.Maps[traceMapProtectedBudget])
 	tm.protectedRefused.Store(0)
-	tm.protectedImagesMap = coll.Maps[traceMapProtectedImages]
+	tm.protectedImagesMap = kernelMapOf(coll.Maps[traceMapProtectedImages])
+	if m := tm.protectedImagesMap; m != nil && int(m.ValueSize()) != binary.Size(protectedImage{}) {
+		tm.log.Printf("%s has %d-byte values and this agent writes %d: the object is not from this release, so it is not used", traceMapProtectedImages, m.ValueSize(), binary.Size(protectedImage{}))
+		tm.protectedImagesMap = nil
+	}
 	tm.protectedImages = nil
 	tm.protectedVerified = nil
 	tm.protectedImagesErr = ""
@@ -316,14 +323,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	tm.probesAbsent = 0
 	tm.kprobeNames = nil
 	for _, probe := range traceProbes {
-		if probe.name == "sched_process_fork" && tm.execKeep && !slices.Contains(tm.linkNames, "sched_process_exec") {
-			// Fork inheritance without the exec program would let a child keep
-			// its entry through any exec. Fork attaches after this point, so
-			// nothing was inherited yet; the budget stays 0 from now on.
-			tm.execKeep = false
-			tm.updateProtectedBudget(len(tm.protectedTGIDs))
-			tm.log.Printf("sched_process_exec is not attached: children of protected processes are not inherited")
-		}
+		tm.disableInheritWithoutExec(probe.name)
 		if sym, ok := kprobeSyms[probe.name]; ok {
 			if kl, ok := tm.attachKprobeTwin(coll, probe, sym, droppedReason); ok {
 				tm.links = append(tm.links, kl)

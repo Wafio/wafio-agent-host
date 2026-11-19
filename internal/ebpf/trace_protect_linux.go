@@ -12,10 +12,10 @@ func (tm *TraceManager) runProtectedSelfCheck() protectedSelfCheck {
 	c := protectedSelfCheck{
 		kernelSet:  tm.protectedMap != nil,
 		risky:      tm.protected.RiskyEntries(),
-		procDenied: procIdentityDenied("/proc"),
+		procDenied: procIdentityDenied(tm.proc()),
 	}
 	if tm.protectedMap == nil {
-		tgids, err := tm.protected.scanProtectedTGIDs("/proc", os.Getpid())
+		tgids, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
 		c.matched, c.scanErr = len(tgids), err
 		return c
 	}

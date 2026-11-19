@@ -58,8 +58,9 @@ var DefaultProtectedUnitExes = map[string]string{
 // enforcement by being called "sshd" (comm is settable via prctl, and a
 // basename is free to choose outside these directories). The path is only the
 // first filter: matchIdentity also requires the running image to be that host
-// file (inode, so a container image's /usr/sbin/sshd does not count), no
-// loader injection, and root UIDs for the built-in names.
+// file (inode, so a container image's /usr/sbin/sshd does not count) in a place
+// only root can write, no loader injection, and root UIDs for the built-in
+// names.
 var trustedExeDirs = []string{
 	"/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/",
 	"/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/", "/usr/libexec/",
@@ -79,9 +80,24 @@ const maxProtectedTGIDs = 1024
 // built-ins, times protectedImageDirs) stay below it on a host with few files.
 const maxProtectedImages = 1024
 
-// protectedImageRootOnly mirrors TRACE_PROTECTED_IMAGE_ROOT: an exec keeps an
-// inherited kernel entry for this image only when the real UID is 0.
-const protectedImageRootOnly uint8 = 1
+// Flags of a trace_protected_images value (TRACE_PROTECTED_IMAGE_* in
+// wafio_trace.c). They are alternatives: an exec keeps the entry when any one
+// holds, and a value with none keeps nothing.
+const (
+	// protectedImageAny keeps the entry for any task: a configured exe path,
+	// which needs no root.
+	protectedImageAny uint64 = 1 << iota
+	// protectedImageRoot keeps it when the real UID is 0: the built-in names.
+	protectedImageRoot
+	// protectedImageUnit keeps it when the task runs in the systemd unit named
+	// in the value: the WAF agent and systemd-networkd.
+	protectedImageUnit
+)
+
+// protectedUnitLen mirrors TRACE_UNIT_NAME_LEN. The kernel reads a cgroup name
+// into a buffer that long and cuts a longer one to protectedUnitLen-1 bytes, so
+// a stored name of at most protectedUnitLen-2 bytes never equals a cut one.
+const protectedUnitLen = 48
 
 // protectedImageKey is the key of trace_protected_images (struct
 // protected_image_key): the file as the kernel sees it. Dev is the encoding of
@@ -93,11 +109,57 @@ type protectedImageKey struct {
 	Gen uint32
 }
 
-// Slots of the trace_protected_budget array (TRACE_PROTECTED_BUDGET_SLOT and
-// TRACE_PROTECTED_REFUSED_SLOT in wafio_trace.c).
+// protectedImage is the value of trace_protected_images (struct
+// protected_image): when an exec of the file keeps the entry. Unit is the
+// NUL padded unit name, set with protectedImageUnit.
+type protectedImage struct {
+	Flags uint64
+	Unit  [protectedUnitLen]byte
+}
+
+// unitImage is the value for a file that keeps the entry only inside the
+// systemd unit of that name. A name the kernel could not compare exactly (empty
+// or too long) has no value: the file is not trusted.
+func unitImage(unit string) (protectedImage, bool) {
+	if unit == "" || len(unit) > protectedUnitLen-2 || strings.IndexByte(unit, 0) >= 0 {
+		return protectedImage{}, false
+	}
+	img := protectedImage{Flags: protectedImageUnit}
+	copy(img.Unit[:], unit)
+	return img, true
+}
+
+// merge combines what two sources know about one file: it keeps the entry when
+// either says so. Two different units for one file leave neither, the safe
+// direction.
+func (a protectedImage) merge(b protectedImage) protectedImage {
+	switch {
+	case a.Flags == 0:
+		return b
+	case b.Flags == 0:
+		return a
+	case (a.Flags|b.Flags)&protectedImageAny != 0:
+		return protectedImage{Flags: protectedImageAny}
+	}
+	out := protectedImage{Flags: a.Flags | b.Flags}
+	switch {
+	case a.Flags&protectedImageUnit == 0:
+		out.Unit = b.Unit
+	case b.Flags&protectedImageUnit == 0 || a.Unit == b.Unit:
+		out.Unit = a.Unit
+	default:
+		out.Flags &^= protectedImageUnit
+	}
+	return out
+}
+
+// Slots of the trace_protected_budget array (TRACE_PROTECTED_BUDGET_SLOT,
+// TRACE_PROTECTED_REFUSED_SLOT and TRACE_PROTECTED_LIMIT_SLOT in
+// wafio_trace.c).
 const (
 	protectedBudgetSlot  uint32 = 0
 	protectedRefusedSlot uint32 = 1
+	protectedLimitSlot   uint32 = 2
 )
 
 // maxInheritedFill: the kernel stops inserting forked children once the map
@@ -105,13 +167,16 @@ const (
 // verified inserts always fit.
 const maxInheritedFill = maxProtectedTGIDs * 3 / 4
 
-// protectedInheritBudget is how many fork inserts the kernel may make until
-// the next refresh, when the map holds entries now. Deletes by the kernel in
-// between are not credited back: the budget only shrinks until the refresh
-// recomputes it. It is 0 when the kernel cannot keep an entry through exec by
-// image (execKeep false: the exec program is not attached, or the object has
-// no trace_protected_images): an inherited entry would then follow whatever
-// the child runs.
+// protectedInheritBudget is how many fork inserts the kernel may make with the
+// map holding entries now: the room below maxInheritedFill. The refresh writes
+// it to the budget slot and to the limit slot. Between refreshes the kernel
+// takes a unit at each insert and gives one back at each delete it makes (exec
+// drop, exit), never above the limit, so the budget follows the entries in the
+// map and a flood of short-lived children does not use it up. It is 0 when the
+// kernel cannot keep an entry through exec by image (execKeep false: the exec
+// program is not attached, or the object has no trace_protected_images): an
+// inherited entry would then follow whatever the child runs, and with the limit
+// at 0 no unit comes back to raise it.
 func protectedInheritBudget(entries int, execKeep bool) int64 {
 	if !execKeep || entries >= maxInheritedFill {
 		return 0
@@ -162,9 +227,11 @@ type procIdentity struct {
 	comm string
 
 	// hostExe: the running image is the very file at the same path in the
-	// host's mount namespace (same device and inode). A path string alone is
-	// not identity: in a container /usr/sbin/sshd is whatever the image put
-	// there.
+	// host's mount namespace (same device and inode), and that file and its
+	// directory belong to root and are writable by no one else. A path string
+	// alone is not identity: in a container /usr/sbin/sshd is whatever the image
+	// put there, and an account that can write the file or its directory can
+	// put its own copy at a trusted path.
 	hostExe tri
 	// hostMntNS: the process shares pid 1's mount namespace. Used for a
 	// replaced-on-disk image ("(deleted)"), whose inode no longer exists at
@@ -407,8 +474,11 @@ func sameHostMountNS(procRoot, dir string) tri {
 }
 
 // hostExeCheck reports whether the running image of the process in dir is the
-// file at exe in the host's filesystem (procRoot/1/root, so an agent running
-// in a container with the host PID namespace compares against the host view).
+// file at exe in the host's filesystem (procRoot/1/root, so an agent running in
+// a container with the host PID namespace compares against the host view), and
+// whether that file and its directory could only have been put there by root
+// (trustedFile): a file an unprivileged account owns, or can replace through
+// its directory, is not a host binary however it got its name.
 // /proc/<pid>/exe is a magic link: stat follows it to the real inode whatever
 // mount namespace the process lives in. A variable so tests can substitute it.
 var hostExeCheck = func(procRoot, dir, exe string) tri {
@@ -416,11 +486,19 @@ var hostExeCheck = func(procRoot, dir, exe string) tri {
 	if err != nil {
 		return triUnknown
 	}
-	host, err := os.Stat(filepath.Join(procRoot, "1", "root", exe))
+	hostPath := filepath.Join(procRoot, "1", "root", exe)
+	host, err := os.Stat(hostPath)
 	if err != nil {
 		return triNo // no such host file: the image is not a host binary
 	}
-	return triOf(os.SameFile(running, host))
+	if !os.SameFile(running, host) {
+		return triNo
+	}
+	parent, err := os.Stat(filepath.Dir(hostPath))
+	if err != nil {
+		return triNo
+	}
+	return triOf(trustedFile(host) && trustedFile(parent))
 }
 
 // rootUIDs parses the "Uid:" line of /proc/<pid>/status (real, effective,
@@ -481,6 +559,22 @@ type protectedTGID struct {
 	// configured: matched by an exe path of the set, which needs no root; a
 	// match by name needs root UIDs (matchIdentity).
 	configured bool
+	// unit: the systemd unit the exe path is bound to ("" when it is not), so
+	// the image this process runs keeps the entry only inside that unit.
+	unit string
+}
+
+// image is the trace_protected_images value for the file the process runs: the
+// same condition matchIdentity applied to it. ok is false for a unit name the
+// kernel cannot compare, which leaves the file untrusted.
+func (p protectedTGID) image() (protectedImage, bool) {
+	switch {
+	case p.unit != "":
+		return unitImage(p.unit)
+	case p.configured:
+		return protectedImage{Flags: protectedImageAny}, true
+	}
+	return protectedImage{Flags: protectedImageRoot}, true
 }
 
 // scanProtectedTGIDs walks procRoot and returns the protected processes
@@ -519,7 +613,7 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 		}
 		exe, _ := protectedExeCandidate(id.exe)
 		_, configured := s.exes[exe]
-		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured})
+		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe]})
 	}
 	return out, nil
 }
@@ -537,33 +631,54 @@ var protectedImageDirs = []string{
 }
 
 // imagePaths is the set of files the kernel may trust at exec, with the
-// trace_protected_images flags: every protected name in every
+// trace_protected_images value of each: every protected name in every
 // protectedImageDirs entry needs root, a configured exe path does not, and the
-// latter wins when both name the same path (matchIdentity's rule). The next
-// refresh still verifies a running process by inode.
-func (s *ProtectedProcessSet) imagePaths() map[string]uint8 {
-	out := make(map[string]uint8)
+// latter wins when both name the same path (matchIdentity's rule). A path bound
+// to a unit keeps the entry only inside that unit, whichever way it is listed:
+// as a name it would need the unit and root together, which the value cannot
+// say, so a bound path is trusted only as a configured one. The next refresh
+// still verifies a running process by inode.
+func (s *ProtectedProcessSet) imagePaths() map[string]protectedImage {
+	out := make(map[string]protectedImage)
 	if s == nil {
 		return out
 	}
 	for n := range s.names {
 		for _, dir := range protectedImageDirs {
-			out[dir+n] = protectedImageRootOnly
+			if _, bound := s.units[dir+n]; !bound {
+				out[dir+n] = protectedImage{Flags: protectedImageRoot}
+			}
 		}
 	}
 	for p := range s.exes {
-		out[p] = 0
+		img, ok := protectedImage{Flags: protectedImageAny}, true
+		if unit, bound := s.units[p]; bound {
+			img, ok = unitImage(unit)
+		}
+		if ok {
+			out[p] = img
+		} else {
+			delete(out, p)
+		}
 	}
 	return out
 }
 
-// mountDevices maps mount IDs to the device of the mount's superblock, from
-// the text of a mountinfo file: field 1 is the mount ID and field 3 the
-// "major:minor" the kernel prints from sb->s_dev. The value is dev_t as BPF
-// reads s_dev, MKDEV(major, minor) = major<<20 | minor. A malformed line is
-// skipped.
-func mountDevices(mountinfo string) map[uint64]uint32 {
-	out := make(map[uint64]uint32)
+// mountEntry is what a mountinfo line says about the superblock of a mount.
+type mountEntry struct {
+	dev      uint32 // sb->s_dev, MKDEV(major, minor)
+	readOnly bool   // "ro" among the super options, the last field
+}
+
+// mountTable maps mount IDs to the superblock of the mount, from the text of a
+// mountinfo file: field 1 is the mount ID, field 3 the "major:minor" the kernel
+// prints from sb->s_dev, and the super options follow the filesystem type and
+// source after " - ". The device is dev_t as BPF reads s_dev, MKDEV(major,
+// minor) = major<<20 | minor. The mount's own options (field 6) are not the
+// superblock's: a read-only bind mount of a writable filesystem does not make
+// the files unwritable. A malformed line is skipped.
+func mountTable(mountinfo string) map[uint64]mountEntry {
+	out := make(map[uint64]mountEntry)
 	for _, line := range strings.Split(mountinfo, "\n") {
 		f := strings.Fields(line)
 		if len(f) < 3 {
@@ -582,7 +697,11 @@ func mountDevices(mountinfo string) map[uint64]uint32 {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		out[id] = uint32(major<<20 | minor)
+		entry := mountEntry{dev: uint32(major<<20 | minor)}
+		if i := slices.Index(f, "-"); i >= 0 && len(f) > i+3 {
+			entry.readOnly = slices.Contains(strings.Split(f[i+3], ","), "ro")
+		}
+		out[id] = entry
 	}
 	return out
 }
@@ -591,7 +710,7 @@ func mountDevices(mountinfo string) map[uint64]uint32 {
 // is missing or changed is written before any stale key is deleted, so a
 // trusted image is never absent while the map is swapped. Failures are
 // returned together; the work goes on.
-func applyProtectedImages(have, want map[protectedImageKey]uint8, put func(protectedImageKey, uint8) error, del func(protectedImageKey) error) error {
+func applyProtectedImages(have, want map[protectedImageKey]protectedImage, put func(protectedImageKey, protectedImage) error, del func(protectedImageKey) error) error {
 	var errs []error
 	for k, v := range want {
 		if hv, ok := have[k]; ok && hv == v {

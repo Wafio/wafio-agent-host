@@ -12,7 +12,9 @@ import (
 // route (trace_open_name_candidate) and the shed exemption
 // (trace_open_keep); every program must stay under verifierInsnBudget, and the
 // exec program under its own small cap: it reads one file identity through five
-// pointer hops and has no loop.
+// pointer hops, compares a cgroup name with the unit of a unit-bound image
+// (three cgroup hops, two name reads and a compare of six words) and has no
+// loop. 367 to 403 instructions on kernels 5.10 to 6.8 and 380 on 6.17.
 // Needs root and WAFIO_TEST_BPF_DIR.
 func TestBPFTraceVerifierBudget(t *testing.T) {
 	c := packetObjectCollection(t, "wafio_trace.o")
@@ -43,4 +45,4 @@ func TestBPFTraceVerifierBudget(t *testing.T) {
 
 // traceProgramInsnCaps holds programs that must stay far below
 // verifierInsnBudget.
-var traceProgramInsnCaps = map[string]uint32{"trace_sched_process_exec": 250}
+var traceProgramInsnCaps = map[string]uint32{"trace_sched_process_exec": 500}

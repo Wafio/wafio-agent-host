@@ -363,7 +363,13 @@ func TestScanProtectedTGIDs(t *testing.T) {
 	// /usr/local/bin or /opt/wafio. 109 and 115 run it from a session scope,
 	// 110 has no readable cgroup, 111 is another program, and 112 and 113 only
 	// carry its name (an interpreter, a copy in /tmp) from inside the unit.
-	want := []protectedTGID{{100, 1100, false}, {104, 1104, false}, {108, 1108, true}, {114, 1114, true}}
+	const wafUnit = "wafio-waf-agent.service"
+	want := []protectedTGID{
+		{tgid: 100, startTicks: 1100},
+		{tgid: 104, startTicks: 1104},
+		{tgid: 108, startTicks: 1108, configured: true, unit: wafUnit},
+		{tgid: 114, startTicks: 1114, configured: true, unit: wafUnit},
+	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protected tgids %v, want %v", got, want)
 	}

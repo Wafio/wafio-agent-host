@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
@@ -118,6 +119,14 @@ func (tm *TraceManager) userspaceKill(evt *TraceEvent, policyID uint32) {
 	tm.log.Printf("deferred signal requested pid=%d policy=%d", evt.PID, policyID)
 }
 
+// proc is where /proc is mounted.
+func (tm *TraceManager) proc() string {
+	if tm.procRoot == "" {
+		return "/proc"
+	}
+	return tm.procRoot
+}
+
 // syncProtectedImages brings trace_protected_images to the trusted file set of
 // the last scan: the paths of the set, the images of the processes it
 // verified and the files PID 1 holds open. Keys are added before stale ones
@@ -130,20 +139,20 @@ func (tm *TraceManager) syncProtectedImages() {
 	if m == nil {
 		return
 	}
-	want := tm.protected.kernelImages("/proc", tm.protectedVerified)
-	have := make(map[protectedImageKey]uint8, len(want))
+	want := tm.protected.kernelImages(tm.proc(), tm.protectedVerified)
+	have := make(map[protectedImageKey]protectedImage, len(want))
 	var key protectedImageKey
-	var flags uint8
+	var image protectedImage
 	iter := m.Iterate()
-	for iter.Next(&key, &flags) {
-		have[key] = flags
+	for iter.Next(&key, &image) {
+		have[key] = image
 	}
 	if err := iter.Err(); err != nil {
 		tm.log.Printf("protected-process image map read: %v; reconciling against own writes", err)
 		have = maps.Clone(tm.protectedImages)
 	}
 	err := applyProtectedImages(have, want,
-		func(k protectedImageKey, v uint8) error { return m.Update(k, v, ebpf.UpdateAny) },
+		func(k protectedImageKey, v protectedImage) error { return m.Update(k, v, ebpf.UpdateAny) },
 		func(k protectedImageKey) error {
 			if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 				return err
@@ -179,19 +188,21 @@ func bootTicksNow() (uint64, error) {
 // refresh verifies what the kernel inherited and removes the rest. The first
 // sync runs synchronously in Start (runProtectedSelfCheck). A change to a file
 // that could be a trusted image refreshes the image set at once, between two
-// ticks.
+// ticks. Directories of those files that did not exist, or were moved, are
+// watched again before each refresh.
 func (tm *TraceManager) protectedRefreshLoop(done <-chan struct{}) {
 	defer tm.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var watch *imageWatch
 	var changed <-chan struct{}
 	if tm.protectedImagesMap != nil {
-		w, err := watchProtectedImages(tm.protected)
+		w, err := watchProtectedImages(tm.protected, tm.proc())
 		if err != nil {
 			tm.log.Printf("protected-process image watch unavailable: %v (the image set refreshes every 5 s)", err)
 		} else {
 			defer w.Close()
-			changed = w.changed
+			watch, changed = w, w.changed
 		}
 	}
 	for {
@@ -199,14 +210,33 @@ func (tm *TraceManager) protectedRefreshLoop(done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
+			tm.refreshOnTick(watch)
 		case <-changed:
-			tm.syncProtectedImages()
-			continue
-		}
-		if _, err := tm.syncProtectedTGIDs(); err != nil {
-			tm.log.Printf("protected-process scan failed: %v", err)
+			tm.refreshOnChange(watch)
 		}
 	}
+}
+
+// refreshOnTick is the periodic refresh: directories of trusted files that were
+// not watched are watched again first, so a file that appears in one is seen by
+// the sync that follows and by the watch after it.
+func (tm *TraceManager) refreshOnTick(watch *imageWatch) {
+	if watch != nil {
+		watch.rearm()
+	}
+	if _, err := tm.syncProtectedTGIDs(); err != nil {
+		tm.log.Printf("protected-process scan failed: %v", err)
+	}
+}
+
+// refreshOnChange follows a change of a file that could be a trusted image: the
+// image set alone, at once. A directory that was moved or removed is watched
+// again first.
+func (tm *TraceManager) refreshOnChange(watch *imageWatch) {
+	if watch != nil {
+		watch.rearm()
+	}
+	tm.syncProtectedImages()
 }
 
 // syncProtectedTGIDs rescans /proc and reconciles trace_protected_tgids with
@@ -225,7 +255,7 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 	if err != nil {
 		withStart = false // no guard possible: fall back to the scan alone
 	}
-	tgids, err := tm.protected.scanProtectedTGIDs("/proc", os.Getpid())
+	tgids, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
 	if err != nil {
 		return 0, err
 	}
@@ -284,15 +314,33 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 	return matched, nil
 }
 
-// updateProtectedBudget refills the kernel's fork-insert budget for the next
-// refresh period and reports inserts the kernel refused since the last one.
+// disableInheritWithoutExec turns fork inheritance off when the fork probe is
+// about to attach and the exec probe is not linked: a child would keep its
+// entry through any exec. Fork attaches after this point, so nothing was
+// inherited yet; the budget stays 0 from now on. Start calls it before each
+// probe.
+func (tm *TraceManager) disableInheritWithoutExec(probe string) {
+	if probe != "sched_process_fork" || !tm.execKeep || slices.Contains(tm.linkNames, "sched_process_exec") {
+		return
+	}
+	tm.execKeep = false
+	tm.updateProtectedBudget(len(tm.protectedTGIDs))
+	tm.log.Printf("sched_process_exec is not attached: children of protected processes are not inherited")
+}
+
+// updateProtectedBudget writes the kernel's fork-insert budget and its limit for
+// the next refresh period, and reports inserts the kernel refused since the
+// last one. The limit goes first: the kernel gives units back up to it, so a
+// lower budget never meets a higher limit.
 func (tm *TraceManager) updateProtectedBudget(entries int) {
 	if tm.protectedBudgetMap == nil {
 		return
 	}
 	budget := protectedInheritBudget(entries, tm.execKeep)
-	if err := tm.protectedBudgetMap.Update(protectedBudgetSlot, budget, ebpf.UpdateAny); err != nil {
-		tm.log.Printf("protected-process fork budget update: %v", err)
+	for _, slot := range []uint32{protectedLimitSlot, protectedBudgetSlot} {
+		if err := tm.protectedBudgetMap.Update(slot, budget, ebpf.UpdateAny); err != nil {
+			tm.log.Printf("protected-process fork budget update (slot %d): %v", slot, err)
+		}
 	}
 	var refused int64
 	if err := tm.protectedBudgetMap.Lookup(protectedRefusedSlot, &refused); err != nil || refused < 0 {
@@ -305,7 +353,7 @@ func (tm *TraceManager) updateProtectedBudget(entries int) {
 
 // readProtectedMap returns the content of trace_protected_tgids, whichever
 // value ABI the object uses (8-byte start ticks or the 1-byte legacy flag).
-func readProtectedMap(m *ebpf.Map) (map[uint32]uint64, error) {
+func readProtectedMap(m kernelMap) (map[uint32]uint64, error) {
 	out := make(map[uint32]uint64)
 	var tgid uint32
 	iter := m.Iterate()

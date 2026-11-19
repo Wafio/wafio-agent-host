@@ -10,8 +10,10 @@ import (
 // writes both) and sets the fork-insert budget before the first probe attaches,
 // so events right after a restart are exe_verified like later ones and the exec
 // program knows the trusted images from its first run; the self-check sync
-// after attach runs too. Start is Linux-only, so the order is checked on the
-// source.
+// after attach runs too. Start needs a kernel, so the order is checked on the
+// source here; the order the sync writes the maps in, and the turn-off of fork
+// inheritance without the exec probe, are checked by running them
+// (trace_protect_sync_linux_test.go).
 func TestTraceStartFillsProtectedSetBeforeAttach(t *testing.T) {
 	src, err := os.ReadFile("trace_manager.go")
 	if err != nil {
@@ -45,22 +47,10 @@ func TestTraceStartFillsProtectedSetBeforeAttach(t *testing.T) {
 	if selfCheck < attached {
 		t.Fatal("the self-check sync must also run after attach")
 	}
-
-	// The tgid sync writes the images first: an entry it writes must never meet
-	// an exec whose image the kernel does not know.
-	kill, err := os.ReadFile("trace_kill_linux.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sync := string(kill)[strings.Index(string(kill), "func (tm *TraceManager) syncProtectedTGIDs("):]
-	if img, tgids := strings.Index(sync, "tm.syncProtectedImages()"), strings.Index(sync, "tm.protectedMap.Update("); img < 0 || tgids < 0 || img > tgids {
-		t.Fatalf("syncProtectedTGIDs must sync the images (%d) before it writes entries (%d)", img, tgids)
-	}
-
-	// Fork inheritance without the exec program would keep an entry through any
-	// exec: the fork probe attaches only while the exec probe is linked.
-	if !strings.Contains(body, `probe.name == "sched_process_fork" && tm.execKeep && !slices.Contains(tm.linkNames, "sched_process_exec")`) {
-		t.Fatal("Start does not turn fork inheritance off when sched_process_exec is not attached")
+	// What the guard does is run in TestDisableInheritWithoutExec; that Start
+	// asks it before each probe attaches cannot be run without a kernel.
+	if guard := strings.Index(body, "tm.disableInheritWithoutExec(probe.name)"); guard < 0 || guard > attach {
+		t.Fatalf("Start does not call disableInheritWithoutExec (%d) before the first attach (%d)", guard, attach)
 	}
 }
 

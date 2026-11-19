@@ -159,22 +159,71 @@ agent trusts. It tells files apart by device, inode number and inode generation,
 never by name. The trusted files are the protected names (built-in and from
 `WAFIO_PROTECTED_PROCESSES`) found in the system directories (`/usr/sbin`,
 `/usr/bin`, `/usr/lib/openssh`, `/usr/lib/systemd` and the like), which keep the
-mark only for root; the paths in `WAFIO_PROTECTED_EXE_PATHS` and the WAF agent
-and systemd-networkd paths above; the programs of processes the agent has
-already verified; and the `systemd-executor` file that PID 1 holds open. The
-agent rewrites the list every 5 s and at once when a file with one of those names
-changes in one of those directories, so a restart right after a package upgrade
-is still verified from its first event. A program that only carries a protected
-name (a copy, a renamed file, a binary in another directory) loses the mark at
-`exec`, before its first instruction.
+mark only for root; the paths in `WAFIO_PROTECTED_EXE_PATHS`, which keep it for
+any user; the WAF agent and systemd-networkd paths above, which keep it only
+inside their unit; the programs of processes the agent has already verified;
+and the `systemd-executor` file that PID 1 holds open. The agent rewrites the
+list every 5 s and at once when a file with one of those names changes in one
+of those directories, so a restart right after a package upgrade is still
+verified from its first event. A program that only carries a protected name (a
+copy, a renamed file, a binary in another directory) loses the mark at `exec`,
+before its first instruction.
+
+A file is trusted only if root owns it and neither its group nor others can
+write it, and the same holds for its directory. An account that owns the file or
+the directory could rename a copy of its own over a trusted path, and the agent
+would then take the copy for the daemon. The agent reads the paths inside the
+root of PID 1, not its own: a symlink in a configured path is followed inside
+that root, while the system directories a protected name is searched in must
+not be symlinks and the file itself is never a symlink (on a host where `/bin`
+points to `usr/bin` the file is found as `/usr/bin/<name>`). Without `openat2`
+(before Linux 5.6, or a seccomp filter that refuses it) no path with a symlink
+is trusted. A directory
+that is group-writable, as `/usr/local/bin` is on some Debian hosts
+(`root:staff`, mode 2775), makes the files in it untrusted until it is set to
+`755`. A directory that does not exist when the agent starts is watched as soon
+as it appears (at the next 5 s refresh), and one that is moved or replaced is
+watched again the same way. A WAF agent whose binary or directory an account
+other than root owns (an installer that hands `/opt/wafio` to the service
+account) is not protected and has no mark: leave both to root.
+
+The kernel checks the unit of the WAF agent and systemd-networkd at `exec` too.
+It keeps the mark only when the new process runs in a cgroup of the default
+hierarchy that is at level 2, is named like the unit and sits under
+`system.slice`. The genuine binary run by root or by a user outside its unit
+loses the mark at `exec`. A host with only cgroup v1 has no such cgroup, so its
+processes lose the mark at `exec` too and get it back at the next refresh; a
+hybrid host is untested. Only root can create a directory in `system.slice`.
+The check reads the cgroup names with CO-RE and fails closed: a kernel without
+the fields, a failed read or a name longer than 46 characters drops the mark.
+The fields exist on Linux 5.10, 5.15, 6.1, 6.8 and 6.17, and the check ran on a
+real kernel on 6.17 only. On 6.17 `kernfs_node.parent` is named `__parent`; the
+program reads the parent through `cgroup.self.parent`, which every kernel has.
+Newer kernels read `kernfs_node.name` under RCU; the field keeps its name, so
+the same read applies.
 
 Where the agent cannot identify a file, the mark is dropped at `exec` and comes
-back at the next refresh once the process is verified. That covers a filesystem
-that reports no inode generation (some overlay and ZFS setups), a kernel before
-5.8 (no mount ID from `statx`), and a protected name in a nested directory: list
-its path in `WAFIO_PROTECTED_EXE_PATHS`. A trace object without the image list, or
-a kernel where the `exec` hook did not attach, also turns off the inheritance of
-the mark by children of protected processes.
+back at the next refresh once the process is verified. That covers a kernel
+before 5.8 (no mount ID from `statx`), and a protected name in a nested
+directory: list its path in `WAFIO_PROTECTED_EXE_PATHS`. A filesystem that
+reports no inode generation (overlayfs, squashfs, erofs, and tmpfs on some kernels) is
+trusted only when its superblock is mounted read-only (`ro` among the super
+options in the mountinfo line, not the options of the mount), with generation 0,
+which is what the kernel reads for a filesystem that never sets one. A
+filesystem that sets one without exposing it has another value in the kernel, the
+key does not match and the mark is dropped: the agent prefers not to trust. A
+trace object without the image list, or a kernel where the `exec` hook did not
+attach, also turns off the inheritance of the mark by children of protected
+processes.
+
+A protected process that forks gives its child a mark at once, from a budget the
+agent refills at every refresh (room for 768 entries less those in the map). The
+kernel takes one unit for each child and gives it back when it removes an entry,
+at `exec` or at exit, up to the value of the refresh. A client that opens and
+closes SSH connections as fast as `sshd` forks therefore does not use the budget
+up and the logins that follow still get their mark. When the budget does run out,
+the children are marked at the next refresh and the agent logs how many were
+refused.
 
 Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
 `WAFIO_PROTECTED_EXE_PATHS` (absolute paths); `WAFIO_PROTECTED_REPLACE_DEFAULTS=true`
