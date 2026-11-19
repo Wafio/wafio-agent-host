@@ -93,11 +93,12 @@ struct {
  *
  * The kernel maintains the map between refreshes too. A process forked
  * by a protected process (or by PID 1) is inserted at sched_process_fork,
- * before it first runs; exec keeps an entry only for a protected image
- * (trace_protected_comms), or for the root exec of PID 1's child that
- * systemd 255 and later route through systemd-executor; the leader's exit
- * removes it. The refresh reconciles against the map's content and drops what
- * it cannot verify. */
+ * before it first runs; exec keeps an entry only when the new image is a file
+ * listed in trace_protected_images (identified by device, inode and
+ * generation, never by name); the leader's exit removes it. The refresh
+ * reconciles against the map's content and drops what it cannot verify. A
+ * fork child keeps its entry through a UID change until it execs or the
+ * refresh drops it. */
 #define TRACE_MAX_PROTECTED 1024
 #define TRACE_NSEC_PER_USER_HZ_TICK 10000000ULL
 struct {
@@ -107,27 +108,35 @@ struct {
     __uint(max_entries, TRACE_MAX_PROTECTED);
 } trace_protected_tgids SEC(".maps");
 
-/* Protected comm names, written once by the TraceManager from its
- * protected set: the executable basenames truncated to TASK_COMM_LEN-1.
- * Bit TRACE_PROTECTED_COMM_ROOT: the name protects only a root process (the
- * built-in and configured names; configured exe paths do not require root).
- * max_entries must match maxProtectedComms in trace_protect.go. */
-#define TRACE_MAX_PROTECTED_COMMS 1024
-#define TRACE_PROTECTED_COMM_ROOT 1
-struct protected_comm_key {
-    char comm[TRACE_COMM_LEN];
+/* Trusted program images: the files an exec may keep a protected entry for.
+ * Written by the TraceManager at every refresh and when a candidate file
+ * changes on disk: the files at the trusted paths, the images of the processes
+ * it verified, and the systemd-executor file PID 1 holds open. A file is
+ * identified as the kernel sees it: the device of its superblock (s_dev), its
+ * inode number and its inode generation. A comm or a path never counts, and a
+ * copy or a replaced file has another identity. Bit TRACE_PROTECTED_IMAGE_ROOT
+ * keeps the entry only when the real UID is 0 (the built-in names); a
+ * configured executable path needs no root.
+ * max_entries must match maxProtectedImages in trace_protect.go. */
+#define TRACE_MAX_PROTECTED_IMAGES 1024
+#define TRACE_PROTECTED_IMAGE_ROOT 1
+struct protected_image_key {
+    __u64 ino;
+    __u32 dev;
+    __u32 gen;
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct protected_comm_key);
+    __type(key, struct protected_image_key);
     __type(value, __u8);
-    __uint(max_entries, TRACE_MAX_PROTECTED_COMMS);
-} trace_protected_comms SEC(".maps");
+    __uint(max_entries, TRACE_MAX_PROTECTED_IMAGES);
+} trace_protected_images SEC(".maps");
 
 /* Budget for kernel fork inserts. Slot 0: inserts left, written
  * by userspace at every refresh so inherited entries never take the map above
  * 3/4 of TRACE_MAX_PROTECTED and the refresh's own inserts still fit (0 until
- * the first refresh, and with an agent that predates it: no inheritance).
+ * the first refresh, with an agent that predates it, and when the exec program
+ * is not attached or trace_protected_images is missing: no inheritance).
  * Slot 1: inserts refused (budget spent or map full), read by userspace.
  * Must match protectedBudgetSlot / protectedRefusedSlot in trace_protect.go. */
 #define TRACE_PROTECTED_BUDGET_SLOT 0
@@ -201,50 +210,44 @@ protect_forked_child(struct task_struct *parent, struct task_struct *child)
         protected_inherit_refused();
 }
 
-/* True when the comm is a decimal number: one or more digits, nothing else. */
-static __always_inline int
-comm_is_number(const char *comm)
+/* The identity of the file the task now runs: mm->exe_file, which
+ * /proc/<pid>/exe shows (the interpreter for a script). The kernel sets it
+ * before sched_process_exec fires. One hop at a time, so a failed read leaves
+ * zeros and nothing in trace_protected_images matches. */
+static __always_inline void
+exec_image_key(struct protected_image_key *key)
 {
-    if (comm[0] < '0' || comm[0] > '9')
-        return 0;
-#pragma clang loop unroll(full)
-    for (int i = 1; i < TRACE_COMM_LEN; i++) {
-        if (comm[i] == 0)
-            return 1;
-        if (comm[i] < '0' || comm[i] > '9')
-            return 0;
-    }
-    return 0;
+    struct task_struct *task = (void *)bpf_get_current_task();
+    struct mm_struct *mm = BPF_CORE_READ(task, mm);
+    struct file *exe = BPF_CORE_READ(mm, exe_file);
+    struct inode *inode = BPF_CORE_READ(exe, f_inode);
+    struct super_block *sb = BPF_CORE_READ(inode, i_sb);
+    key->ino = BPF_CORE_READ(inode, i_ino);
+    key->dev = BPF_CORE_READ(sb, s_dev);
+    key->gen = BPF_CORE_READ(inode, i_generation);
 }
 
-/* exec replaces the image the protection was granted for. The entry is
- * kept only when the new comm is a protected name (as root, when the name
- * requires it); the next refresh verifies the binary by inode. Anything else
- * (the user's shell after sshd-session, a service binary after PID 1) loses
- * the protection it inherited at fork.
- * One exception: systemd 255 and later start each unit through
- * systemd-executor, which PID 1's child execs as /proc/self/fd/<n>, so the
- * comm is that number. PID 1's own child keeps its entry through that one
- * root exec; the exec of the service binary decides. Called at
- * sched_process_exec, after the kernel set the new comm. */
+/* exec replaces the image the protection was granted for. The entry is kept
+ * only when the new image is listed in trace_protected_images (as root, when
+ * the entry says so). Anything else loses the protection it inherited at
+ * fork: the user's shell after sshd-session, a service binary after PID 1,
+ * a fake that only carries a protected name. The listed images include the
+ * systemd-executor file PID 1's child runs as /proc/self/fd/<n> (systemd 255
+ * and later), so the exec of the service binary decides next. An empty map
+ * drops every entry. Called at sched_process_exec, after the kernel set the
+ * new image and before it returns to user space. */
 static __always_inline void
 protect_on_exec(void)
 {
     __u32 tgid = bpf_get_current_pid_tgid() >> 32;
     if (!bpf_map_lookup_elem(&trace_protected_tgids, &tgid))
         return;
-    struct protected_comm_key key = {};
-    bpf_get_current_comm(&key.comm, sizeof(key.comm));
-    __u8 *flags = bpf_map_lookup_elem(&trace_protected_comms, &key);
+    struct protected_image_key key = {};
+    exec_image_key(&key);
+    __u8 *flags = bpf_map_lookup_elem(&trace_protected_images, &key);
     __u32 uid = (__u32)bpf_get_current_uid_gid();
-    if (flags && (!(*flags & TRACE_PROTECTED_COMM_ROOT) || uid == 0))
+    if (flags && (!(*flags & TRACE_PROTECTED_IMAGE_ROOT) || uid == 0))
         return;
-    if (uid == 0 && comm_is_number(key.comm)) {
-        struct task_struct *task = (void *)bpf_get_current_task();
-        struct task_struct *parent = BPF_CORE_READ(task, real_parent);
-        if (BPF_CORE_READ(parent, tgid) == 1)
-            return;
-    }
     bpf_map_delete_elem(&trace_protected_tgids, &tgid);
 }
 

@@ -118,19 +118,47 @@ func (tm *TraceManager) userspaceKill(evt *TraceEvent, policyID uint32) {
 	tm.log.Printf("deferred signal requested pid=%d policy=%d", evt.PID, policyID)
 }
 
-// writeProtectedComms fills trace_protected_comms and returns how
-// many names it wrote. The set is immutable for the agent's lifetime.
-func writeProtectedComms(m *ebpf.Map, comms map[[taskCommLen]byte]uint8) (int, error) {
-	n := 0
-	var errs []error
-	for comm, flags := range comms {
-		if err := m.Update(comm, flags, ebpf.UpdateAny); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		n++
+// syncProtectedImages brings trace_protected_images to the trusted file set of
+// the last scan: the paths of the set, the images of the processes it
+// verified and the files PID 1 holds open. Keys are added before stale ones
+// are deleted, so no trusted image is missing while the map is swapped. A
+// failure leaves the map as it is (an exec of an image that is missing drops
+// the entry, the safe direction). Owned by protectedRefreshLoop, like the
+// tgid state.
+func (tm *TraceManager) syncProtectedImages() {
+	m := tm.protectedImagesMap
+	if m == nil {
+		return
 	}
-	return n, errors.Join(errs...)
+	want := tm.protected.kernelImages("/proc", tm.protectedVerified)
+	have := make(map[protectedImageKey]uint8, len(want))
+	var key protectedImageKey
+	var flags uint8
+	iter := m.Iterate()
+	for iter.Next(&key, &flags) {
+		have[key] = flags
+	}
+	if err := iter.Err(); err != nil {
+		tm.log.Printf("protected-process image map read: %v; reconciling against own writes", err)
+		have = maps.Clone(tm.protectedImages)
+	}
+	err := applyProtectedImages(have, want,
+		func(k protectedImageKey, v uint8) error { return m.Update(k, v, ebpf.UpdateAny) },
+		func(k protectedImageKey) error {
+			if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				return err
+			}
+			return nil
+		})
+	switch {
+	case err == nil:
+		tm.protectedImagesErr = ""
+	case err.Error() != tm.protectedImagesErr:
+		// Once per distinct failure: the refresh repeats it every 5 s.
+		tm.protectedImagesErr = err.Error()
+		tm.log.Printf("protected-process image map update: %v", err)
+	}
+	tm.protectedImages = want
 }
 
 // bootTicksNow is the current CLOCK_BOOTTIME in USER_HZ ticks, the unit of
@@ -147,18 +175,33 @@ func bootTicksNow() (uint64, error) {
 // so the kernel kill paths (enforce_check, check_deferred_signal) skip those
 // processes too. The kernel also inserts children forked by a
 // protected process (and by PID 1) at fork, keeps an entry across exec only
-// for a protected image and drops it at exit; the refresh verifies what the
-// kernel inherited and removes the rest. The first sync runs synchronously in
-// Start (runProtectedSelfCheck).
+// for a trusted image (trace_protected_images) and drops it at exit; the
+// refresh verifies what the kernel inherited and removes the rest. The first
+// sync runs synchronously in Start (runProtectedSelfCheck). A change to a file
+// that could be a trusted image refreshes the image set at once, between two
+// ticks.
 func (tm *TraceManager) protectedRefreshLoop(done <-chan struct{}) {
 	defer tm.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var changed <-chan struct{}
+	if tm.protectedImagesMap != nil {
+		w, err := watchProtectedImages(tm.protected)
+		if err != nil {
+			tm.log.Printf("protected-process image watch unavailable: %v (the image set refreshes every 5 s)", err)
+		} else {
+			defer w.Close()
+			changed = w.changed
+		}
+	}
 	for {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
+		case <-changed:
+			tm.syncProtectedImages()
+			continue
 		}
 		if _, err := tm.syncProtectedTGIDs(); err != nil {
 			tm.log.Printf("protected-process scan failed: %v", err)
@@ -188,6 +231,10 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 	}
 	matched := len(tgids)
 	defer func() { tm.protectedCount.Store(i32FromInt(len(tm.protectedTGIDs))) }()
+	// Images first: an entry the refresh writes below must not meet an exec
+	// whose image the kernel does not know yet.
+	tm.protectedVerified = tgids
+	tm.syncProtectedImages()
 	if len(tgids) > maxProtectedTGIDs {
 		if !tm.protectedOverflowLogged {
 			tm.protectedOverflowLogged = true
@@ -243,7 +290,7 @@ func (tm *TraceManager) updateProtectedBudget(entries int) {
 	if tm.protectedBudgetMap == nil {
 		return
 	}
-	budget := protectedInheritBudget(entries)
+	budget := protectedInheritBudget(entries, tm.execKeep)
 	if err := tm.protectedBudgetMap.Update(protectedBudgetSlot, budget, ebpf.UpdateAny); err != nil {
 		tm.log.Printf("protected-process fork budget update: %v", err)
 	}

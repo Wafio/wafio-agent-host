@@ -27,7 +27,7 @@ reusing old pinned maps is not supported.
 | Verifier and budgets | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectsPassVerifier\|TestBPFFirewallVerifierBudget\|TestBPFTraceVerifierBudget' ./internal/ebpf/` | root, objects from `scripts/build-ebpf.sh` |
 | Integration fixtures | see `internal/ebpf/integration/README.md` | root, `WAFIO_EBPF_INTEGRATION=1`, an authorized lab |
 | Lockout and Kill scenarios | `.github/workflows/ebpf-vm.yml` (dispatch) | a VM per kernel: 5.10, 5.15, 6.1 and 6.12 |
-| Full maps | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectMapSizes\|TestKernelMapFull' ./internal/ebpf/` | root, objects |
+| Full maps | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectMapSizes\|TestTraceProtectedImagesMapMatchesAgent\|TestKernelMapFull' ./internal/ebpf/` | root, objects |
 | Restart, kill and load at the smallest sizes | `WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_EBPF_FLOOR_LOAD=1 go test ./internal/ebpf/integration -run 'TestVMScenarioMapScale\|TestVMScenarioKilledAgent\|TestVMScenarioLastGood\|TestMapFloorLoad'` | root, objects, veth, a disposable VM |
 
 `scripts/ci-local.sh` runs the first three rows (the third only as root). The

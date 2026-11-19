@@ -83,7 +83,7 @@ ebpf_objects() {
 # Loads the objects into the running kernel and checks the verifier budgets.
 verifier() {
   WAFIO_TEST_BPF_DIR=$PWD/build/ebpf go test -count=1 \
-    -run 'TestBPFObjectsPassVerifier|TestBPFObjectMapSizes|TestBPFFirewallVerifierBudget|TestBPFTraceVerifierBudget|TestKernelMapFull' ./internal/ebpf/
+    -run 'TestBPFObjectsPassVerifier|TestBPFObjectMapSizes|TestTraceProtectedImagesMapMatchesAgent|TestBPFFirewallVerifierBudget|TestBPFTraceVerifierBudget|TestKernelMapFull' ./internal/ebpf/
 }
 
 dirty=$(git status --porcelain)

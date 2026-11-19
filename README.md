@@ -149,10 +149,32 @@ A protected process also gets `exe_verified` on its own trace events, so the
 control plane can tell the WAF agent reading its TLS key, or the nginx master
 loading its own, from another process reading it. The mark says only that the
 kernel saw the process in the protected set. A child forked by a protected process keeps it until the child execs or the
-next refresh (5 s) drops it, and a thread can rename itself with
+next refresh (5 s) drops it, also when the child changes its user in between, and a thread can rename itself with
 `prctl(PR_SET_NAME)`. A rule that trusts the mark should therefore also match
 the process name and the user. The same set makes the WAF agent immune to Kill
 policies, so a policy cannot take down the sites it fronts.
+
+Across `exec` the kernel keeps the mark only when the new program is a file the
+agent trusts. It tells files apart by device, inode number and inode generation,
+never by name. The trusted files are the protected names (built-in and from
+`WAFIO_PROTECTED_PROCESSES`) found in the system directories (`/usr/sbin`,
+`/usr/bin`, `/usr/lib/openssh`, `/usr/lib/systemd` and the like), which keep the
+mark only for root; the paths in `WAFIO_PROTECTED_EXE_PATHS` and the WAF agent
+and systemd-networkd paths above; the programs of processes the agent has
+already verified; and the `systemd-executor` file that PID 1 holds open. The
+agent rewrites the list every 5 s and at once when a file with one of those names
+changes in one of those directories, so a restart right after a package upgrade
+is still verified from its first event. A program that only carries a protected
+name (a copy, a renamed file, a binary in another directory) loses the mark at
+`exec`, before its first instruction.
+
+Where the agent cannot identify a file, the mark is dropped at `exec` and comes
+back at the next refresh once the process is verified. That covers a filesystem
+that reports no inode generation (some overlay and ZFS setups), a kernel before
+5.8 (no mount ID from `statx`), and a protected name in a nested directory: list
+its path in `WAFIO_PROTECTED_EXE_PATHS`. A trace object without the image list, or
+a kernel where the `exec` hook did not attach, also turns off the inheritance of
+the mark by children of protected processes.
 
 Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
 `WAFIO_PROTECTED_EXE_PATHS` (absolute paths); `WAFIO_PROTECTED_REPLACE_DEFAULTS=true`

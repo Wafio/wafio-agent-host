@@ -2,8 +2,11 @@ package ebpf
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -33,47 +36,117 @@ func TestDefaultProtectedNamesIncludeOpenSSHSplit(t *testing.T) {
 	}
 }
 
-// The kernel keeps an inherited entry across exec only for a protected comm;
-// names need root, configured exe paths do not (matchIdentity's rule).
-func TestProtectedKernelComms(t *testing.T) {
+// The kernel keeps an inherited entry across exec only for a trusted file;
+// names need root, configured exe paths do not (matchIdentity's rule), and a
+// configured path never frees the same name in another directory.
+func TestProtectedImagePaths(t *testing.T) {
 	s := NewProtectedProcessSet([]string{"my-daemon"}, []string{"/opt/acme/bin/agentd", "/opt/other/sshd"})
-	got := s.kernelComms()
+	got := s.imagePaths()
 	want := map[string]uint8{
-		// A configured exe path lifts the root requirement for its basename;
-		// the refresh still verifies the inode.
-		"sshd":            0,
-		"sshd-session":    protectedCommRootOnly,
-		"sshd-auth":       protectedCommRootOnly,
-		"systemd":         protectedCommRootOnly,
-		"systemd-journal": protectedCommRootOnly, // truncated to TASK_COMM_LEN-1
-		"systemd-executo": protectedCommRootOnly, // the systemd 255 helper, truncated
-		"wafio-waf-agent": 0,                     // runs as a service account; /usr/local/bin and /opt/wafio share the comm
-		"containerd":      protectedCommRootOnly,
-		"dockerd":         protectedCommRootOnly,
-		"kubelet":         protectedCommRootOnly,
-		"nginx":           protectedCommRootOnly, // the master; a worker is not root
-		"systemd-network": 0,                     // runs as its own user, in its own unit; the comm is cut at 15 bytes
-		"my-daemon":       protectedCommRootOnly,
-		"agentd":          0,
+		"/usr/sbin/sshd":                    protectedImageRootOnly,
+		"/usr/lib/openssh/sshd-session":     protectedImageRootOnly, // Debian
+		"/usr/libexec/openssh/sshd-auth":    protectedImageRootOnly, // Fedora
+		"/usr/lib/ssh/sshd-session":         protectedImageRootOnly, // Arch
+		"/usr/lib/systemd/systemd-executor": protectedImageRootOnly, // the systemd 255 helper
+		"/lib/systemd/systemd-journald":     protectedImageRootOnly,
+		"/usr/sbin/nginx":                   protectedImageRootOnly, // the master; a worker is not root
+		"/usr/bin/containerd":               protectedImageRootOnly,
+		"/usr/local/bin/kubelet":            protectedImageRootOnly,
+		"/usr/bin/my-daemon":                protectedImageRootOnly,
+		"/opt/acme/bin/agentd":              0,
+		"/opt/other/sshd":                   0, // another file than /usr/sbin/sshd
+		"/usr/local/bin/wafio-waf-agent":    0, // runs as a service account
+		"/opt/wafio/wafio-waf-agent":        0,
+		"/usr/lib/systemd/systemd-networkd": 0, // runs as its own user
+		"/lib/systemd/systemd-networkd":     0,
 	}
-	plain := make(map[string]uint8, len(got))
-	for k, v := range got {
-		plain[commKeyString(k)] = v
+	for path, flags := range want {
+		if v, ok := got[path]; !ok || v != flags {
+			t.Errorf("image path %s: got %d (listed %t), want %d", path, v, ok, flags)
+		}
 	}
-	if !maps.Equal(plain, want) {
-		t.Fatalf("kernel comms:\n got %v\nwant %v", plain, want)
+	// A name is searched in the system directories only.
+	for _, path := range []string{"/tmp/sshd", "/opt/sshd", "/usr/lib/sshd", "/home/u/nginx"} {
+		if _, ok := got[path]; ok {
+			t.Errorf("image path %s is listed", path)
+		}
 	}
-	if len(got) > maxProtectedComms {
-		t.Fatalf("%d comms exceed the map capacity %d", len(got), maxProtectedComms)
+	if len(got) > maxProtectedImages {
+		t.Fatalf("%d image paths exceed the map capacity %d", len(got), maxProtectedImages)
+	}
+	// The same path as a name and as a configured exe: the configured entry
+	// lifts the root requirement, as in matchIdentity.
+	if got := NewProtectedProcessSet(nil, []string{"/usr/sbin/nginx"}).imagePaths()["/usr/sbin/nginx"]; got != 0 {
+		t.Errorf("configured /usr/sbin/nginx has flags %d, want 0", got)
+	}
+	if got := (*ProtectedProcessSet)(nil).imagePaths(); len(got) != 0 {
+		t.Errorf("nil set lists %v", got)
 	}
 }
 
-func commKeyString(k [taskCommLen]byte) string {
-	n := slices.Index(k[:], 0)
-	if n < 0 {
-		n = len(k)
+// Every directory the image set is searched in is a trusted executable
+// directory, so an image path never trusts a place a name would not.
+func TestProtectedImageDirsAreTrusted(t *testing.T) {
+	for _, dir := range protectedImageDirs {
+		if !strings.HasSuffix(dir, "/") || !inTrustedExeDir(dir) {
+			t.Errorf("image directory %q is not a trusted directory with a trailing slash", dir)
+		}
 	}
-	return string(k[:n])
+}
+
+// mountinfo field 3 is the superblock device the kernel prints as major:minor;
+// BPF reads it as dev_t, MKDEV(major, minor).
+func TestMountDevices(t *testing.T) {
+	got := mountDevices("" +
+		"36 35 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n" +
+		"40 36 0:45 / /run rw,nosuid - tmpfs tmpfs rw\n" +
+		"41 36 8:1 /sub /mnt rw - btrfs /dev/sda1 rw\n" +
+		"malformed\n" +
+		"x 36 8:1 / /x rw - ext4 /dev/sda1 rw\n" + // mount ID is not a number
+		"42 36 8 / /y rw - ext4 /dev/sda1 rw\n" + // no colon
+		"43 36 4096:1 / /z rw - ext4 /dev/sda1 rw\n" + // major beyond 12 bits
+		"44 36 1:1048576 / /w rw - ext4 /dev/sda1 rw\n") // minor beyond 20 bits
+	want := map[uint64]uint32{36: 0x10300002, 40: 45, 41: 8<<20 | 1}
+	if !maps.Equal(got, want) {
+		t.Fatalf("mount devices %v, want %v", got, want)
+	}
+	if _, ok := got[999]; ok {
+		t.Fatal("an unknown mount ID has a device")
+	}
+}
+
+// A refresh writes what is missing or changed before it deletes what is gone,
+// so the trusted image of a service that restarts in between is never absent.
+func TestApplyProtectedImagesAddsBeforeDeletes(t *testing.T) {
+	gone, kept, flipped, added := protectedImageKey{1, 1, 1}, protectedImageKey{2, 1, 1}, protectedImageKey{3, 1, 1}, protectedImageKey{4, 1, 1}
+	have := map[protectedImageKey]uint8{gone: 1, kept: 1, flipped: 1}
+	want := map[protectedImageKey]uint8{kept: 1, flipped: 0, added: 1}
+	var ops []string
+	put := func(k protectedImageKey, v uint8) error {
+		ops = append(ops, fmt.Sprintf("put %d=%d", k.Ino, v))
+		return nil
+	}
+	del := func(k protectedImageKey) error {
+		ops = append(ops, fmt.Sprintf("del %d", k.Ino))
+		return nil
+	}
+	if err := applyProtectedImages(have, want, put, del); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops) != 3 || ops[2] != "del 1" {
+		t.Fatalf("operations %v, want the two writes then del 1", ops)
+	}
+	slices.Sort(ops[:2])
+	if ops[0] != "put 3=0" || ops[1] != "put 4=1" {
+		t.Fatalf("operations %v: the unchanged key was written or a change is missing", ops)
+	}
+
+	// A failed write does not stop the others, and the failures are returned.
+	ops = nil
+	failing := func(protectedImageKey, uint8) error { return errors.New("full") }
+	if err := applyProtectedImages(have, want, failing, del); err == nil || len(ops) != 1 {
+		t.Fatalf("err %v, operations %v: the delete must still run after failed writes", err, ops)
+	}
 }
 
 // The refresh reconciles against what the kernel map actually holds: the
@@ -114,8 +187,12 @@ func TestReconcileProtectedEntries(t *testing.T) {
 // cannot crowd out the refresh's verified entries.
 func TestProtectedInheritBudget(t *testing.T) {
 	for entries, want := range map[int]int64{0: 768, 10: 758, 767: 1, 768: 0, 1000: 0, maxProtectedTGIDs: 0} {
-		if got := protectedInheritBudget(entries); got != want {
+		if got := protectedInheritBudget(entries, true); got != want {
 			t.Errorf("budget(%d) = %d, want %d", entries, got, want)
+		}
+		// Without the exec keep by image the kernel inherits nothing.
+		if got := protectedInheritBudget(entries, false); got != 0 {
+			t.Errorf("budget(%d) without exec keep = %d, want 0", entries, got)
 		}
 	}
 	if maxInheritedFill >= maxProtectedTGIDs || maxInheritedFill <= 0 {
@@ -142,7 +219,7 @@ func TestZombieLeaderRenamedToDaemonIsNotProtected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got, []protectedTGID{{300, 1300}}) {
+	if !slices.Equal(got, []protectedTGID{{300, 1300, false}}) {
 		t.Fatalf("kernel set %v, want only the verified dockerd", got)
 	}
 }

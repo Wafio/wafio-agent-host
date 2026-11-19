@@ -73,14 +73,25 @@ const taskCommLen = 16
 // wafio_trace.c. Extra matches are logged and left to the userspace guard.
 const maxProtectedTGIDs = 1024
 
-// maxProtectedComms must match max_entries of trace_protected_comms in
-// wafio_trace.c. The configuration bounds (maxProtectedEntries names and exe
-// paths plus the built-ins) stay well below it.
-const maxProtectedComms = 1024
+// maxProtectedImages must match max_entries of trace_protected_images in
+// wafio_trace.c. A refresh writes one key per trusted file that exists: the
+// configuration bounds (maxProtectedEntries names and exe paths plus the
+// built-ins, times protectedImageDirs) stay below it on a host with few files.
+const maxProtectedImages = 1024
 
-// protectedCommRootOnly mirrors TRACE_PROTECTED_COMM_ROOT: an exec keeps an
-// inherited kernel entry for this comm only when the real UID is 0.
-const protectedCommRootOnly uint8 = 1
+// protectedImageRootOnly mirrors TRACE_PROTECTED_IMAGE_ROOT: an exec keeps an
+// inherited kernel entry for this image only when the real UID is 0.
+const protectedImageRootOnly uint8 = 1
+
+// protectedImageKey is the key of trace_protected_images (struct
+// protected_image_key): the file as the kernel sees it. Dev is the encoding of
+// sb->s_dev (major<<20 | minor), Gen is i_generation. The layout has no
+// padding, so cilium/ebpf marshals it byte for byte.
+type protectedImageKey struct {
+	Ino uint64
+	Dev uint32
+	Gen uint32
+}
 
 // Slots of the trace_protected_budget array (TRACE_PROTECTED_BUDGET_SLOT and
 // TRACE_PROTECTED_REFUSED_SLOT in wafio_trace.c).
@@ -97,9 +108,12 @@ const maxInheritedFill = maxProtectedTGIDs * 3 / 4
 // protectedInheritBudget is how many fork inserts the kernel may make until
 // the next refresh, when the map holds entries now. Deletes by the kernel in
 // between are not credited back: the budget only shrinks until the refresh
-// recomputes it.
-func protectedInheritBudget(entries int) int64 {
-	if entries >= maxInheritedFill {
+// recomputes it. It is 0 when the kernel cannot keep an entry through exec by
+// image (execKeep false: the exec program is not attached, or the object has
+// no trace_protected_images): an inherited entry would then follow whatever
+// the child runs.
+func protectedInheritBudget(entries int, execKeep bool) int64 {
+	if !execKeep || entries >= maxInheritedFill {
 		return 0
 	}
 	return int64(maxInheritedFill - entries)
@@ -464,6 +478,9 @@ func loaderInjection(environPath string) bool {
 type protectedTGID struct {
 	tgid       uint32
 	startTicks uint64
+	// configured: matched by an exe path of the set, which needs no root; a
+	// match by name needs root UIDs (matchIdentity).
+	configured bool
 }
 
 // scanProtectedTGIDs walks procRoot and returns the protected processes
@@ -500,36 +517,99 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 		if err != nil {
 			continue
 		}
-		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks})
+		exe, _ := protectedExeCandidate(id.exe)
+		_, configured := s.exes[exe]
+		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured})
 	}
 	return out, nil
 }
 
-// kernelComms is the content of the trace_protected_comms map: every
-// protected name and configured exe basename, truncated to TASK_COMM_LEN-1
-// and NUL-padded as bpf_get_current_comm returns it. The kernel consults it
-// when a process in trace_protected_tgids calls exec: the entry is kept
-// only for a listed comm, and for a name (not an exe path) only as root —
-// matchIdentity's rule, which the next refresh then verifies by inode.
-func (s *ProtectedProcessSet) kernelComms() map[[taskCommLen]byte]uint8 {
-	out := make(map[[taskCommLen]byte]uint8)
+// protectedImageDirs are the directories searched for the built-in and extra
+// protected names when the kernel's image set is built. They are system
+// locations of root-owned binaries, a subset of trustedExeDirs (the OpenSSH
+// helpers live in /usr/lib/openssh on Debian, /usr/libexec/openssh on Fedora
+// and /usr/lib/ssh on Arch). A name in a nested directory is not found here:
+// list its path in WAFIO_PROTECTED_EXE_PATHS.
+var protectedImageDirs = []string{
+	"/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/", "/usr/local/sbin/", "/usr/local/bin/",
+	"/usr/libexec/", "/usr/lib/openssh/", "/usr/libexec/openssh/", "/usr/lib/ssh/", "/usr/libexec/ssh/",
+	"/usr/lib/systemd/", "/lib/systemd/",
+}
+
+// imagePaths is the set of files the kernel may trust at exec, with the
+// trace_protected_images flags: every protected name in every
+// protectedImageDirs entry needs root, a configured exe path does not, and the
+// latter wins when both name the same path (matchIdentity's rule). The next
+// refresh still verifies a running process by inode.
+func (s *ProtectedProcessSet) imagePaths() map[string]uint8 {
+	out := make(map[string]uint8)
 	if s == nil {
 		return out
 	}
-	key := func(name string) [taskCommLen]byte {
-		var k [taskCommLen]byte
-		copy(k[:], truncateComm(name))
-		return k
-	}
 	for n := range s.names {
-		if _, seen := out[key(n)]; !seen {
-			out[key(n)] = protectedCommRootOnly
+		for _, dir := range protectedImageDirs {
+			out[dir+n] = protectedImageRootOnly
 		}
 	}
 	for p := range s.exes {
-		out[key(filepath.Base(p))] = 0 // exe paths need no root (matchIdentity)
+		out[p] = 0
 	}
 	return out
+}
+
+// mountDevices maps mount IDs to the device of the mount's superblock, from
+// the text of a mountinfo file: field 1 is the mount ID and field 3 the
+// "major:minor" the kernel prints from sb->s_dev. The value is dev_t as BPF
+// reads s_dev, MKDEV(major, minor) = major<<20 | minor. A malformed line is
+// skipped.
+func mountDevices(mountinfo string) map[uint64]uint32 {
+	out := make(map[uint64]uint32)
+	for _, line := range strings.Split(mountinfo, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		id, err := strconv.ParseUint(f[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		majorText, minorText, ok := strings.Cut(f[2], ":")
+		if !ok {
+			continue
+		}
+		major, err1 := strconv.ParseUint(majorText, 10, 12)
+		minor, err2 := strconv.ParseUint(minorText, 10, 20)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		out[id] = uint32(major<<20 | minor)
+	}
+	return out
+}
+
+// applyProtectedImages brings trace_protected_images to want: every key that
+// is missing or changed is written before any stale key is deleted, so a
+// trusted image is never absent while the map is swapped. Failures are
+// returned together; the work goes on.
+func applyProtectedImages(have, want map[protectedImageKey]uint8, put func(protectedImageKey, uint8) error, del func(protectedImageKey) error) error {
+	var errs []error
+	for k, v := range want {
+		if hv, ok := have[k]; ok && hv == v {
+			continue
+		}
+		if err := put(k, v); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for k := range have {
+		if _, ok := want[k]; ok {
+			continue
+		}
+		if err := del(k); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // reconcileProtectedEntries computes the kernel map changes for one refresh.

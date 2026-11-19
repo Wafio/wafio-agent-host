@@ -363,7 +363,7 @@ func TestScanProtectedTGIDs(t *testing.T) {
 	// /usr/local/bin or /opt/wafio. 109 and 115 run it from a session scope,
 	// 110 has no readable cgroup, 111 is another program, and 112 and 113 only
 	// carry its name (an interpreter, a copy in /tmp) from inside the unit.
-	want := []protectedTGID{{100, 1100}, {104, 1104}, {108, 1108}, {114, 1114}}
+	want := []protectedTGID{{100, 1100, false}, {104, 1104, false}, {108, 1108, true}, {114, 1114, true}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protected tgids %v, want %v", got, want)
 	}
