@@ -120,15 +120,18 @@ struct {
  * and a value with none of them keeps nothing: ANY (a configured executable
  * path), ROOT (the real UID is 0: the built-in names) and UNIT (the task runs
  * in the systemd unit named in unit, see task_in_unit: the WAF agent and
- * systemd-networkd, which run as service accounts). unit is a NUL padded
- * name of at most TRACE_UNIT_NAME_LEN - 2 characters, so a longer name read
- * back from the kernel, which is cut to TRACE_UNIT_NAME_LEN - 1, never equals it.
+ * systemd-networkd, which run as service accounts). KEEP_ON_SETUID is not an
+ * alternative for exec: only protect_on_setuid reads it (the OpenSSH images).
+ * unit is a NUL padded name of at most TRACE_UNIT_NAME_LEN - 2 characters, so
+ * a longer name read back from the kernel, which is cut to
+ * TRACE_UNIT_NAME_LEN - 1, never equals it.
  * max_entries must match maxProtectedImages, the value layout protectedImage
  * and the flags protectedImage* in trace_protect.go. */
 #define TRACE_MAX_PROTECTED_IMAGES 1024
 #define TRACE_PROTECTED_IMAGE_ANY 1
 #define TRACE_PROTECTED_IMAGE_ROOT 2
 #define TRACE_PROTECTED_IMAGE_UNIT 4
+#define TRACE_PROTECTED_IMAGE_KEEP_ON_SETUID 8
 #define TRACE_UNIT_NAME_LEN 48
 struct protected_image_key {
     __u64 ino;
@@ -222,10 +225,10 @@ protected_inherit_give(void)
 }
 
 /* A child forked by a protected process runs that process's verified
- * image until it execs or gives up root, so it is protected from its first
- * instruction instead of after the next 5 s refresh (sshd's per-connection
- * child, sshd-session's pre-auth child). PID 1 is guarded by number, so its
- * children count too.
+ * image until it execs or gives up root (the OpenSSH images keep the entry
+ * through that), so it is protected from its first instruction instead of
+ * after the next 5 s refresh (sshd's per-connection child, sshd-session's
+ * pre-auth child). PID 1 is guarded by number, so its children count too.
  * A new thread shares the parent's TGID and needs no entry. Inserts are
  * bounded by trace_protected_budget; a refused insert only delays the child's
  * kernel protection to the next refresh. Called at sched_process_fork, before
@@ -383,11 +386,13 @@ protect_on_exec(void)
 /* A task that gives up root without an exec still runs the image its entry
  * was granted for. At the exit of setuid, setreuid and setresuid the entry
  * stays only when that image keeps it for this task, as exec decides (a
- * configured path, the unit of the WAF agent). A root-only image loses it, as
- * an nginx worker or sshd's child that switches to the user does, and the
- * budget unit comes back. A child of PID 1 is left to its exec: systemd
- * switches to User= right before it. A real UID that is still 0 changes
- * nothing. */
+ * configured path, the unit of the WAF agent), or lists KEEP_ON_SETUID: the
+ * OpenSSH images call setgid(0) and setuid(0) right after their own switch to
+ * check that root cannot come back, and the rules that downgrade those two
+ * events need the mark. A root-only image loses it, as an nginx worker does,
+ * and the budget unit comes back. A child of PID 1 is left to its exec:
+ * systemd switches to User= right before it. A real UID that is still 0
+ * changes nothing. */
 static __always_inline void
 protect_on_setuid(void)
 {
@@ -403,7 +408,8 @@ protect_on_setuid(void)
     struct protected_image_key key = {};
     exec_image_key(task, &key);
     struct protected_image *image = bpf_map_lookup_elem(&trace_protected_images, &key);
-    if (image && protected_image_keeps(image, task))
+    if (image && ((image->flags & TRACE_PROTECTED_IMAGE_KEEP_ON_SETUID) ||
+                  protected_image_keeps(image, task)))
         return;
     if (bpf_map_delete_elem(&trace_protected_tgids, &tgid) == 0)
         protected_inherit_give();

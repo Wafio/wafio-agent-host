@@ -386,8 +386,8 @@ func TestScanProtectedTGIDs(t *testing.T) {
 	// carry its name (an interpreter, a copy in /tmp) from inside the unit.
 	const wafUnit = "wafio-waf-agent.service"
 	want := []protectedTGID{
-		{tgid: 100, startTicks: 1100},
-		{tgid: 104, startTicks: 1104},
+		{tgid: 100, startTicks: 1100, name: "sshd"},
+		{tgid: 104, startTicks: 1104, name: "dockerd"},
 		{tgid: 108, startTicks: 1108, configured: true, unit: wafUnit},
 		{tgid: 114, startTicks: 1114, configured: true, unit: wafUnit},
 	}

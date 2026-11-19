@@ -577,6 +577,15 @@ func TestKernelImagesMergesSources(t *testing.T) {
 	if v := got[childKey]; v != (protectedImage{Flags: protectedImageRoot | protectedImageUnit, Unit: waf.Unit}) {
 		t.Errorf("the image of two verified processes: %+v, want root or the unit", v)
 	}
+	// A verified OpenSSH program also survives its own switch of user, and a
+	// name is searched in the system directories without symlinks all the same.
+	got = s.kernelImages(proc, []protectedTGID{{tgid: 500, startTicks: ticks, name: "sshd-session"}})
+	if v := got[childKey]; v != (protectedImage{Flags: protectedImageRoot | protectedImageKeepOnSetuid}) {
+		t.Errorf("the image of a verified sshd-session: %+v, want root and keep on setuid", v)
+	}
+	if !systemDirOnly(protectedImage{Flags: protectedImageRoot | protectedImageKeepOnSetuid}) || systemDirOnly(protectedImage{Flags: protectedImageAny}) {
+		t.Error("a protected name is no longer searched without symlinks")
+	}
 	if got := (*ProtectedProcessSet)(nil).kernelImages(proc, nil); len(got) != 0 {
 		t.Errorf("nil set returned %v", got)
 	}

@@ -43,6 +43,8 @@ func TestDefaultProtectedNamesIncludeOpenSSHSplit(t *testing.T) {
 // bound to a unit keeps the entry only inside that unit.
 func TestProtectedImagePaths(t *testing.T) {
 	root := protectedImage{Flags: protectedImageRoot}
+	// The OpenSSH names also survive their own switch of user.
+	openssh := protectedImage{Flags: protectedImageRoot | protectedImageKeepOnSetuid}
 	anyone := protectedImage{Flags: protectedImageAny}
 	unit := func(name string) protectedImage {
 		img, ok := unitImage(name)
@@ -54,11 +56,11 @@ func TestProtectedImagePaths(t *testing.T) {
 	s := NewProtectedProcessSet([]string{"my-daemon"}, []string{"/opt/acme/bin/agentd", "/opt/other/sshd"})
 	got := s.imagePaths()
 	want := map[string]protectedImage{
-		"/usr/sbin/sshd":                    root,
-		"/usr/lib/openssh/sshd-session":     root, // Debian
-		"/usr/libexec/openssh/sshd-auth":    root, // Fedora
-		"/usr/lib/ssh/sshd-session":         root, // Arch
-		"/usr/lib/systemd/systemd-executor": root, // the systemd 255 helper
+		"/usr/sbin/sshd":                    openssh,
+		"/usr/lib/openssh/sshd-session":     openssh, // Debian
+		"/usr/libexec/openssh/sshd-auth":    openssh, // Fedora
+		"/usr/lib/ssh/sshd-session":         openssh, // Arch
+		"/usr/lib/systemd/systemd-executor": root,    // the systemd 255 helper
 		"/lib/systemd/systemd-journald":     root,
 		"/usr/sbin/nginx":                   root, // the master; a worker is not root
 		"/usr/bin/containerd":               root,
@@ -327,7 +329,7 @@ func TestZombieLeaderRenamedToDaemonIsNotProtected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got, []protectedTGID{{tgid: 300, startTicks: 1300}}) {
+	if !slices.Equal(got, []protectedTGID{{tgid: 300, startTicks: 1300, name: "dockerd"}}) {
 		t.Fatalf("kernel set %v, want only the verified dockerd", got)
 	}
 }

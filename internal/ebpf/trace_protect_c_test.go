@@ -2,9 +2,37 @@ package ebpf
 
 import (
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// The flag values of trace_protected_images are the same numbers in the object
+// and in the agent.
+func TestProtectedImageFlagsMatchObject(t *testing.T) {
+	source, err := os.ReadFile("bpf/wafio_trace.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]uint64{
+		"ANY": protectedImageAny, "ROOT": protectedImageRoot, "UNIT": protectedImageUnit,
+		"KEEP_ON_SETUID": protectedImageKeepOnSetuid,
+	}
+	found := map[string]uint64{}
+	for _, m := range regexp.MustCompile(`#define TRACE_PROTECTED_IMAGE_(\w+) (\d+)`).FindAllStringSubmatch(string(source), -1) {
+		v, _ := strconv.ParseUint(m[2], 10, 64)
+		found[m[1]] = v
+	}
+	if len(found) != len(want) {
+		t.Fatalf("object flags %v, agent flags %v", found, want)
+	}
+	for name, v := range want {
+		if found[name] != v {
+			t.Errorf("flag %s: object %d, agent %d", name, found[name], v)
+		}
+	}
+}
 
 // TestTraceProtectedInheritance compiles the kernel-side protected-set
 // helpers of wafio_trace.c natively, with only the BPF helpers, maps and kernel
@@ -143,13 +171,13 @@ static int survives(__u64 ino, __u32 dev, __u32 gen, __u32 uid) {
 int main(void) {
   /* Device 259:2 (0x10300002), one inode generation per file. */
   const __u32 DEV = 0x10300002, OTHER_DEV = 0x10300003;
-  const __u64 SSHD_SESSION = 1001, AGENT = 1002, NETWORKD = 1003, EXECUTOR = 1004, WAF = 1005, BOTH = 1006, NOTHING = 1007, UNKNOWN_BIT = 1008, NO_UNIT = 1009, LONG_UNIT = 1010;
+  const __u64 SSHD_SESSION = 1001, AGENT = 1002, NETWORKD = 1003, EXECUTOR = 1004, WAF = 1005, BOTH = 1006, NOTHING = 1007, UNKNOWN_BIT = 1008, NO_UNIT = 1009, LONG_UNIT = 1010, SSHD_USER = 1011, ONLY_KEEP = 1012;
   const char *long_unit = u_run(46); /* the most userspace stores */
   image(SSHD_SESSION, DEV, 7, TRACE_PROTECTED_IMAGE_ROOT, NULL); image(AGENT, DEV, 8, TRACE_PROTECTED_IMAGE_ANY, NULL);
   image(NETWORKD, DEV, 9, TRACE_PROTECTED_IMAGE_UNIT, "systemd-networkd.service"); image(EXECUTOR, DEV, 10, TRACE_PROTECTED_IMAGE_ROOT, NULL);
   image(WAF, DEV, 11, TRACE_PROTECTED_IMAGE_UNIT, "wafio-waf-agent.service");
   image(BOTH, DEV, 12, TRACE_PROTECTED_IMAGE_ROOT | TRACE_PROTECTED_IMAGE_UNIT, "wafio-waf-agent.service");
-  image(NOTHING, DEV, 13, 0, "wafio-waf-agent.service"); image(UNKNOWN_BIT, DEV, 14, 8, NULL);
+  image(NOTHING, DEV, 13, 0, "wafio-waf-agent.service"); image(UNKNOWN_BIT, DEV, 14, 16, NULL);
   image(NO_UNIT, DEV, 15, TRACE_PROTECTED_IMAGE_UNIT, NULL); image(LONG_UNIT, DEV, 16, TRACE_PROTECTED_IMAGE_UNIT, long_unit);
   set_slot(TRACE_PROTECTED_REFUSED_SLOT, 0);
 
@@ -343,9 +371,9 @@ int main(void) {
   EXPECT(!has(720), "an exec kept the entry with no image listed");
   image(SSHD_SESSION, DEV, 7, TRACE_PROTECTED_IMAGE_ROOT, NULL);
 
-  /* A forked child that gives up root without exec (an nginx worker, the child
-   * of sshd that switches to the user) keeps its entry only when its image
-   * keeps it for a task without root. The budget unit comes back. */
+  /* A forked child that gives up root without exec (an nginx worker) keeps its
+   * entry only when its image keeps it for a task without root. The budget
+   * unit comes back. */
   image(AGENT, DEV, 8, TRACE_PROTECTED_IMAGE_ANY, NULL); image(WAF, DEV, 11, TRACE_PROTECTED_IMAGE_UNIT, "wafio-waf-agent.service");
   struct task_struct priv = mk_task(800, 800, 9600000000ULL); priv.group_leader = &priv;
   protect(800, 9600000000ULL);
@@ -404,6 +432,28 @@ int main(void) {
   exec_file.f_inode = &exec_inode; exec_mm.exe_file = &exec_file; exec_task.mm = &exec_mm; exec_task.real_parent = NULL; cur_task = &exec_task;
   cur_pid_tgid = ((__u64)809 << 32) | 809; cur_uid_gid = 998; protect_on_setuid();
   EXPECT(!has(809), "a parent that could not be read kept a root-only entry like PID 1's child");
+
+  /* The OpenSSH images keep the entry through their own switch of user: right
+   * after it they call setgid(0) and setuid(0), and both are traced as the
+   * verified daemon. Exec ignores the flag: it is no alternative there. */
+  image(SSHD_USER, DEV, 17, TRACE_PROTECTED_IMAGE_ROOT | TRACE_PROTECTED_IMAGE_KEEP_ON_SETUID, NULL);
+  image(ONLY_KEEP, DEV, 18, TRACE_PROTECTED_IMAGE_KEEP_ON_SETUID, NULL);
+  set_budget(2); set_slot(TRACE_PROTECTED_BUDGET_SLOT, 1);
+  protect(810, 9960000000ULL);
+  run_setuid(810, 800, SSHD_USER, DEV, 17, 105);
+  run_setuid(810, 800, SSHD_USER, DEV, 17, 105); /* setuid(0) as sshd: still not root */
+  EXPECT(has(810) && budget() == 1, "an OpenSSH image lost the entry at its switch of user");
+  protect(811, 9970000000ULL);
+  run_setuid(811, 800, SSHD_SESSION, DEV, 7, 105);
+  EXPECT(!has(811), "a root-only image kept the entry at a switch of user");
+  EXPECT(survives(SSHD_USER, DEV, 17, 0), "an OpenSSH image run by root lost the entry at exec");
+  EXPECT(!survives(SSHD_USER, DEV, 17, 105), "an OpenSSH image run by a user kept the entry at exec");
+  EXPECT(!survives(ONLY_KEEP, DEV, 18, 0), "a keep-on-setuid flag alone kept the entry at exec");
+  protect(812, 9980000000ULL);
+  run_setuid(812, 800, ONLY_KEEP, DEV, 18, 105);
+  EXPECT(has(812), "a keep-on-setuid flag alone dropped the entry at a switch of user");
+  bpf_map_delete_elem(&trace_protected_tgids, &(__u32){ 810 }); bpf_map_delete_elem(&trace_protected_tgids, &(__u32){ 812 });
+  set_budget(2); set_slot(TRACE_PROTECTED_BUDGET_SLOT, 1);
 
   /* exit: only when the whole thread group is gone, and only for the
    * entry's own process. */

@@ -93,8 +93,8 @@ const maxProtectedTGIDs = 1024
 const maxProtectedImages = 1024
 
 // Flags of a trace_protected_images value (TRACE_PROTECTED_IMAGE_* in
-// wafio_trace.c). They are alternatives: an exec keeps the entry when any one
-// holds, and a value with none keeps nothing.
+// wafio_trace.c). Any, Root and Unit are alternatives: an exec keeps the entry
+// when any one holds, and a value with none keeps nothing.
 const (
 	// protectedImageAny keeps the entry for any task: a configured exe path,
 	// which needs no root.
@@ -104,7 +104,27 @@ const (
 	// protectedImageUnit keeps it when the task runs in the systemd unit named
 	// in the value: the WAF agent and systemd-networkd.
 	protectedImageUnit
+	// protectedImageKeepOnSetuid keeps it through the exit of setuid, setreuid
+	// and setresuid, whoever the task is then. Exec ignores it.
+	protectedImageKeepOnSetuid
 )
+
+// userSwitchNames are the OpenSSH programs that drop root themselves and then
+// call setgid(0) and setuid(0) to check that root cannot come back. The control
+// plane downgrades those two events only for a verified process, so these
+// images keep the mark through their own switch of user.
+var userSwitchNames = map[string]struct{}{"sshd": {}, "sshd-session": {}, "sshd-auth": {}}
+
+// rootImage is the value for a protected name found in a system directory: the
+// entry survives an exec for root, and a switch of user too for the OpenSSH
+// names.
+func rootImage(name string) protectedImage {
+	img := protectedImage{Flags: protectedImageRoot}
+	if _, ok := userSwitchNames[name]; ok {
+		img.Flags |= protectedImageKeepOnSetuid
+	}
+	return img
+}
 
 // protectedUnitLen mirrors TRACE_UNIT_NAME_LEN. The kernel reads a cgroup name
 // into a buffer that long and cuts a longer one to protectedUnitLen-1 bytes, so
@@ -655,6 +675,9 @@ type protectedTGID struct {
 	// unit: the systemd unit the exe path is bound to ("" when it is not), so
 	// the image this process runs keeps the entry only inside that unit.
 	unit string
+	// name: the basename of the executable of a process matched by name; ""
+	// for one matched by a configured path.
+	name string
 }
 
 // image is the trace_protected_images value for the file the process runs: the
@@ -667,7 +690,7 @@ func (p protectedTGID) image() (protectedImage, bool) {
 	case p.configured:
 		return protectedImage{Flags: protectedImageAny}, true
 	}
-	return protectedImage{Flags: protectedImageRoot}, true
+	return rootImage(p.name), true
 }
 
 // scanProtectedTGIDs walks procRoot and returns the protected processes
@@ -715,7 +738,11 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 		}
 		exe, _ := protectedExeCandidate(id.exe)
 		_, configured := s.exes[exe]
-		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe]})
+		p := protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe]}
+		if !configured {
+			p.name = filepath.Base(exe)
+		}
+		out = append(out, p)
 	}
 	slices.Sort(untrusted)
 	return out, slices.Compact(untrusted), nil
@@ -749,7 +776,7 @@ func (s *ProtectedProcessSet) imagePaths() map[string]protectedImage {
 	for n := range s.names {
 		for _, dir := range protectedImageDirs {
 			if _, bound := s.units[dir+n]; !bound {
-				out[dir+n] = protectedImage{Flags: protectedImageRoot}
+				out[dir+n] = rootImage(n)
 			}
 		}
 	}

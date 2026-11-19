@@ -207,7 +207,7 @@ var afterImageRead func(dir string)
 // systemDirOnly says that a path comes from a protected name searched in the
 // system directories (imagePaths): symlinks are refused in its directory part.
 func systemDirOnly(img protectedImage) bool {
-	return img.Flags == protectedImageRoot
+	return img.Flags&^protectedImageKeepOnSetuid == protectedImageRoot
 }
 
 // kernelImages is the content of trace_protected_images: the files the kernel

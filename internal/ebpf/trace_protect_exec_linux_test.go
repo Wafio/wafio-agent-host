@@ -3,10 +3,15 @@
 package ebpf
 
 import (
+	"bufio"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -249,6 +254,102 @@ func TestKernelProtectedEntryDroppedWithRoot(t *testing.T) {
 			}
 		})
 	}
+}
+
+// OpenSSH drops root and then calls setuid(0) to check that root cannot come
+// back; the rules that downgrade that call need the entry. A child whose image
+// lists keep-on-setuid has it through the switch and through the call, in the
+// real kernel, and one whose image is for root only loses it at the switch. The
+// helper is a copy of the test binary in a file of its own, so the file
+// identity is the test's to set.
+func TestKernelProtectedEntryKeptThroughOpenSSHUserSwitch(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := writeFile(t, filepath.Join(imageTestDir(t), "switcher"), string(data), 0o755)
+	key, ok := identityOf(helper, "/proc/self/mountinfo")
+	if !ok {
+		t.Skipf("%s has no identity here (not root's, or a filesystem without inode generations)", helper)
+	}
+
+	lab := newKernelProtectLab(t, 16)
+	for _, tc := range []struct {
+		name  string
+		flags uint64
+		keep  bool
+	}{
+		{"image listed for the OpenSSH user switch", protectedImageRoot | protectedImageKeepOnSetuid, true},
+		{"image for root only", protectedImageRoot, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := lab.images.Update(key, protectedImage{Flags: tc.flags}, cebpf.UpdateAny); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(helper, "-test.run=^TestUserSwitchHelper$")
+			cmd.Env = append(os.Environ(), userSwitchHelperEnv+"=1")
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+			pid := cmd.Process.Pid
+			lines := bufio.NewReader(stdout)
+			expect := func(want string) {
+				t.Helper()
+				if got, _ := lines.ReadString('\n'); strings.TrimSpace(got) != want {
+					t.Fatalf("the helper said %q, want %q", got, want)
+				}
+			}
+
+			expect("switched") // setresuid has returned, so its exit program has run
+			if got := lab.has(pid); got != tc.keep {
+				t.Fatalf("entry when the helper calls setuid(0): %t, want %t", got, tc.keep)
+			}
+			if _, err := io.WriteString(stdin, "go\n"); err != nil {
+				t.Fatal(err)
+			}
+			expect("refused") // setuid(0) failed and its exit program has run
+			if got := lab.has(pid); got != tc.keep {
+				t.Fatalf("entry after setuid(0): %t, want %t", got, tc.keep)
+			}
+		})
+	}
+}
+
+const userSwitchHelperEnv = "WAFIO_TEST_USER_SWITCH_HELPER"
+
+// TestUserSwitchHelper is the child of the test above, not a test of its own:
+// it gives up root on one thread the way OpenSSH does, reports, waits for the
+// go-ahead and asks for root back.
+func TestUserSwitchHelper(t *testing.T) {
+	if os.Getenv(userSwitchHelperEnv) == "" {
+		t.Skip("runs as the child of TestKernelProtectedEntryKeptThroughOpenSSHUserSwitch")
+	}
+	runtime.LockOSThread() // the credentials of a thread are its own
+	const nobody = 65534
+	if err := unix.Setresuid(nobody, nobody, nobody); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("switched")
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setuid(0); err == nil {
+		t.Fatal("setuid(0) gave root back")
+	}
+	fmt.Println("refused")
 }
 
 // The fork budget follows the entries in the map: a client that opens and

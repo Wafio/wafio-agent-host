@@ -158,10 +158,15 @@ loading its own, from another process reading it. The mark says only that the
 kernel saw the process in the protected set. A child forked by a protected
 process has it from its first instruction. It loses it when it gives up root
 without an `exec` (the exit of `setuid`, `setreuid` or `setresuid`), unless its
-program keeps the mark for any user (a path in `WAFIO_PROTECTED_EXE_PATHS`) or
-inside its unit; a child of PID 1 keeps it until its `exec`, because systemd
-switches to `User=` right before it. A kernel that rejects those three programs
-leaves the next refresh (5 s) to drop the mark, as does a 32-bit call on x86_64.
+program keeps the mark for any user (a path in `WAFIO_PROTECTED_EXE_PATHS`),
+inside its unit, or through its own switch of user. `sshd`, `sshd-session` and
+`sshd-auth` do the last: OpenSSH calls `setgid(0)` and `setuid(0)` right after
+the switch to check that root cannot come back, and the control plane downgrades
+those two events only for a verified process. The next refresh drops that mark,
+because a process under a name counts only as root. A child of PID 1 keeps the
+mark until its `exec`, because systemd switches to `User=` right before it. A
+kernel that rejects those three programs leaves the next refresh (5 s) to drop
+the mark, as does a 32-bit call on x86_64.
 A thread can rename itself with `prctl(PR_SET_NAME)`. A rule that trusts the
 mark should therefore also match the process name and the user. The same set makes the WAF agent immune to Kill
 policies, so a policy cannot take down the sites it fronts.
