@@ -25,8 +25,8 @@ const imageWatchMask = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_CLOSE_WRITE |
 // imageWatch reports on changed that a file which could be a trusted image
 // changed on disk. The channel holds one signal: a burst of events is one
 // refresh. The directories are those of PID 1's root, the view the images are
-// read in, and one that does not exist yet, was moved or was removed is watched
-// again by rearm.
+// read in, and one that does not exist yet, was moved or was removed, or that a
+// symlink in its path leads away from, is watched again by rearm.
 type imageWatch struct {
 	f       *os.File
 	inotify int // f's descriptor, kept so Fd() never switches f to blocking reads
@@ -36,7 +36,16 @@ type imageWatch struct {
 	dirs    []string // every directory of the trusted paths
 
 	mu    sync.Mutex
-	armed map[string]int // directory -> watch descriptor
+	armed map[string]armedDir
+}
+
+// armedDir is the watch behind a directory name and the directory (device and
+// inode) it was set on. A name that is a symlink, or whose directory was
+// replaced, can lead to another directory later while the watch stays on the old
+// one.
+type armedDir struct {
+	wd       int
+	dev, ino uint64
 }
 
 // watchProtectedImages watches the directories of every path in imagePaths,
@@ -67,7 +76,7 @@ func watchProtectedImages(s *ProtectedProcessSet, procRoot string) (*imageWatch,
 		root:    root,
 		changed: make(chan struct{}, 1),
 		exited:  make(chan struct{}),
-		armed:   make(map[string]int),
+		armed:   make(map[string]armedDir),
 	}
 	for d := range dirs {
 		w.dirs = append(w.dirs, d)
@@ -78,7 +87,8 @@ func watchProtectedImages(s *ProtectedProcessSet, procRoot string) (*imageWatch,
 }
 
 // rearm watches the directories that are not watched: one that did not exist
-// when the watch started, or that was moved or removed since. It returns how
+// when the watch started, that was moved or removed since, or whose name leads
+// to another directory now (a symlink pointed at a new release). It returns how
 // many it armed. Call it before each refresh: a file that appeared in a
 // directory before it was armed is then seen by the refresh itself.
 func (w *imageWatch) rearm() int {
@@ -86,22 +96,45 @@ func (w *imageWatch) rearm() int {
 	defer w.mu.Unlock()
 	n := 0
 	for _, dir := range w.dirs {
-		if _, ok := w.armed[dir]; ok {
-			continue
-		}
 		fd, err := openDirIn(w.root, dir, true)
 		if err != nil {
 			continue // not there (yet), or not a directory
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+			continue
+		}
+		now := armedDir{dev: uint64(st.Dev), ino: uint64(st.Ino)}
+		if old, ok := w.armed[dir]; ok {
+			if old.dev == now.dev && old.ino == now.ino {
+				_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+				continue
+			}
+			delete(w.armed, dir)
+			w.removeUnlessShared(old.wd)
 		}
 		wd, err := unix.InotifyAddWatch(w.inotify, "/proc/self/fd/"+strconv.Itoa(fd), imageWatchMask)
 		_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
 		if err != nil {
 			continue
 		}
-		w.armed[dir] = wd
+		now.wd = wd
+		w.armed[dir] = now
 		n++
 	}
 	return n
+}
+
+// removeUnlessShared drops the watch behind wd when no other directory name
+// leads to the same directory. Callers hold mu.
+func (w *imageWatch) removeUnlessShared(wd int) {
+	for _, a := range w.armed {
+		if a.wd == wd {
+			return
+		}
+	}
+	_, _ = unix.InotifyRmWatch(w.inotify, uint32(wd)) // the watch may be gone already
 }
 
 // armedDirs is the number of directories being watched.
@@ -116,8 +149,8 @@ func (w *imageWatch) armedDirs() int {
 func (w *imageWatch) unarm(wd int, remove bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for dir, d := range w.armed {
-		if d == wd {
+	for dir, a := range w.armed {
+		if a.wd == wd {
 			delete(w.armed, dir)
 		}
 	}

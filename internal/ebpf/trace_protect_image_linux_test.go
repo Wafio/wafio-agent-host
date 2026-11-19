@@ -824,6 +824,118 @@ func TestWatchProtectedImagesUsesPID1Root(t *testing.T) {
 	}
 }
 
+// retargetLink points link at target the way a release switch does: a new link
+// renamed over the old one, in a directory nothing watches.
+func retargetLink(t *testing.T, link, target string) {
+	t.Helper()
+	if err := os.Symlink(target, link+".new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(link+".new", link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// signalAfterWriting makes a file appear at path and waits for the watch to
+// say so. It first drops the signals still pending, so only this write counts.
+func signalAfterWriting(t *testing.T, w *imageWatch, path string) {
+	t.Helper()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-w.changed:
+	default:
+	}
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.changed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("a file written at %s did not signal", path)
+	}
+}
+
+// A configured path that goes through a symlink is watched where the link leads
+// now: the link moves in a directory nobody watches, so only rearm can see it.
+func TestWatchFollowsRetargetedSymlink(t *testing.T) {
+	base := t.TempDir()
+	rel1, rel2 := filepath.Join(base, "rel1"), filepath.Join(base, "rel2")
+	for _, d := range []string{rel1, rel2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := filepath.Join(base, "current")
+	if err := os.Symlink(rel1, current); err != nil {
+		t.Fatal(err)
+	}
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(current, "agentd")}, ReplaceDefaults: true})
+	w, err := watchProtectedImages(s, selfProc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if n := w.rearm(); n != 0 {
+		t.Fatalf("rearm armed %d directories with nothing changed, want 0", n)
+	}
+
+	retargetLink(t, current, rel2)
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories after the link moved, want 1", n)
+	}
+	if n := w.armedDirs(); n != 1 {
+		t.Fatalf("%d directories armed, want 1", n)
+	}
+	signalAfterWriting(t, w, filepath.Join(rel2, "agentd"))
+	// The old release is not watched any more.
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-w.changed:
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(rel1, "agentd"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.changed:
+		t.Error("the old release still signals")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Two names for one directory share a watch: moving one of them leaves the
+// other watched.
+func TestWatchRetargetKeepsSharedWatch(t *testing.T) {
+	base := t.TempDir()
+	rel1, rel2 := filepath.Join(base, "rel1"), filepath.Join(base, "rel2")
+	for _, d := range []string{rel1, rel2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current, alias := filepath.Join(base, "current"), filepath.Join(base, "alias")
+	for _, link := range []string{current, alias} {
+		if err := os.Symlink(rel1, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(current, "agentd"), filepath.Join(alias, "agentd")}, ReplaceDefaults: true})
+	w, err := watchProtectedImages(s, selfProc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if n := w.armedDirs(); n != 2 {
+		t.Fatalf("%d directories armed, want 2", n)
+	}
+	retargetLink(t, current, rel2)
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories after one link moved, want 1", n)
+	}
+	signalAfterWriting(t, w, filepath.Join(rel1, "agentd"))
+	signalAfterWriting(t, w, filepath.Join(rel2, "agentd"))
+}
+
 // TestTraceProtectedImagesMapMatchesAgent reads the compiled object, not the
 // kernel: the key and the value the agent writes are the layouts the exec
 // program looks up and reads, the budget array has the slots the agent writes,
