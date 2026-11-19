@@ -236,6 +236,30 @@ func (s *ProtectedProcessSet) kernelImages(procRoot string, verified []protected
 	}
 	add := func(key protectedImageKey, img protectedImage) { out[key] = out[key].merge(img) }
 
+	// A mount table is the same for every process of a mount namespace, so each
+	// is read once per call. Mount IDs are global: a process that changes
+	// namespace after its link was read can only miss a mount, which leaves its
+	// image out.
+	tables := make(map[string]map[uint64]mountEntry)
+	hostMounts, hostMountsOK := readMounts(filepath.Join(procRoot, "1", "mountinfo"))
+	if ns, err := os.Readlink(filepath.Join(procRoot, "1", "ns", "mnt")); hostMountsOK && err == nil {
+		tables[ns] = hostMounts
+	}
+	mountsOf := func(dir string) (map[uint64]mountEntry, bool) {
+		ns, err := os.Readlink(filepath.Join(dir, "ns", "mnt"))
+		if err != nil {
+			return readMounts(filepath.Join(dir, "mountinfo"))
+		}
+		if m, ok := tables[ns]; ok {
+			return m, true
+		}
+		m, ok := readMounts(filepath.Join(dir, "mountinfo"))
+		if ok {
+			tables[ns] = m
+		}
+		return m, ok
+	}
+
 	for _, p := range verified {
 		img, ok := p.image()
 		if !ok {
@@ -249,7 +273,7 @@ func (s *ProtectedProcessSet) kernelImages(procRoot string, verified []protected
 		if !ok {
 			continue
 		}
-		mounts, mountsOK := readMounts(filepath.Join(dir, "mountinfo"))
+		mounts, mountsOK := mountsOf(dir)
 		key, keyOK := fileImage(fd, mounts)
 		_ = unix.Close(fd) // read-only descriptor
 		if afterImageRead != nil {
@@ -264,7 +288,7 @@ func (s *ProtectedProcessSet) kernelImages(procRoot string, verified []protected
 	hostRoot, err := unix.Open(filepath.Join(procRoot, "1", "root"), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err == nil {
 		defer func() { _ = unix.Close(hostRoot) }() // an O_PATH descriptor holds no data to flush
-		if hostMounts, ok := readMounts(filepath.Join(procRoot, "1", "mountinfo")); ok {
+		if hostMountsOK {
 			paths := s.imagePaths()
 			for p, img := range paths {
 				fd, ok := openTrusted(hostRoot, p, !systemDirOnly(img))

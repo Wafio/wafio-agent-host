@@ -646,6 +646,52 @@ func TestKernelImagesChecksProcessStartTime(t *testing.T) {
 	}
 }
 
+// A process in the mount namespace of PID 1 uses its table: the fake process
+// has no mountinfo file and still gets its image. One in a namespace of its own
+// needs a table of its own, and is left out without one.
+func TestKernelImagesSharesMountTables(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	agent := writeFile(t, filepath.Join(dir, "agentd"), "agent", 0o755)
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(dir, "no-such-file")}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	fake := func(pid string) string {
+		t.Helper()
+		d := filepath.Join(proc, pid)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(agent, filepath.Join(d, "exe")); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(d, "stat"), string(statLine("agentd", 4242)), 0o644)
+		return d
+	}
+	// ns of 600 is PID 1's own: the same link text for mnt.
+	if err := os.Symlink("/proc/self/ns", filepath.Join(fake("600"), "ns")); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(fake("601"), "ns")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("mnt:[1]", filepath.Join(other, "mnt")); err != nil {
+		t.Fatal(err)
+	}
+	key, ok := identityOf(agent, "/proc/self/mountinfo")
+	if !ok {
+		t.Fatal("no identity for the agent file")
+	}
+
+	got := s.kernelImages(proc, []protectedTGID{{tgid: 600, startTicks: 4242}})
+	if v, ok := got[key]; !ok || v.Flags != protectedImageRoot {
+		t.Errorf("a process in the namespace of PID 1 has no image: %+v", got)
+	}
+	if got := s.kernelImages(proc, []protectedTGID{{tgid: 601, startTicks: 4242}}); len(got) != 0 {
+		t.Errorf("a process of another namespace with no table has an image: %+v", got)
+	}
+}
+
 // A protected name is searched in the system directories, which stay out of the
 // reach of every symlink and of any non-root writer. This runs on the real
 // system files: /usr/bin/true is root's, in root's directory.
