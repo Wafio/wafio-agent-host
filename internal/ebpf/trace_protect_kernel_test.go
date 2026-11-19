@@ -46,6 +46,8 @@ func TestProtectedKernelComms(t *testing.T) {
 		"sshd-auth":       protectedCommRootOnly,
 		"systemd":         protectedCommRootOnly,
 		"systemd-journal": protectedCommRootOnly, // truncated to TASK_COMM_LEN-1
+		"systemd-executo": protectedCommRootOnly, // the systemd 255 helper, truncated
+		"wafio-waf-agent": 0,                     // runs as a service account; /usr/local/bin and /opt/wafio share the comm
 		"containerd":      protectedCommRootOnly,
 		"dockerd":         protectedCommRootOnly,
 		"kubelet":         protectedCommRootOnly,

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -24,9 +25,23 @@ import (
 // by enforcement. The agent itself is protected by PID (userspace self-check
 // and trace_config.agent_pid in the kernel), not by name. OpenSSH >= 9.8 runs
 // each connection as sshd-session and (10.0+) the pre-auth phase as
-// sshd-auth.
+// sshd-auth. systemd-executor is the helper that systemd 255 and later runs
+// as root between PID 1 and the service binary.
 var DefaultProtectedProcessNames = []string{
 	"sshd", "sshd-session", "sshd-auth", "systemd", "systemd-journald", "containerd", "dockerd", "kubelet",
+	"systemd-executor",
+}
+
+// DefaultProtectedUnitExes maps a built-in protected executable path to the
+// systemd unit it must run in. The WAF agent runs as a service account and
+// takes a key file and an engine library from its own configuration, so the
+// path and the inode alone would let any local user run the genuine binary
+// and be trusted. Only root can put a process into a system.slice cgroup.
+// The unit installer puts the binary in /usr/local/bin; the installer in the
+// WAF agent bundle puts it in /opt/wafio and points the unit there.
+var DefaultProtectedUnitExes = map[string]string{
+	"/usr/local/bin/wafio-waf-agent": "wafio-waf-agent.service",
+	"/opt/wafio/wafio-waf-agent":     "wafio-waf-agent.service",
 }
 
 // trustedExeDirs: a protected NAME only counts when the executable lives in a
@@ -87,6 +102,7 @@ type ProtectedProcessSet struct {
 	names map[string]struct{} // executable basenames (full, untruncated)
 	comms map[string]struct{} // same names truncated to TASK_COMM_LEN-1
 	exes  map[string]struct{} // exact executable paths
+	units map[string]string   // exe path -> system unit it must run in
 
 	defaultsReplaced bool // DefaultProtectedProcessNames dropped by configuration
 }
@@ -129,7 +145,7 @@ type procIdentity struct {
 	hostExe tri
 	// hostMntNS: the process shares pid 1's mount namespace. Used for a
 	// replaced-on-disk image ("(deleted)"), whose inode no longer exists at
-	// the path.
+	// the path, unless the path is bound to a unit.
 	hostMntNS tri
 	// rootUIDs: real, effective, saved and filesystem UID are all 0. An
 	// unprivileged user can run a genuine, non-setuid protected binary, but
@@ -143,6 +159,10 @@ type procIdentity struct {
 	// unreadable: a kernel thread has no exe, but neither has a zombie leader
 	// whose live threads renamed themselves.
 	kthread tri
+
+	// cgroup: the systemd cgroup path of the process (see systemdCgroup). Read
+	// only for an exe that must run in a unit; "" when unreadable.
+	cgroup string
 }
 
 // pfKthread is PF_KTHREAD (include/linux/sched.h), field 9 of /proc/<pid>/stat.
@@ -168,10 +188,12 @@ func kernelThread(statPath string) tri {
 // exe is authoritative when known: comm is ignored then, because it is
 // attacker-controlled. A protected exe path counts only when the process is
 // verifiably that host binary (hostExe, or hostMntNS for a replaced image),
-// runs without a loader injection, and — for the built-in name list — runs as
-// root. Any failed or impossible verification means NOT protected: the
-// protection exists to keep host daemons alive, and must not become a way for
-// the processes a Kill policy targets to exempt themselves.
+// runs without a loader injection, runs in its own unit when the set names one
+// for that path (units, which also stands in for the mount namespace check on a
+// replaced image), and, for the built-in name list, runs as root. Any
+// failed or impossible verification means NOT protected: the protection exists
+// to keep host daemons alive, and must not become a way for the processes a
+// Kill policy targets to exempt themselves.
 //
 // When exe is unknown (unreadable link) comm decides only for a kernel thread
 // in the host mount namespace (both verified). Anything else without an exe —
@@ -201,10 +223,15 @@ func (s *ProtectedProcessSet) matchIdentity(id procIdentity) (bool, string) {
 		return false, ""
 	}
 	if deleted {
-		if id.hostMntNS != triYes {
+		// A unit-bound path needs no host mount namespace: its unit may give the
+		// process its own, and the cgroup check below decides.
+		if _, bound := s.units[exe]; !bound && id.hostMntNS != triYes {
 			return false, ""
 		}
 	} else if id.hostExe != triYes {
+		return false, ""
+	}
+	if unit, ok := s.units[exe]; ok && id.cgroup != "/system.slice/"+unit {
 		return false, ""
 	}
 	if configured {
@@ -302,7 +329,31 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 	}
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
+	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {
+		id.cgroup = systemdCgroup(filepath.Join(dir, "cgroup"))
+	}
 	return id
+}
+
+// systemdCgroup returns the cgroup path from a /proc/<pid>/cgroup file: the
+// unified "0::<path>" line, or else the cgroup v1 "name=systemd" line. "" when
+// the file is unreadable or has neither.
+func systemdCgroup(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var v1 string
+	for _, line := range strings.Split(string(data), "\n") {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			return p
+		}
+		// "<id>:<controllers>:<path>"; the path may hold colons.
+		if f := strings.SplitN(line, ":", 3); len(f) == 3 && slices.Contains(strings.Split(f[1], ","), "name=systemd") {
+			v1 = f[2]
+		}
+	}
+	return v1
 }
 
 // procIdentityDenied reports whether this process is refused the identity
