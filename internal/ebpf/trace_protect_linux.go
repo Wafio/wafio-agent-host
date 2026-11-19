@@ -15,12 +15,13 @@ func (tm *TraceManager) runProtectedSelfCheck() protectedSelfCheck {
 		procDenied: procIdentityDenied(tm.proc()),
 	}
 	if tm.protectedMap == nil {
-		tgids, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
-		c.matched, c.scanErr = len(tgids), err
+		tgids, untrusted, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
+		c.matched, c.untrusted, c.scanErr = len(tgids), untrusted, err
 		return c
 	}
 	c.valueSize = tm.protectedMap.ValueSize()
 	c.matched, c.scanErr = tm.syncProtectedTGIDs()
 	c.kernelTGIDs = len(tm.protectedTGIDs)
+	c.untrusted = sortedKeys(tm.protectedUntrusted)
 	return c
 }

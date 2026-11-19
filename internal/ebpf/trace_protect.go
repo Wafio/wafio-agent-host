@@ -266,6 +266,10 @@ type procIdentity struct {
 	// cgroup: the systemd cgroup path of the process (see systemdCgroup). Read
 	// only for an exe that must run in a unit; "" when unreadable.
 	cgroup string
+
+	// untrusted: the file or directory an account other than root can write
+	// while the process runs that file (hostExeCheck); hostExe is triNo then.
+	untrusted string
 }
 
 // pfKthread is PF_KTHREAD (include/linux/sched.h), field 9 of /proc/<pid>/stat.
@@ -429,7 +433,7 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 		return id
 	}
 	id.hostMntNS = sameHostMountNS(procRoot, dir)
-	id.hostExe, _ = hostExeCheck(procRoot, dir, id.exe)
+	id.hostExe, id.untrusted = hostExeCheck(procRoot, dir, id.exe)
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
 	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {
@@ -609,13 +613,16 @@ func (p protectedTGID) image() (protectedImage, bool) {
 // (excluding pid<=1 and selfPID, which the kernel guards already) with their
 // start times. Unreadable entries are skipped: a process we cannot identify
 // here is still covered by the userspace guard at kill time, and one whose
-// start time cannot be read gets no kernel entry.
-func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) ([]protectedTGID, error) {
+// start time cannot be read gets no kernel entry. The second result lists the
+// paths an account other than root can write, for the processes that would be
+// protected if that were not so (hostExeCheck): they are left out of the first.
+func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) ([]protectedTGID, []string, error) {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []protectedTGID
+	var untrusted []string
 	for _, e := range entries {
 		pid, err := strconv.ParseUint(e.Name(), 10, 32)
 		if err != nil || pid <= 1 || int64(pid) == int64(selfPID) {
@@ -629,6 +636,12 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 			continue
 		}
 		if ok, _ := s.matchIdentity(id); !ok {
+			if id.untrusted != "" {
+				id.hostExe = triYes
+				if ok, _ := s.matchIdentity(id); ok {
+					untrusted = append(untrusted, id.untrusted)
+				}
+			}
 			continue
 		}
 		stat, err := os.ReadFile(filepath.Join(procDir(procRoot, uint32(pid)), "stat"))
@@ -643,7 +656,8 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 		_, configured := s.exes[exe]
 		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe]})
 	}
-	return out, nil
+	slices.Sort(untrusted)
+	return out, slices.Compact(untrusted), nil
 }
 
 // protectedImageDirs are the directories searched for the built-in and extra

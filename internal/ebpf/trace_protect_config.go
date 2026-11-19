@@ -334,7 +334,14 @@ type protectedSelfCheck struct {
 	// procDenied: the identity links of root daemons are unreadable
 	// (procIdentityDenied), so nothing beyond pid<=1 and the agent is protected.
 	procDenied bool
+	// untrusted: paths an account other than root can write, under protected
+	// processes that are therefore not protected (scanProtectedTGIDs).
+	untrusted []string
 }
+
+// protectedUntrustedHint names the fix on the log line and in the startup
+// warning.
+const protectedUntrustedHint = "make root the owner and remove group and other write"
 
 // protectedProcDeniedHint names the fix on the self-check line and in the
 // startup warning.
@@ -367,6 +374,9 @@ func (c protectedSelfCheck) String() string {
 	if len(c.risky) > 0 {
 		fmt.Fprintf(&b, " warning=risky_protected:%s", strings.Join(c.risky, ","))
 	}
+	if len(c.untrusted) > 0 {
+		fmt.Fprintf(&b, " untrusted_owner=%s", strings.Join(c.untrusted, ","))
+	}
 	if !c.kernelSet {
 		b.WriteString(" note=\"trace object predates the protected set; kernel kill paths skip only pid<=1 and the agent\"")
 	}
@@ -377,12 +387,16 @@ func (c protectedSelfCheck) String() string {
 }
 
 // Warning is the separate startup warning for a self-check that found the
-// protected set unenforceable; "" when there is none.
+// protected set unenforceable, one line for each cause; "" when there is none.
 func (c protectedSelfCheck) Warning() string {
-	if !c.procDenied {
-		return ""
+	var lines []string
+	if c.procDenied {
+		lines = append(lines, "WARNING: protected-process identity check denied: "+protectedProcDeniedHint)
 	}
-	return "WARNING: protected-process identity check denied: " + protectedProcDeniedHint
+	if len(c.untrusted) > 0 {
+		lines = append(lines, "WARNING: protected processes without protection, an account other than root can write "+strings.Join(c.untrusted, ", ")+": "+protectedUntrustedHint)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // traceProtectedMapName mirrors the trace object's protected-set map name for

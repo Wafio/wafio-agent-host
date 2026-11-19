@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -264,5 +265,53 @@ func TestRefreshOnTickRearmsTheWatch(t *testing.T) {
 	tm.refreshOnChange(w)
 	if len(images.data) != 1 {
 		t.Fatalf("after the replacement the map holds %d images, want the new one alone", len(images.data))
+	}
+}
+
+// A protected process whose file an account other than root can write is not
+// protected: the refresh says so once for each path, forgets a path that was
+// fixed and says so again when it comes back.
+func TestSyncProtectedTGIDsReportsUntrustedOwnerOnce(t *testing.T) {
+	const path = "/usr/local/bin/kubelet"
+	proc := fakeProc(t, map[uint32]fakeProcEntry{
+		700: {exe: path, comm: "kubelet", uid: "0", mntns: hostNS, start: 1234, untrusted: path},
+	})
+	var out bytes.Buffer
+	var ops []string
+	tm := &TraceManager{log: log.New(&out, "", 0), protected: NewProtectedProcessSet(nil, nil), procRoot: proc, protectedMap: newFakeKernelMap("tgids", 8, &ops)}
+	reports := func() int {
+		t.Helper()
+		if _, err := tm.syncProtectedTGIDs(); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Count(out.String(), path+" can be written by an account other than root")
+	}
+	if n := reports(); n != 1 {
+		t.Fatalf("the first scan reported the path %d times, want 1:\n%s", n, out.String())
+	}
+	if n := reports(); n != 1 {
+		t.Fatalf("the next scan reported it again (%d lines in all)", n)
+	}
+	if got := sortedKeys(tm.protectedUntrusted); !slices.Equal(got, []string{path}) {
+		t.Fatalf("untrusted set %v, want [%s]", got, path)
+	}
+	dir := filepath.Join(proc, "700")
+	if err := os.Remove(filepath.Join(dir, "fake_untrusted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fake_host_exe"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := reports(); n != 1 || len(tm.protectedUntrusted) != 0 {
+		t.Fatalf("after the fix: %d lines, untrusted %v, want the set empty", n, sortedKeys(tm.protectedUntrusted))
+	}
+	if err := os.Remove(filepath.Join(dir, "fake_host_exe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fake_untrusted"), []byte(path), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := reports(); n != 2 {
+		t.Fatalf("a path that came back was reported %d times in all, want 2", n)
 	}
 }

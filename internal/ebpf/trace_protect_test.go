@@ -229,6 +229,7 @@ type fakeProcEntry struct {
 	env       string // NUL-separated environ
 	mntns     string // ns/mnt link text; "" = none
 	hostExe   bool   // the fake host-binary check reports a match
+	untrusted string // the fake host-binary check reports this path as writable by others
 	start     uint64 // stat starttime ticks; 0 = no stat file (unless kthread)
 	kthread   bool   // stat flags carry PF_KTHREAD
 	cgroup    string // /proc/<pid>/cgroup content; "" = no file
@@ -274,6 +275,9 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 		if e.hostExe {
 			write(filepath.Join(dir, "fake_host_exe"), "")
 		}
+		if e.untrusted != "" {
+			write(filepath.Join(dir, "fake_untrusted"), e.untrusted)
+		}
 		if e.start != 0 || e.kthread {
 			var flags uint64
 			if e.kthread {
@@ -284,6 +288,9 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 	}
 	orig := hostExeCheck
 	hostExeCheck = func(_, dir, _ string) (tri, string) {
+		if path, err := os.ReadFile(filepath.Join(dir, "fake_untrusted")); err == nil {
+			return triNo, string(path)
+		}
 		_, err := os.Stat(filepath.Join(dir, "fake_host_exe"))
 		return triOf(err == nil), ""
 	}
@@ -358,8 +365,16 @@ func TestScanProtectedTGIDs(t *testing.T) {
 		113:  {exe: "/tmp/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1113, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
 		114:  {exe: "/opt/wafio/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1114, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
 		115:  {exe: "/opt/wafio/wafio-waf-agent", comm: "wafio-waf-agent", uid: "1000", mntns: hostNS, hostExe: true, start: 1115, cgroup: "0::/user.slice/user-1000.slice/session-3.scope\n"},
+		// Running the genuine file, but one an account other than root can write.
+		116: {exe: "/usr/local/bin/kubelet", comm: "kubelet", uid: "0", mntns: hostNS, start: 1116, untrusted: "/usr/local/bin/kubelet"},
+		117: {exe: "/usr/local/bin/kubelet", comm: "kubelet", uid: "0", mntns: hostNS, start: 1117, untrusted: "/usr/local/bin/kubelet"},
+		118: {exe: "/usr/sbin/sshd", comm: "sshd", uid: "0", mntns: hostNS, start: 1118, untrusted: "/usr/sbin"},
+		// Not protected for another reason as well: the path says nothing the operator can fix.
+		119: {exe: "/usr/sbin/sshd", comm: "sshd", uid: "1000", mntns: hostNS, start: 1119, untrusted: "/usr/sbin"},
+		120: {exe: "/usr/sbin/sshd", comm: "sshd", uid: "0", mntns: hostNS, start: 1120, untrusted: "/usr/sbin", env: "LD_PRELOAD=/tmp/x.so\x00"},
+		121: {exe: "/usr/local/bin/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, start: 1121, untrusted: "/usr/local/bin/wafio-waf-agent", cgroup: "0::/user.slice/user-1000.slice/session-3.scope\n"},
 	})
-	got, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
+	got, untrusted, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +394,13 @@ func TestScanProtectedTGIDs(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("protected tgids %v, want %v", got, want)
 	}
-	if _, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(filepath.Join(root, "missing"), self); err == nil {
+	// 116 to 118 would be protected but for the owner or mode: the path is listed
+	// once for both kubelets. A non-root sshd, a preloaded one and the agent
+	// outside its unit are not protected anyway.
+	if want := []string{"/usr/local/bin/kubelet", "/usr/sbin"}; !slices.Equal(untrusted, want) {
+		t.Fatalf("untrusted paths %v, want %v", untrusted, want)
+	}
+	if _, _, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(filepath.Join(root, "missing"), self); err == nil {
 		t.Fatal("missing proc root not reported")
 	}
 }
@@ -404,7 +425,7 @@ func TestProcIdentityDenied(t *testing.T) {
 		200: hostDaemon("/usr/sbin/sshd", "sshd", 500),
 	})
 	s := NewProtectedProcessSet(nil, nil)
-	if got, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 1 {
+	if got, _, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 1 {
 		t.Fatalf("readable scan = %v, %v; want sshd", got, err)
 	}
 	for _, pid := range []string{"1", "200"} {
@@ -419,7 +440,7 @@ func TestProcIdentityDenied(t *testing.T) {
 	}
 	// What the scan sees in that state: no identity, so no match — the
 	// failure the self-check must name instead of reporting 0 as healthy.
-	if got, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 0 {
+	if got, _, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 0 {
 		t.Fatalf("scan under denial = %v, %v", got, err)
 	}
 }

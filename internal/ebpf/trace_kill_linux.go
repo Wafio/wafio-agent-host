@@ -255,10 +255,11 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 	if err != nil {
 		withStart = false // no guard possible: fall back to the scan alone
 	}
-	tgids, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
+	tgids, untrusted, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
 	if err != nil {
 		return 0, err
 	}
+	tm.noteUntrusted(untrusted)
 	matched := len(tgids)
 	defer func() { tm.protectedCount.Store(i32FromInt(len(tm.protectedTGIDs))) }()
 	// Images first: an entry the refresh writes below must not meet an exec
@@ -312,6 +313,21 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 	tm.protectedTGIDs = have
 	tm.updateProtectedBudget(len(have))
 	return matched, nil
+}
+
+// noteUntrusted logs each path an account other than root can write when it is
+// first seen, and forgets the ones that were fixed, so a path that is made
+// writable again is logged again. Owned by protectedRefreshLoop, like the tgid
+// state.
+func (tm *TraceManager) noteUntrusted(paths []string) {
+	now := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		now[p] = struct{}{}
+		if _, seen := tm.protectedUntrusted[p]; !seen {
+			tm.log.Printf("%s can be written by an account other than root, so the protected process that runs from it is not protected: %s", p, protectedUntrustedHint)
+		}
+	}
+	tm.protectedUntrusted = now
 }
 
 // disableInheritWithoutExec turns fork inheritance off when the fork probe is

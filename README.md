@@ -187,7 +187,10 @@ that is group-writable, as `/usr/local/bin` is on some Debian hosts
 as it appears (at the next 5 s refresh), and one that is moved or replaced is
 watched again the same way. A WAF agent whose binary or directory an account
 other than root owns (an installer that hands `/opt/wafio` to the service
-account) is not protected and has no mark: leave both to root.
+account) is not protected and has no mark: leave both to root. The agent says so
+once in its log for each such path ("can be written by an account other than
+root"), at start with a warning too, and again if the path becomes writable
+again.
 
 The kernel checks the unit of the WAF agent and systemd-networkd at `exec` too.
 It keeps the mark only when the new process runs in a cgroup of the default
@@ -240,7 +243,10 @@ journalctl -u wafio-host-agent -b | grep 'protected-process self-check'
 ```
 
 `kernel_set=present` means the kernel side protects them too. `proc_access=denied`
-means the unit lacks `CAP_SYS_PTRACE`.
+means the unit lacks `CAP_SYS_PTRACE`. `untrusted_owner=<paths>` lists files or
+directories that an account other than root can write under a protected process:
+that process is not protected until root owns the path and neither its group nor
+others can write it.
 
 ### Memory use and map sizes
 

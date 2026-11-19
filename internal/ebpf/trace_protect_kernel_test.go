@@ -323,7 +323,7 @@ func TestZombieLeaderRenamedToDaemonIsNotProtected(t *testing.T) {
 	if reason := s.protectedPIDReason(root, 301, self, "dockerd"); reason != "" {
 		t.Fatalf("zombie leader named dockerd protected: %s", reason)
 	}
-	got, err := s.scanProtectedTGIDs(root, self)
+	got, _, err := s.scanProtectedTGIDs(root, self)
 	if err != nil {
 		t.Fatal(err)
 	}

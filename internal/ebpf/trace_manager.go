@@ -75,6 +75,9 @@ type TraceManager struct {
 	protectedTGIDs          map[uint32]uint64 // tgid → value written to protectedMap
 	protectedOverflowLogged bool
 	protectedCount          atomic.Int32 // len(protectedTGIDs), readable by Status
+	// protectedUntrusted: the paths the last scan found an account other than
+	// root can write under a process that would be protected otherwise.
+	protectedUntrusted map[string]struct{}
 	// protectedImagesMap is trace_protected_images: the file identities an exec
 	// may keep an entry for, each with the condition (root, a unit) the exec must
 	// meet. protectedImages is what was last written to it and
@@ -260,6 +263,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	tm.deferredEvents = make(map[uint32]TraceEvent)
 	tm.protectedMap = kernelMapOf(coll.Maps[traceMapProtected])
 	tm.protectedTGIDs = make(map[uint32]uint64)
+	tm.protectedUntrusted = nil
 	tm.protectedCount.Store(0)
 	tm.protectedBudgetMap = kernelMapOf(coll.Maps[traceMapProtectedBudget])
 	tm.protectedRefused.Store(0)
@@ -441,8 +445,10 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	if tm.execKeep {
 		tm.log.Printf("protected-process images: %d trusted files known to the kernel", len(tm.protectedImages))
 	}
-	if w := selfCheck.Warning(); w != "" {
-		tm.log.Print(w)
+	for _, line := range strings.Split(selfCheck.Warning(), "\n") {
+		if line != "" {
+			tm.log.Print(line)
+		}
 	}
 
 	childCtx, cancel := context.WithCancel(ctx)
