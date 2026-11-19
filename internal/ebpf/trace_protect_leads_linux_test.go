@@ -148,3 +148,32 @@ func TestRiskyEntriesNameTheFileASymlinkLeadsTo(t *testing.T) {
 		t.Fatalf("the self-check line lacks the symlinked paths: %q", line)
 	}
 }
+
+// A configured path is reported as written by an account other than root only
+// when something is at its end. A writable /usr/local (root:staff, mode 2775 on
+// older Debian) above a missing WAF agent names nothing, and the agent that is
+// there afterwards does.
+func TestMissingPathBehindWritableDirectoryIsNotReported(t *testing.T) {
+	_, rootPath := walkRoot(t)
+	proc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proc, "1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(rootPath, filepath.Join(proc, "1", "root")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		path string
+		want []string
+	}{
+		{"/loose/missing", nil},
+		{"/loose/inner/missing", nil},
+		{"/loose/inner/agentd", []string{"/loose"}},
+	} {
+		s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{tc.path}, ReplaceDefaults: true})
+		s.refreshExeLeads(proc)
+		if got := s.leads.Load().untrusted; !slices.Equal(got, tc.want) {
+			t.Errorf("%s: reported %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}

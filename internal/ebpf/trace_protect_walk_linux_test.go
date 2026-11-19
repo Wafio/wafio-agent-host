@@ -120,6 +120,7 @@ func TestTrustedWalk(t *testing.T) {
 		{path: "/loose/inner/agentd", untrusted: "/loose"},                          // a root-only directory below a writable one
 		{path: "/releases/v1/open", untrusted: "/releases/v1/open"},                 // the file itself is writable
 		{path: "/loose/missing", err: unix.ENOENT},                                  // a writable directory with no such entry names nothing
+		{path: "/loose/inner/missing", err: unix.ENOENT},                            // nor does one with a directory in it, and nothing at the end
 		{path: "/loop/a", err: unix.ELOOP},                                          // a loop
 		{path: "/chain40/l1", resolved: "/releases/v1/agentd"},                      // 40 links are followed
 		{path: "/chain41/l1", err: unix.ELOOP},                                      // the 41st is not

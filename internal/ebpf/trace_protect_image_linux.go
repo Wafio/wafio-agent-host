@@ -215,16 +215,18 @@ func walkPath(dirs []walkDir, name string) string {
 
 // trustedWalk resolves path inside the root rootFD refers to, one component at a
 // time, and returns an O_PATH descriptor of what it leads to, with where that is
-// in the root (no symlink left in it). Every directory a component is looked up
-// in must be root's alone (trustedOwnerMode), the ones that hold a symlink
-// included, and so must the file the path leads to. A symlink is followed only
-// when its directory passed: the target is spliced in front of the rest of the
-// path, an absolute one restarting at the root and ".." never climbing above it,
-// at most maxTrustedLinks times. It reads with openat, readlinkat and statx only,
-// so it needs no openat2.
+// in the root (no symlink left in it). It succeeds only when every directory a
+// component is looked up in is root's alone (trustedOwnerMode), the ones that
+// hold a symlink included, and so is the file the path leads to. The target of a
+// symlink is spliced in front of the rest of the path, an absolute one restarting
+// at the root and ".." never climbing above it, at most maxTrustedLinks times. It
+// reads with openat, readlinkat and statx only, so it needs no openat2.
 //
-// A directory or file that others can write ends the walk with an
-// *untrustedError naming it, unless the entry the walk looks for is not there.
+// Past a directory or file that others can write the walk goes on, to find out
+// whether the path leads anywhere, and cannot succeed any more: it gives an
+// *untrustedError naming the first such directory or file. It reads only the text
+// of symlinks and what exists, never a file's content. A path that leads nowhere
+// gives the error of the walk (ENOENT) and names nothing.
 func trustedWalk(rootFD int, path string) (int, string, error) {
 	top, err := unix.FcntlInt(uintptr(rootFD), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
@@ -244,6 +246,7 @@ func trustedWalk(rootFD int, path string) (int, string, error) {
 
 	todo := pathParts(path)
 	links := 0
+	stop := "" // the first directory or file on the way that others can write
 	for len(todo) > 0 {
 		name := todo[0]
 		todo = todo[1:]
@@ -255,13 +258,8 @@ func trustedWalk(rootFD int, path string) (int, string, error) {
 			}
 			continue
 		}
-		if !cur.ok {
-			// The directory matters only when the entry is in it.
-			var probe unix.Statx_t
-			if err := unix.Statx(cur.fd, name, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_TYPE, &probe); err != nil {
-				return -1, "", err
-			}
-			return -1, "", &untrustedError{walkPath(dirs, "")}
+		if !cur.ok && stop == "" {
+			stop = walkPath(dirs, "")
 		}
 		fd, err := unix.Openat(cur.fd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -295,18 +293,25 @@ func trustedWalk(rootFD int, path string) (int, string, error) {
 		case len(todo) > 0:
 			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
 			return -1, "", unix.ENOTDIR
-		case !entryTrusted(fd, &st):
-			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
-			return -1, "", &untrustedError{here}
 		default:
+			if stop == "" && !entryTrusted(fd, &st) {
+				stop = here
+			}
+			if stop != "" {
+				_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+				return -1, "", &untrustedError{stop}
+			}
 			return fd, here, nil
 		}
 	}
 	// The path named the root, or ended in "..": the directory it stands in.
 	cur := dirs[len(dirs)-1]
 	here := walkPath(dirs, "")
-	if !cur.ok {
-		return -1, "", &untrustedError{here}
+	if stop == "" && !cur.ok {
+		stop = here
+	}
+	if stop != "" {
+		return -1, "", &untrustedError{stop}
 	}
 	fd, err := unix.FcntlInt(uintptr(cur.fd), unix.F_DUPFD_CLOEXEC, 0)
 	return fd, here, err
