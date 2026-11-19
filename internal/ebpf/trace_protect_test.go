@@ -106,6 +106,7 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 	with := func(id procIdentity, f func(*procIdentity)) procIdentity { f(&id); return id }
 	// The WAF agent runs as a service account, so it is never root.
 	const wafExe, wafUnit = "/usr/local/bin/wafio-waf-agent", "/system.slice/wafio-waf-agent.service"
+	const wafBundleExe = "/opt/wafio/wafio-waf-agent" // where the WAF agent bundle installer puts it
 	waf := func(exe, cgroup string) procIdentity {
 		return with(hostRoot(exe, "wafio-waf-agent"), func(i *procIdentity) { i.rootUIDs = triNo; i.cgroup = cgroup })
 	}
@@ -164,6 +165,11 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"waf agent cgroup unreadable", waf(wafExe, ""), false},
 		{"waf agent preloaded", with(waf(wafExe, wafUnit), func(i *procIdentity) { i.preload = true }), false},
 		{"waf agent copy in tmp", waf("/tmp/wafio-waf-agent", wafUnit), false},
+		{"bundle waf agent in its unit", waf(wafBundleExe, wafUnit), true},
+		{"bundle waf agent deleted image in its unit", waf(wafBundleExe+" (deleted)", wafUnit), true},
+		{"bundle waf agent in a session scope", waf(wafBundleExe, "/user.slice/user-1000.slice/session-3.scope"), false},
+		{"bundle waf agent cgroup unreadable", waf(wafBundleExe, ""), false},
+		{"other binary in /opt/wafio", waf("/opt/wafio/other", wafUnit), false},
 		{"waf agent other image", with(waf(wafExe, wafUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
 		// systemd 255 and later: the helper between PID 1 and the service, as root.
 		{"systemd-executor", hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), true},
@@ -316,17 +322,20 @@ func TestScanProtectedTGIDs(t *testing.T) {
 		111:  {exe: "/usr/bin/cat", comm: "cat", uid: "1000", mntns: hostNS, hostExe: true, start: 1111},
 		112:  {exe: "/usr/bin/python3", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1112, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
 		113:  {exe: "/tmp/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1113, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
+		114:  {exe: "/opt/wafio/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1114, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
+		115:  {exe: "/opt/wafio/wafio-waf-agent", comm: "wafio-waf-agent", uid: "1000", mntns: hostNS, hostExe: true, start: 1115, cgroup: "0::/user.slice/user-1000.slice/session-3.scope\n"},
 	})
 	got, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
 	if err != nil {
 		t.Fatal(err)
 	}
 	slices.SortFunc(got, func(a, b protectedTGID) int { return int(a.tgid) - int(b.tgid) })
-	// Only 108 gets the kernel entry that marks its events verified: the WAF
-	// agent in its unit as a service account. 109 runs it from a session scope,
+	// Only 108 and 114 get the kernel entry that marks their events verified:
+	// the WAF agent in its unit as a service account, installed under
+	// /usr/local/bin or /opt/wafio. 109 and 115 run it from a session scope,
 	// 110 has no readable cgroup, 111 is another program, and 112 and 113 only
 	// carry its name (an interpreter, a copy in /tmp) from inside the unit.
-	want := []protectedTGID{{100, 1100}, {104, 1104}, {108, 1108}}
+	want := []protectedTGID{{100, 1100}, {104, 1104}, {108, 1108}, {114, 1114}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protected tgids %v, want %v", got, want)
 	}

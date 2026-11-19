@@ -83,7 +83,7 @@ func init() {
 	rootCmd.Flags().StringSliceVar(&cfg.ProtectedExePaths, flagProtectedExePaths, nil,
 		"absolute executable paths never killed by enforcement, comma-separated (env "+agent.EnvProtectedExePaths+")")
 	rootCmd.Flags().BoolVar(&cfg.ProtectedReplaceDefaults, flagProtectedReplaceDefaults, false,
-		"replace the built-in protected names and the WAF agent entry instead of extending them (env "+agent.EnvProtectedReplaceDefaults+")")
+		"replace the built-in protected names and both WAF agent paths instead of extending them (env "+agent.EnvProtectedReplaceDefaults+")")
 
 	// Local control/callback listener. Only used for ops callbacks from the
 	// control plane (block-ip, reload, etc.) — NOT for HTTP analysis.

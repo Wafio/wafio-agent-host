@@ -37,8 +37,11 @@ var DefaultProtectedProcessNames = []string{
 // takes a key file and an engine library from its own configuration, so the
 // path and the inode alone would let any local user run the genuine binary
 // and be trusted. Only root can put a process into a system.slice cgroup.
+// The unit installer puts the binary in /usr/local/bin; the installer in the
+// WAF agent bundle puts it in /opt/wafio and points the unit there.
 var DefaultProtectedUnitExes = map[string]string{
 	"/usr/local/bin/wafio-waf-agent": "wafio-waf-agent.service",
+	"/opt/wafio/wafio-waf-agent":     "wafio-waf-agent.service",
 }
 
 // trustedExeDirs: a protected NAME only counts when the executable lives in a
