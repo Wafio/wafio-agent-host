@@ -19,12 +19,39 @@ import (
 )
 
 // asTrustedOwner lets the test use files it owns: the owner the trust decision
-// asks for is root, which an unprivileged test run cannot be.
+// asks for is root, which an unprivileged test run cannot be. The trusted walk
+// also asks it of every directory above the files, and /tmp is writable by
+// everyone, so the temporary directory and the ones above it count as root's. A
+// umask of 022 keeps the directories the test makes from being group-writable.
 func asTrustedOwner(t *testing.T) {
 	t.Helper()
-	prev := trustedUID
+	prevUID, prevDirs := trustedUID, assumeTrustedDirs
 	trustedUID = uint32(os.Getuid())
-	t.Cleanup(func() { trustedUID = prev })
+	assumeTrustedDirs = dirsAbove(os.TempDir(), os.Getenv("WAFIO_TEST_IMAGE_DIR"))
+	prevMask := unix.Umask(0o022)
+	t.Cleanup(func() {
+		trustedUID, assumeTrustedDirs = prevUID, prevDirs
+		unix.Umask(prevMask)
+	})
+}
+
+// dirsAbove returns each of dirs and every directory above it, by real path.
+func dirsAbove(dirs ...string) map[string]bool {
+	out := make(map[string]bool)
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(d)
+		if err != nil {
+			continue
+		}
+		for ; real != "/"; real = filepath.Dir(real) {
+			out[real] = true
+		}
+		out["/"] = true
+	}
+	return out
 }
 
 // requireGeneration fails the test when the filesystem of path reports no inode
@@ -351,7 +378,7 @@ func TestOpenTrusted(t *testing.T) {
 		"/relative/agent":        {follow: true},
 		"/absolute/agent":        {follow: true},
 		"real/agent":             {follow: true, nosym: true}, // a relative spelling means the same
-		"/real/alias":            {},                          // the file itself is a symlink
+		"/real/alias":            {follow: true},              // the file itself is a symlink, in a directory only root can write
 		"/real/missing":          {},
 		"/real":                  {}, // a directory
 		"/escape/agent":          {}, // resolves to /outside inside the root: not there
@@ -369,12 +396,15 @@ func TestOpenTrusted(t *testing.T) {
 		}
 	}
 
-	// Without openat2 the walk refuses every symlink.
+	// Without openat2 a configured path still follows its symlinks (the trusted
+	// walk needs none), and the system directories still refuse every one.
 	noOpenat2 = true
 	t.Cleanup(func() { noOpenat2 = false })
-	for path, expect := range map[string]bool{"/real/agent": true, "/relative/agent": false, "/absolute/agent": false} {
-		if _, ok := imageAt(t, r, path, true); ok != expect {
-			t.Errorf("%s with the fallback: trusted %t, want %t", path, ok, expect)
+	for path, expect := range map[string][2]bool{"/real/agent": {true, true}, "/relative/agent": {true, false}, "/absolute/agent": {true, false}} {
+		for i, follow := range []bool{true, false} {
+			if _, ok := imageAt(t, r, path, follow); ok != expect[i] {
+				t.Errorf("%s with the fallback (follow symlinks %t): trusted %t, want %t", path, follow, ok, expect[i])
+			}
 		}
 	}
 	noOpenat2 = false
@@ -444,6 +474,17 @@ func startTicksOfPID(t *testing.T, pid int) uint64 {
 		t.Fatalf("no start time for pid %d", pid)
 	}
 	return ticks
+}
+
+// runningFile is the file the process directory dir shows as its image: what
+// the scan keeps of a verified process.
+func runningFile(t *testing.T, dir string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(dir, "exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
 }
 
 // kernelImages merges the trusted paths, the images of verified processes and
@@ -542,9 +583,10 @@ func TestKernelImagesMergesSources(t *testing.T) {
 	root := protectedImage{Flags: protectedImageRoot}
 	anyone := protectedImage{Flags: protectedImageAny}
 	waf, _ := unitImage("waf.service")
+	childFile, otherFile := runningFile(t, filepath.Join(proc, "500")), runningFile(t, filepath.Join(proc, "501"))
 	got := s.kernelImages(proc, []protectedTGID{
-		{tgid: 500, startTicks: ticks},                                             // by name: root
-		{tgid: 501, startTicks: otherTicks, configured: true, unit: "waf.service"}, // a configured path bound to a unit
+		{tgid: 500, startTicks: ticks, file: childFile},                                             // by name: root
+		{tgid: 501, startTicks: otherTicks, configured: true, unit: "waf.service", file: otherFile}, // a configured path bound to a unit
 	})
 	wafKey, ok := identityOf(wafd, "/proc/self/mountinfo")
 	if !ok {
@@ -573,9 +615,18 @@ func TestKernelImagesMergesSources(t *testing.T) {
 
 	// A file listed by two sources keeps what both say: the same image by a
 	// path that needs no root, and by a verified process of a name.
-	got = s.kernelImages(proc, []protectedTGID{{tgid: 500, startTicks: ticks}, {tgid: 500, startTicks: ticks, unit: "waf.service"}})
+	got = s.kernelImages(proc, []protectedTGID{{tgid: 500, startTicks: ticks, file: childFile}, {tgid: 500, startTicks: ticks, unit: "waf.service", file: childFile}})
 	if v := got[childKey]; v != (protectedImage{Flags: protectedImageRoot | protectedImageUnit, Unit: waf.Unit}) {
 		t.Errorf("the image of two verified processes: %+v, want root or the unit", v)
+	}
+	// A verified OpenSSH program also survives its own switch of user, and a
+	// name is searched in the system directories without symlinks all the same.
+	got = s.kernelImages(proc, []protectedTGID{{tgid: 500, startTicks: ticks, name: "sshd-session", file: childFile}})
+	if v := got[childKey]; v != (protectedImage{Flags: protectedImageRoot | protectedImageKeepOnSetuid}) {
+		t.Errorf("the image of a verified sshd-session: %+v, want root and keep on setuid", v)
+	}
+	if !systemDirOnly(protectedImage{Flags: protectedImageRoot | protectedImageKeepOnSetuid}) || systemDirOnly(protectedImage{Flags: protectedImageAny}) {
+		t.Error("a protected name is no longer searched without symlinks")
 	}
 	if got := (*ProtectedProcessSet)(nil).kernelImages(proc, nil); len(got) != 0 {
 		t.Errorf("nil set returned %v", got)
@@ -612,8 +663,9 @@ func TestKernelImagesChecksProcessStartTime(t *testing.T) {
 	if !ok {
 		t.Fatal("no identity for the child's image")
 	}
+	childFile := runningFile(t, fake)
 	run := func(recorded uint64) bool {
-		_, ok := s.kernelImages(proc, []protectedTGID{{tgid: 600, startTicks: recorded}})[childKey]
+		_, ok := s.kernelImages(proc, []protectedTGID{{tgid: 600, startTicks: recorded, file: childFile}})[childKey]
 		return ok
 	}
 
@@ -643,6 +695,112 @@ func TestKernelImagesChecksProcessStartTime(t *testing.T) {
 	}
 	if run(ticks) {
 		t.Error("the image of a process with no readable start time was used")
+	}
+}
+
+// A verified process lends the file the scan saw it run, and no other: exec
+// keeps the PID and the start time, so a process that ran another program since
+// the scan (the list may be seconds old when a file change starts the refresh)
+// must not put that program in the trusted set with the condition of the first.
+func TestKernelImagesIgnoresAProcessThatExecutedSinceTheScan(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	start := func(name string) *exec.Cmd {
+		t.Helper()
+		child := exec.Command(writeFile(t, filepath.Join(dir, name), sleepBinary(t), 0o755), "30")
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+		return child
+	}
+	scanned, executed := start("scanned"), start("executed")
+	ticks := startTicksOfPID(t, scanned.Process.Pid)
+
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(dir, "no-such-file")}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	fake := filepath.Join(proc, "600")
+	if err := os.MkdirAll(fake, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(fake, "stat"), string(statLine("scanned", ticks)), 0o644)
+	// run makes the fake process run the program of the live child pid.
+	run := func(pid int) {
+		t.Helper()
+		for _, name := range []string{"exe", "mountinfo"} {
+			_ = os.Remove(filepath.Join(fake, name))
+			if err := os.Symlink(filepath.Join("/proc", strconv.Itoa(pid), name), filepath.Join(fake, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	scannedKey, ok := identityOf(filepath.Join("/proc", strconv.Itoa(scanned.Process.Pid), "exe"), filepath.Join("/proc", strconv.Itoa(scanned.Process.Pid), "mountinfo"))
+	if !ok {
+		t.Fatal("no identity for the image of the scanned process")
+	}
+
+	run(scanned.Process.Pid)
+	verified := []protectedTGID{{tgid: 600, startTicks: ticks, name: "sshd", file: runningFile(t, fake)}}
+	if got := s.kernelImages(proc, verified); got[scannedKey] != rootImage("sshd") || len(got) != 1 {
+		t.Fatalf("the image of the process the scan verified: %+v, want %+v alone", got, rootImage("sshd"))
+	}
+	// The process runs another program now, with the PID and the start time the
+	// scan recorded: neither program is lent.
+	run(executed.Process.Pid)
+	if got := s.kernelImages(proc, verified); len(got) != 0 {
+		t.Errorf("the image of a process that executed since the scan was used: %+v", got)
+	}
+	// The scan recorded no image: nothing is lent.
+	run(scanned.Process.Pid)
+	if got := s.kernelImages(proc, []protectedTGID{{tgid: 600, startTicks: ticks, name: "sshd"}}); len(got) != 0 {
+		t.Errorf("the image of a process the scan recorded no file for was used: %+v", got)
+	}
+}
+
+// A process in the mount namespace of PID 1 uses its table: the fake process
+// has no mountinfo file and still gets its image. One in a namespace of its own
+// needs a table of its own, and is left out without one.
+func TestKernelImagesSharesMountTables(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	agent := writeFile(t, filepath.Join(dir, "agentd"), "agent", 0o755)
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(dir, "no-such-file")}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	fake := func(pid string) string {
+		t.Helper()
+		d := filepath.Join(proc, pid)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(agent, filepath.Join(d, "exe")); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(d, "stat"), string(statLine("agentd", 4242)), 0o644)
+		return d
+	}
+	// ns of 600 is PID 1's own: the same link text for mnt.
+	if err := os.Symlink("/proc/self/ns", filepath.Join(fake("600"), "ns")); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(fake("601"), "ns")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("mnt:[1]", filepath.Join(other, "mnt")); err != nil {
+		t.Fatal(err)
+	}
+	key, ok := identityOf(agent, "/proc/self/mountinfo")
+	if !ok {
+		t.Fatal("no identity for the agent file")
+	}
+
+	file := runningFile(t, filepath.Join(proc, "600"))
+	got := s.kernelImages(proc, []protectedTGID{{tgid: 600, startTicks: 4242, file: file}})
+	if v, ok := got[key]; !ok || v.Flags != protectedImageRoot {
+		t.Errorf("a process in the namespace of PID 1 has no image: %+v", got)
+	}
+	if got := s.kernelImages(proc, []protectedTGID{{tgid: 601, startTicks: 4242, file: file}}); len(got) != 0 {
+		t.Errorf("a process of another namespace with no table has an image: %+v", got)
 	}
 }
 
@@ -678,6 +836,7 @@ func TestKernelImagesNameDerivedPaths(t *testing.T) {
 // directory that does not exist yet or was replaced is watched once rearm finds
 // it.
 func TestWatchProtectedImages(t *testing.T) {
+	asTrustedOwner(t)
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "agentd")
 	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{exe}, ReplaceDefaults: true})
@@ -787,6 +946,7 @@ func TestWatchProtectedImages(t *testing.T) {
 // The watch looks at the directories of PID 1's root, not at the agent's own
 // view of the same names.
 func TestWatchProtectedImagesUsesPID1Root(t *testing.T) {
+	asTrustedOwner(t)
 	fakeRoot := t.TempDir()
 	proc := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(proc, "1"), 0o755); err != nil {
@@ -821,6 +981,217 @@ func TestWatchProtectedImagesUsesPID1Root(t *testing.T) {
 	// not a watch of something else.
 	if _, err := watchProtectedImages(s, filepath.Join(proc, "missing")); err == nil {
 		t.Fatal("a watch started without the root of PID 1")
+	}
+}
+
+// retargetLink points link at target the way a release switch does: a new link
+// renamed over the old one, in a directory nothing watches.
+func retargetLink(t *testing.T, link, target string) {
+	t.Helper()
+	if err := os.Symlink(target, link+".new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(link+".new", link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// signalAfterWriting makes a file appear at path and waits for the watch to
+// say so. It first drops the signals still pending, so only this write counts.
+func signalAfterWriting(t *testing.T, w *imageWatch, path string) {
+	t.Helper()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-w.changed:
+	default:
+	}
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.changed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("a file written at %s did not signal", path)
+	}
+}
+
+// A configured path that goes through a symlink is watched where the link leads
+// now: the link moves in a directory nobody watches, so only rearm can see it.
+func TestWatchFollowsRetargetedSymlink(t *testing.T) {
+	asTrustedOwner(t)
+	base := t.TempDir()
+	rel1, rel2 := filepath.Join(base, "rel1"), filepath.Join(base, "rel2")
+	for _, d := range []string{rel1, rel2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := filepath.Join(base, "current")
+	if err := os.Symlink(rel1, current); err != nil {
+		t.Fatal(err)
+	}
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(current, "agentd")}, ReplaceDefaults: true})
+	w, err := watchProtectedImages(s, selfProc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if n := w.rearm(); n != 0 {
+		t.Fatalf("rearm armed %d directories with nothing changed, want 0", n)
+	}
+
+	retargetLink(t, current, rel2)
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories after the link moved, want 1", n)
+	}
+	if n := w.armedDirs(); n != 1 {
+		t.Fatalf("%d directories armed, want 1", n)
+	}
+	signalAfterWriting(t, w, filepath.Join(rel2, "agentd"))
+	// The old release is not watched any more.
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-w.changed:
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(rel1, "agentd"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.changed:
+		t.Error("the old release still signals")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Two names for one directory share a watch: moving one of them leaves the
+// other watched.
+func TestWatchRetargetKeepsSharedWatch(t *testing.T) {
+	asTrustedOwner(t)
+	base := t.TempDir()
+	rel1, rel2 := filepath.Join(base, "rel1"), filepath.Join(base, "rel2")
+	for _, d := range []string{rel1, rel2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current, alias := filepath.Join(base, "current"), filepath.Join(base, "alias")
+	for _, link := range []string{current, alias} {
+		if err := os.Symlink(rel1, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(current, "agentd"), filepath.Join(alias, "agentd")}, ReplaceDefaults: true})
+	w, err := watchProtectedImages(s, selfProc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if n := w.armedDirs(); n != 2 {
+		t.Fatalf("%d directories armed, want 2", n)
+	}
+	retargetLink(t, current, rel2)
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories after one link moved, want 1", n)
+	}
+	signalAfterWriting(t, w, filepath.Join(rel1, "agentd"))
+	signalAfterWriting(t, w, filepath.Join(rel2, "agentd"))
+}
+
+// The image set reads a protected name from a directory only root can write in,
+// whatever the directories above it allow, as long as no symlink is on its path
+// (a 755 /usr/local/bin under a group-writable /usr/local). The watch follows
+// the same rule, or a file renamed into place there is seen only at the next
+// refresh.
+func TestWatchArmsADirectoryBehindAGroupWritableParent(t *testing.T) {
+	asTrustedOwner(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(base, "local")
+	dir := filepath.Join(parent, "bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	root := rootFD(t, "/")
+	if fd, _, err := trustedWalk(root, dir); err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("the walk of a configured path trusts a directory below a group-writable one")
+	}
+	if fd, ok := trustedDir(root, dir, false); !ok {
+		t.Fatal("a directory only root can write in is not trusted without symlinks")
+	} else {
+		_ = unix.Close(fd)
+	}
+
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ReplaceDefaults: true})
+	w, err := watchProtectedImages(s, selfProc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.mu.Lock()
+	w.dirs = append(w.dirs, dir)
+	w.names["sshd"] = struct{}{}
+	w.mu.Unlock()
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories, want 1", n)
+	}
+	signalAfterWriting(t, w, filepath.Join(dir, "sshd"))
+}
+
+// A configured path whose last part is a symlink has its file in another
+// directory: that directory is watched, for the name of the file, and a file
+// replaced there is a new image.
+func TestWatchFollowsTheFileASymlinkLeadsTo(t *testing.T) {
+	asTrustedOwner(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, release := filepath.Join(base, "bin"), filepath.Join(base, "release")
+	target := writeFile(t, filepath.Join(release, "agentd-1.2"), "agent", 0o755)
+	writeFile(t, filepath.Join(bin, "placeholder"), "x", 0o755)
+	if err := os.Symlink(target, filepath.Join(bin, "agentd")); err != nil {
+		t.Fatal(err)
+	}
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(bin, "agentd")}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	w, err := watchProtectedImages(s, proc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if n := w.armedDirs(); n != 1 {
+		t.Fatalf("%d directories armed, want the one of the path", n)
+	}
+	// Nothing is known of the lead before the first walk of the path.
+	if n := w.rearm(); n != 0 {
+		t.Fatalf("rearm armed %d directories before the path was walked, want 0", n)
+	}
+	s.refreshExeLeads(proc)
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories after the walk, want the one of the file", n)
+	}
+	signalAfterWriting(t, w, target)
+
+	// Another file in that directory is none of the watch's business.
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-w.changed:
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(release, "other"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.changed:
+		t.Error("an unrelated file in the directory of the target signalled")
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 

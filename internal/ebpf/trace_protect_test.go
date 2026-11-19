@@ -132,6 +132,10 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"deleted host ns", hostRoot("/usr/sbin/sshd (deleted)", "sshd"), true},
 		{"deleted other ns", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostMntNS = triNo }), false},
 		{"deleted ns unknown", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostMntNS = triUnknown }), false},
+		// The namespace is not identity either: the replaced image must be a file only root can write, on the filesystem of its directory.
+		{"deleted image not the host's", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"deleted image unverified", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostExe = triUnknown }), false},
+		{"deleted configured exe not the host's", with(hostRoot("/opt/acme/bin/agentd (deleted)", "agentd"), func(i *procIdentity) { i.hostExe = triNo }), false},
 		// Container image (or any other file) at a protected path: not the host binary.
 		{"container sshd", with(hostRoot("/usr/sbin/sshd", "sshd"), func(i *procIdentity) { i.hostExe = triNo; i.hostMntNS = triNo }), false},
 		{"host binary unverified", with(hostRoot("/usr/sbin/sshd", "sshd"), func(i *procIdentity) { i.hostExe = triUnknown }), false},
@@ -179,6 +183,7 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"bundle waf agent cgroup unreadable", waf(wafBundleExe, ""), false},
 		{"other binary in /opt/wafio", waf("/opt/wafio/other", wafUnit), false},
 		{"waf agent other image", with(waf(wafExe, wafUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"waf agent deleted image not the host's", with(waf(wafExe+" (deleted)", wafUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
 		// systemd 255 and later: the helper between PID 1 and the service, as root.
 		{"systemd-executor", hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), true},
 		{"systemd-executor non-root", with(hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), func(i *procIdentity) { i.rootUIDs = triNo }), false},
@@ -201,6 +206,7 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"networkd preloaded", with(networkd(netExe, netUnit), func(i *procIdentity) { i.preload = true }), false},
 		{"networkd copy in tmp", networkd("/tmp/systemd-networkd", netUnit), false},
 		{"networkd other image", with(networkd(netExe, netUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"networkd deleted image not the host's", with(networkd(netExe+" (deleted)", netUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
 		{"other systemd binary in its unit", networkd("/usr/lib/systemd/systemd-resolved", netUnit), false},
 		// Rejected configuration entries never match.
 		{"bad name", hostRoot("/usr/bin/bad/name", "name"), false},
@@ -223,9 +229,11 @@ type fakeProcEntry struct {
 	env       string // NUL-separated environ
 	mntns     string // ns/mnt link text; "" = none
 	hostExe   bool   // the fake host-binary check reports a match
+	untrusted string // the fake host-binary check reports this path as writable by others
 	start     uint64 // stat starttime ticks; 0 = no stat file (unless kthread)
 	kthread   bool   // stat flags carry PF_KTHREAD
 	cgroup    string // /proc/<pid>/cgroup content; "" = no file
+	ppid      uint32 // PPid line of the status file; 0 = no line
 }
 
 // fakeProc builds a /proc-like tree: <pid>/exe symlink (dangling is fine,
@@ -254,7 +262,11 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 			write(filepath.Join(dir, "comm"), e.comm+"\n")
 		}
 		if e.uid != "" {
-			write(filepath.Join(dir, "status"), "Name:\t"+e.comm+"\nUid:\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\nGid:\t0\t0\t0\t0\n")
+			ppid := ""
+			if e.ppid != 0 {
+				ppid = "PPid:\t" + strconv.FormatUint(uint64(e.ppid), 10) + "\n"
+			}
+			write(filepath.Join(dir, "status"), "Name:\t"+e.comm+"\n"+ppid+"Uid:\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\nGid:\t0\t0\t0\t0\n")
 		}
 		write(filepath.Join(dir, "environ"), e.env)
 		if e.cgroup != "" {
@@ -268,6 +280,9 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 		if e.hostExe {
 			write(filepath.Join(dir, "fake_host_exe"), "")
 		}
+		if e.untrusted != "" {
+			write(filepath.Join(dir, "fake_untrusted"), e.untrusted)
+		}
 		if e.start != 0 || e.kthread {
 			var flags uint64
 			if e.kthread {
@@ -277,9 +292,12 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 		}
 	}
 	orig := hostExeCheck
-	hostExeCheck = func(_, dir, _ string) tri {
+	hostExeCheck = func(_, dir, _ string, _ *exeWalk) (tri, string, os.FileInfo) {
+		if path, err := os.ReadFile(filepath.Join(dir, "fake_untrusted")); err == nil {
+			return triNo, string(path), nil
+		}
 		_, err := os.Stat(filepath.Join(dir, "fake_host_exe"))
-		return triOf(err == nil)
+		return triOf(err == nil), "", nil
 	}
 	t.Cleanup(func() { hostExeCheck = orig })
 	return root
@@ -352,8 +370,16 @@ func TestScanProtectedTGIDs(t *testing.T) {
 		113:  {exe: "/tmp/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1113, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
 		114:  {exe: "/opt/wafio/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: 1114, cgroup: "0::/system.slice/wafio-waf-agent.service\n"},
 		115:  {exe: "/opt/wafio/wafio-waf-agent", comm: "wafio-waf-agent", uid: "1000", mntns: hostNS, hostExe: true, start: 1115, cgroup: "0::/user.slice/user-1000.slice/session-3.scope\n"},
+		// Running the genuine file, but one an account other than root can write.
+		116: {exe: "/usr/local/bin/kubelet", comm: "kubelet", uid: "0", mntns: hostNS, start: 1116, untrusted: "/usr/local/bin/kubelet"},
+		117: {exe: "/usr/local/bin/kubelet", comm: "kubelet", uid: "0", mntns: hostNS, start: 1117, untrusted: "/usr/local/bin/kubelet"},
+		118: {exe: "/usr/sbin/sshd", comm: "sshd", uid: "0", mntns: hostNS, start: 1118, untrusted: "/usr/sbin"},
+		// Not protected for another reason as well: the path says nothing the operator can fix.
+		119: {exe: "/usr/sbin/sshd", comm: "sshd", uid: "1000", mntns: hostNS, start: 1119, untrusted: "/usr/sbin"},
+		120: {exe: "/usr/sbin/sshd", comm: "sshd", uid: "0", mntns: hostNS, start: 1120, untrusted: "/usr/sbin", env: "LD_PRELOAD=/tmp/x.so\x00"},
+		121: {exe: "/usr/local/bin/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, start: 1121, untrusted: "/usr/local/bin/wafio-waf-agent", cgroup: "0::/user.slice/user-1000.slice/session-3.scope\n"},
 	})
-	got, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
+	got, untrusted, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,16 +391,110 @@ func TestScanProtectedTGIDs(t *testing.T) {
 	// carry its name (an interpreter, a copy in /tmp) from inside the unit.
 	const wafUnit = "wafio-waf-agent.service"
 	want := []protectedTGID{
-		{tgid: 100, startTicks: 1100},
-		{tgid: 104, startTicks: 1104},
+		{tgid: 100, startTicks: 1100, name: "sshd"},
+		{tgid: 104, startTicks: 1104, name: "dockerd"},
 		{tgid: 108, startTicks: 1108, configured: true, unit: wafUnit},
 		{tgid: 114, startTicks: 1114, configured: true, unit: wafUnit},
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protected tgids %v, want %v", got, want)
 	}
-	if _, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(filepath.Join(root, "missing"), self); err == nil {
+	// 116 to 118 would be protected but for the owner or mode: the path is listed
+	// once for both kubelets. A non-root sshd, a preloaded one and the agent
+	// outside its unit are not protected anyway.
+	if want := []string{"/usr/local/bin/kubelet", "/usr/sbin"}; !slices.Equal(untrusted, want) {
+		t.Fatalf("untrusted paths %v, want %v", untrusted, want)
+	}
+	if _, _, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(filepath.Join(root, "missing"), self); err == nil {
 		t.Fatal("missing proc root not reported")
+	}
+}
+
+// In a cgroup namespace of its own the agent reads a unit outside it as
+// "/../../system.slice/<unit>", which never equals the unit's path. It asks
+// the unit's cgroup.procs under PID 1's root instead: a process the file lists
+// is a direct member, one it does not list is not, whatever its relative path
+// says.
+func TestUnitCheckInPrivateCgroupNamespace(t *testing.T) {
+	const self = 300
+	const unit = "wafio-waf-agent.service"
+	const relative = "0::/../../system.slice/" + unit + "\n"
+	waf := func(start uint64, cgroup string) fakeProcEntry {
+		return fakeProcEntry{exe: "/usr/local/bin/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: start, cgroup: cgroup}
+	}
+	build := func(t *testing.T, selfNS, procsDir, procs string) string {
+		t.Helper()
+		root := fakeProc(t, map[uint32]fakeProcEntry{
+			1:   hostDaemon("/usr/lib/systemd/systemd", "systemd", 1),
+			108: waf(1108, relative),
+			109: waf(1109, relative),
+		})
+		for dir, target := range map[string]string{"self": selfNS, "1": "cgroup:[4026531835]"} {
+			if err := os.MkdirAll(filepath.Join(root, dir, "ns"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(root, dir, "ns", "cgroup")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if procsDir != "" {
+			dir := filepath.Join(root, "1", "root", procsDir, "system.slice", unit)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(procs), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	tgids := func(root string) []uint32 {
+		t.Helper()
+		got, _, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pids []uint32
+		for _, p := range got {
+			pids = append(pids, p.tgid)
+		}
+		slices.Sort(pids)
+		return pids
+	}
+
+	// A private namespace: only the process the unit lists is protected.
+	for _, dir := range hostCgroupRoots {
+		root := build(t, "cgroup:[4026532500]", dir, "42\n108\n")
+		if got := tgids(root); !slices.Equal(got, []uint32{108}) {
+			t.Errorf("private namespace, unit listed under %s: protected %v, want [108]", dir, got)
+		}
+		if !unitCheckAvailable(root) {
+			t.Errorf("a readable system.slice under %s reported as unavailable", dir)
+		}
+	}
+	// No unit directory to ask, or none of the places has system.slice at all.
+	if got := tgids(build(t, "cgroup:[4026532500]", "", "")); len(got) != 0 {
+		t.Errorf("private namespace without a system.slice: protected %v, want none", got)
+	}
+	if unitCheckAvailable(build(t, "cgroup:[4026532500]", "", "")) {
+		t.Error("a private namespace with no readable system.slice reported as available")
+	}
+	// The same namespace as PID 1: the path in /proc/<pid>/cgroup, as before,
+	// and the file of the unit is not asked.
+	root := build(t, "cgroup:[4026531835]", "sys/fs/cgroup", "108\n109\n")
+	if got := tgids(root); len(got) != 0 {
+		t.Errorf("shared namespace, relative path: protected %v, want none", got)
+	}
+	if !unitCheckAvailable(build(t, "cgroup:[4026531835]", "", "")) {
+		t.Error("the shared namespace reported the unit check as unavailable")
+	}
+	for _, pid := range []string{"108", "109"} {
+		if err := os.WriteFile(filepath.Join(root, pid, "cgroup"), []byte("0::/system.slice/"+unit+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := tgids(root); !slices.Equal(got, []uint32{108, 109}) {
+		t.Errorf("shared namespace, exact path: protected %v, want [108 109]", got)
 	}
 }
 
@@ -398,7 +518,7 @@ func TestProcIdentityDenied(t *testing.T) {
 		200: hostDaemon("/usr/sbin/sshd", "sshd", 500),
 	})
 	s := NewProtectedProcessSet(nil, nil)
-	if got, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 1 {
+	if got, _, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 1 {
 		t.Fatalf("readable scan = %v, %v; want sshd", got, err)
 	}
 	for _, pid := range []string{"1", "200"} {
@@ -413,7 +533,7 @@ func TestProcIdentityDenied(t *testing.T) {
 	}
 	// What the scan sees in that state: no identity, so no match — the
 	// failure the self-check must name instead of reporting 0 as healthy.
-	if got, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 0 {
+	if got, _, err := s.scanProtectedTGIDs(denied, 4242); err != nil || len(got) != 0 {
 		t.Fatalf("scan under denial = %v, %v", got, err)
 	}
 }

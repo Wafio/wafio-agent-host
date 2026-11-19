@@ -231,6 +231,19 @@ func (s *ProtectedProcessSet) ExePaths() []string {
 	return sortedKeys(s.exes)
 }
 
+// unitExePaths returns the executable paths bound to a unit, sorted.
+func (s *ProtectedProcessSet) unitExePaths() []string {
+	if s == nil {
+		return nil
+	}
+	paths := make([]string, 0, len(s.units))
+	for p := range s.units {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
 // riskyProtectedNames are shells, interpreters and multi-call binaries.
 // Protecting one exempts every root process running that host binary from
 // Kill enforcement — which is what a post-exploitation shell or one-liner
@@ -264,7 +277,10 @@ func isRiskyProtectedName(basename string) bool {
 }
 
 // RiskyEntries returns the protected names and exe paths that name a shell,
-// interpreter or multi-call binary, sorted. The built-in names never do.
+// interpreter or multi-call binary, sorted. The built-in names never do. A path
+// whose own name is harmless counts when the file it leads to now is not, as a
+// symlink to busybox is: it is listed as "<path>-><file>" (refreshExeLeads must
+// have run).
 func (s *ProtectedProcessSet) RiskyEntries() []string {
 	if s == nil {
 		return nil
@@ -280,6 +296,13 @@ func (s *ProtectedProcessSet) RiskyEntries() []string {
 			out = append(out, p)
 		}
 	}
+	if leads := s.leads.Load(); leads != nil {
+		for target, p := range leads.byTarget {
+			if isRiskyProtectedName(filepath.Base(target)) && !isRiskyProtectedName(filepath.Base(p)) {
+				out = append(out, p+"->"+target)
+			}
+		}
+	}
 	slices.Sort(out)
 	return out
 }
@@ -290,7 +313,7 @@ func (s *ProtectedProcessSet) RiskyWarning() string {
 	if len(risky) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("WARNING protected-process set includes shells/interpreters [%s]: every root process running them is exempt from Kill enforcement; protect the daemon's own binary path instead",
+	return fmt.Sprintf("WARNING protected-process set includes shells/interpreters [%s]: every process running them is exempt from Kill enforcement (any user for a path, root for a name); protect the daemon's own binary path instead",
 		strings.Join(risky, ","))
 }
 
@@ -334,6 +357,32 @@ type protectedSelfCheck struct {
 	// procDenied: the identity links of root daemons are unreadable
 	// (procIdentityDenied), so nothing beyond pid<=1 and the agent is protected.
 	procDenied bool
+	// untrusted: paths an account other than root can write, under protected
+	// processes that are therefore not protected (scanProtectedTGIDs).
+	untrusted []string
+	// unitUnavailable: the executable paths bound to a unit when the unit of a
+	// process cannot be told (unitCheckAvailable): none of them is protected.
+	unitUnavailable []string
+}
+
+// protectedUnitCheckHint names the fix on the self-check line and in the
+// startup warning.
+const protectedUnitCheckHint = "the agent runs in a cgroup namespace of its own and PID 1's root shows no readable system.slice: run it in the host cgroup namespace"
+
+// protectedUntrustedHint names the fix on the log line and in the startup
+// warning.
+const protectedUntrustedHint = "make root the owner and remove group and other write"
+
+// protectedUntrustedDeletedHint replaces it for a path that ends in " (deleted)":
+// the file the process runs is gone from disk, so no chown or chmod reaches it.
+const protectedUntrustedDeletedHint = "find out how a file that an account other than root could write ran at this path, fix its directory and restart the process"
+
+// untrustedHint is the fix for one path of the untrusted list.
+func untrustedHint(path string) string {
+	if strings.HasSuffix(path, " (deleted)") {
+		return protectedUntrustedDeletedHint
+	}
+	return protectedUntrustedHint
 }
 
 // protectedProcDeniedHint names the fix on the self-check line and in the
@@ -367,6 +416,12 @@ func (c protectedSelfCheck) String() string {
 	if len(c.risky) > 0 {
 		fmt.Fprintf(&b, " warning=risky_protected:%s", strings.Join(c.risky, ","))
 	}
+	if len(c.untrusted) > 0 {
+		fmt.Fprintf(&b, " untrusted_owner=%s", strings.Join(c.untrusted, ","))
+	}
+	if len(c.unitUnavailable) > 0 {
+		fmt.Fprintf(&b, " unit_check=unavailable hint=%q", protectedUnitCheckHint)
+	}
 	if !c.kernelSet {
 		b.WriteString(" note=\"trace object predates the protected set; kernel kill paths skip only pid<=1 and the agent\"")
 	}
@@ -377,12 +432,29 @@ func (c protectedSelfCheck) String() string {
 }
 
 // Warning is the separate startup warning for a self-check that found the
-// protected set unenforceable; "" when there is none.
+// protected set unenforceable, one line for each cause; "" when there is none.
 func (c protectedSelfCheck) Warning() string {
-	if !c.procDenied {
-		return ""
+	var lines []string
+	if c.procDenied {
+		lines = append(lines, "WARNING: protected-process identity check denied: "+protectedProcDeniedHint)
 	}
-	return "WARNING: protected-process identity check denied: " + protectedProcDeniedHint
+	var live, replaced []string
+	for _, p := range c.untrusted {
+		if untrustedHint(p) == protectedUntrustedHint {
+			live = append(live, p)
+		} else {
+			replaced = append(replaced, p)
+		}
+	}
+	for _, paths := range [][]string{live, replaced} {
+		if len(paths) > 0 {
+			lines = append(lines, "WARNING: protected processes without protection, an account other than root can write "+strings.Join(paths, ", ")+": "+untrustedHint(paths[0]))
+		}
+	}
+	if len(c.unitUnavailable) > 0 {
+		lines = append(lines, "WARNING: protected-process unit check unavailable, not protected: "+strings.Join(c.unitUnavailable, ", ")+": "+protectedUnitCheckHint)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // traceProtectedMapName mirrors the trace object's protected-set map name for

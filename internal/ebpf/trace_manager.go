@@ -75,6 +75,9 @@ type TraceManager struct {
 	protectedTGIDs          map[uint32]uint64 // tgid → value written to protectedMap
 	protectedOverflowLogged bool
 	protectedCount          atomic.Int32 // len(protectedTGIDs), readable by Status
+	// protectedUntrusted: the paths the last scan found an account other than
+	// root can write under a process that would be protected otherwise.
+	protectedUntrusted map[string]struct{}
 	// protectedImagesMap is trace_protected_images: the file identities an exec
 	// may keep an entry for, each with the condition (root, a unit) the exec must
 	// meet. protectedImages is what was last written to it and
@@ -103,8 +106,8 @@ type TraceManager struct {
 	links         []link.Link
 	linkNames     []string
 	probeFailures map[string]string
-	// probesAbsent: mayBeAbsent probes whose tracepoint this kernel lacks
-	// (not expected, not failures).
+	// probesAbsent: mayBeAbsent probes whose tracepoint this kernel lacks, and
+	// maintenance probes the object lacks (not expected, not failures).
 	probesAbsent int
 
 	// ringbuf reader
@@ -260,6 +263,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	tm.deferredEvents = make(map[uint32]TraceEvent)
 	tm.protectedMap = kernelMapOf(coll.Maps[traceMapProtected])
 	tm.protectedTGIDs = make(map[uint32]uint64)
+	tm.protectedUntrusted = nil
 	tm.protectedCount.Store(0)
 	tm.protectedBudgetMap = kernelMapOf(coll.Maps[traceMapProtectedBudget])
 	tm.protectedRefused.Store(0)
@@ -334,12 +338,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 		}
 		prog := coll.Programs[probe.funcName]
 		if prog == nil {
-			reason := "program missing from BPF object"
-			if r, ok := droppedReason[probe.funcName]; ok {
-				reason = r
-			}
-			tm.probeFailures[probe.name] = reason
-			tm.log.Printf("trace program %q not available (%s), skipping", probe.funcName, reason)
+			tm.noteMissingProgram(probe, droppedReason)
 			continue
 		}
 
@@ -433,6 +432,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	// first kernel-map sync as a self-check line deploy verification greps
 	// for. Runs before protectedRefreshLoop starts (it owns that state).
 	tm.log.Printf("protected-process set: %s", tm.protected.Summary())
+	tm.protected.refreshExeLeads(tm.proc()) // the warning below names a symlink by the file it leads to
 	if w := tm.protected.RiskyWarning(); w != "" {
 		tm.log.Print(w)
 	}
@@ -441,8 +441,10 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	if tm.execKeep {
 		tm.log.Printf("protected-process images: %d trusted files known to the kernel", len(tm.protectedImages))
 	}
-	if w := selfCheck.Warning(); w != "" {
-		tm.log.Print(w)
+	for _, line := range strings.Split(selfCheck.Warning(), "\n") {
+		if line != "" {
+			tm.log.Print(line)
+		}
 	}
 
 	childCtx, cancel := context.WithCancel(ctx)
@@ -776,6 +778,24 @@ func (tm *TraceManager) DrainEnforcementLog(limit int) []EnforcementLogEntry {
 
 func (tm *TraceManager) ClearEnforcementLog() {
 	tm.policyEngine.ClearEnforcementLog()
+}
+
+// noteMissingProgram records a probe whose program the loaded object does not
+// have. It is a failed probe, except for a maintenance program that an object of
+// an earlier release lacks: that loses no event, so it is neither expected nor
+// failed. A program the verifier rejected is always a failure.
+func (tm *TraceManager) noteMissingProgram(probe traceProbe, droppedReason map[string]string) {
+	reason, rejected := droppedReason[probe.funcName]
+	if probe.maintenance && !rejected {
+		tm.probesAbsent++
+		tm.log.Printf("trace program %q is not in the BPF object, skipping", probe.funcName)
+		return
+	}
+	if !rejected {
+		reason = "program missing from BPF object"
+	}
+	tm.probeFailures[probe.name] = reason
+	tm.log.Printf("trace program %q not available (%s), skipping", probe.funcName, reason)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

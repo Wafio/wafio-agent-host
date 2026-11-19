@@ -14,6 +14,7 @@ type mapIterator interface {
 // stand in for the kernel and look at what is written, and in which order.
 type kernelMap interface {
 	ValueSize() uint32
+	MaxEntries() uint32
 	Update(key, value any, flags ebpf.MapUpdateFlags) error
 	Delete(key any) error
 	Lookup(key, valueOut any) error

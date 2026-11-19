@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -67,6 +68,18 @@ var trustedExeDirs = []string{
 	"/usr/local/sbin/", "/usr/local/bin/", "/snap/",
 }
 
+// trustedUID is the owner a trusted file and its directory must have. It is 0;
+// a test that builds its files as an unprivileged user sets its own UID.
+var trustedUID uint32
+
+// trustedOwnerMode reports whether a file with this owner and permission bits
+// could only have been written by root: owned by trustedUID and writable by
+// neither its group nor others. Anyone else who can write the file, or its
+// directory, can replace a trusted binary with one of their own.
+func trustedOwnerMode(uid uint32, perm uint32) bool {
+	return uid == trustedUID && perm&0o022 == 0
+}
+
 // taskCommLen mirrors TASK_COMM_LEN: the kernel keeps 15 bytes + NUL.
 const taskCommLen = 16
 
@@ -81,8 +94,8 @@ const maxProtectedTGIDs = 1024
 const maxProtectedImages = 1024
 
 // Flags of a trace_protected_images value (TRACE_PROTECTED_IMAGE_* in
-// wafio_trace.c). They are alternatives: an exec keeps the entry when any one
-// holds, and a value with none keeps nothing.
+// wafio_trace.c). Any, Root and Unit are alternatives: an exec keeps the entry
+// when any one holds, and a value with none keeps nothing.
 const (
 	// protectedImageAny keeps the entry for any task: a configured exe path,
 	// which needs no root.
@@ -92,7 +105,27 @@ const (
 	// protectedImageUnit keeps it when the task runs in the systemd unit named
 	// in the value: the WAF agent and systemd-networkd.
 	protectedImageUnit
+	// protectedImageKeepOnSetuid keeps it through the exit of setuid, setreuid
+	// and setresuid, whoever the task is then. Exec ignores it.
+	protectedImageKeepOnSetuid
 )
+
+// userSwitchNames are the OpenSSH programs that drop root themselves and then
+// call setgid(0) and setuid(0) to check that root cannot come back. The control
+// plane downgrades those two events only for a verified process, so these
+// images keep the mark through their own switch of user.
+var userSwitchNames = map[string]struct{}{"sshd": {}, "sshd-session": {}, "sshd-auth": {}}
+
+// rootImage is the value for a protected name found in a system directory: the
+// entry survives an exec for root, and a switch of user too for the OpenSSH
+// names.
+func rootImage(name string) protectedImage {
+	img := protectedImage{Flags: protectedImageRoot}
+	if _, ok := userSwitchNames[name]; ok {
+		img.Flags |= protectedImageKeepOnSetuid
+	}
+	return img
+}
 
 // protectedUnitLen mirrors TRACE_UNIT_NAME_LEN. The kernel reads a cgroup name
 // into a buffer that long and cuts a longer one to protectedUnitLen-1 bytes, so
@@ -185,12 +218,15 @@ func protectedInheritBudget(entries int, execKeep bool) int64 {
 }
 
 // ProtectedProcessSet decides whether a process may be targeted by enforcement.
-// Immutable after construction; safe for concurrent use.
+// Immutable after construction except leads; safe for concurrent use.
 type ProtectedProcessSet struct {
 	names map[string]struct{} // executable basenames (full, untruncated)
 	comms map[string]struct{} // same names truncated to TASK_COMM_LEN-1
 	exes  map[string]struct{} // exact executable paths
 	units map[string]string   // exe path -> system unit it must run in
+
+	// leads is what the last refreshExeLeads found. Replaced as a whole.
+	leads atomic.Pointer[exeLeads]
 
 	defaultsReplaced bool // DefaultProtectedProcessNames dropped by configuration
 }
@@ -200,6 +236,74 @@ func truncateComm(name string) string {
 		return name[:taskCommLen-1]
 	}
 	return name
+}
+
+// exeLeads is what refreshExeLeads found for the configured exe paths.
+type exeLeads struct {
+	// byTarget maps the file a configured path leads to now, inside PID 1's root,
+	// to that path, for each one that goes through a symlink: /proc/<pid>/exe
+	// shows the resolved path, never the configured one.
+	byTarget map[string]string
+	// untrusted names the directories and files an account other than root can
+	// write that stopped the walk of a configured path with something at its end:
+	// such a path has no lead and no image.
+	untrusted []string
+	// walked is the walk of each configured path, which also decides whether a
+	// running process is the file at that path (hostExeCheck).
+	walked map[string]exeWalk
+}
+
+// exeWalk is what refreshExeLeads found for one configured path by walking it
+// inside PID 1's root.
+type exeWalk struct {
+	// lead is where the path leads now, with no symlink left in it; "" when the
+	// walk found no file and no directory to name.
+	lead string
+	// file is the file at lead, set when the walk reached it and the file and
+	// every directory on the way belong to root alone.
+	file os.FileInfo
+	// dir is the directory that holds lead, set when the walk to it passed on the
+	// same terms. A replaced image has no file at the path: it is compared with
+	// this directory.
+	dir os.FileInfo
+	// untrusted is the directory or file that stopped the walk of the path, dirStop
+	// the one that stopped the walk of its directory.
+	untrusted, dirStop string
+}
+
+// walkOf is the walk of exe when exe is a configured path, nil when it is not.
+// A path that has not been walked yet has an empty walk, which verifies nothing.
+func (s *ProtectedProcessSet) walkOf(exe string) *exeWalk {
+	if _, ok := s.exes[exe]; !ok {
+		return nil
+	}
+	if leads := s.leads.Load(); leads != nil {
+		if w, ok := leads.walked[exe]; ok {
+			return &w
+		}
+	}
+	return &exeWalk{}
+}
+
+// configuredLink maps an exe link that is the file a configured symlinked path
+// leads to onto that path. Any other link is returned as it is.
+func (s *ProtectedProcessSet) configuredLink(link string) string {
+	if s == nil {
+		return link
+	}
+	leads := s.leads.Load()
+	if leads == nil {
+		return link
+	}
+	exe, deleted := protectedExeCandidate(link)
+	configured, ok := leads.byTarget[exe]
+	switch {
+	case !ok:
+		return link
+	case deleted:
+		return configured + " (deleted)"
+	}
+	return configured
 }
 
 // tri is a three-valued check result: a check that could not be performed is
@@ -223,19 +327,20 @@ func triOf(ok bool) tri {
 // process. exe and comm are always read; the verification fields are read only
 // for a process whose exe names a protected binary (see readProcIdentity).
 type procIdentity struct {
-	exe  string // /proc/<pid>/exe link text; "" when unreadable
+	exe  string // /proc/<pid>/exe link text, or the configured path it is the target of (configuredLink); "" when unreadable
 	comm string
 
 	// hostExe: the running image is the very file at the same path in the
-	// host's mount namespace (same device and inode), and that file and its
-	// directory belong to root and are writable by no one else. A path string
-	// alone is not identity: in a container /usr/sbin/sshd is whatever the image
-	// put there, and an account that can write the file or its directory can
-	// put its own copy at a trusted path.
+	// host's mount namespace (same device and inode), or, for a replaced image,
+	// a file on the filesystem of the directory the path names, and that file
+	// and its directory belong to root and are writable by no one else. A path
+	// string alone is not identity: in a container /usr/sbin/sshd is whatever
+	// the image put there, and an account that can write the file or its
+	// directory can put its own copy at a trusted path.
 	hostExe tri
-	// hostMntNS: the process shares pid 1's mount namespace. Used for a
-	// replaced-on-disk image ("(deleted)"), whose inode no longer exists at
-	// the path, unless the path is bound to a unit.
+	// hostMntNS: the process shares pid 1's mount namespace. A replaced-on-disk
+	// image ("(deleted)") at a path that is bound to no unit needs it on top of
+	// hostExe: nothing is at the path to compare the inode with.
 	hostMntNS tri
 	// rootUIDs: real, effective, saved and filesystem UID are all 0. An
 	// unprivileged user can run a genuine, non-setuid protected binary, but
@@ -250,9 +355,18 @@ type procIdentity struct {
 	// whose live threads renamed themselves.
 	kthread tri
 
-	// cgroup: the systemd cgroup path of the process (see systemdCgroup). Read
-	// only for an exe that must run in a unit; "" when unreadable.
+	// cgroup: the cgroup path of the process in the form matchIdentity compares
+	// (see unitCgroup). Read only for an exe that must run in a unit; "" when
+	// unreadable or not in that unit.
 	cgroup string
+
+	// untrusted: the file or directory an account other than root can write
+	// while the process runs that file (hostExeCheck); hostExe is triNo then.
+	untrusted string
+
+	// exeFile is the running image hostExeCheck judged, nil when it could not be
+	// read.
+	exeFile os.FileInfo
 }
 
 // pfKthread is PF_KTHREAD (include/linux/sched.h), field 9 of /proc/<pid>/stat.
@@ -277,10 +391,11 @@ func kernelThread(statPath string) tri {
 //
 // exe is authoritative when known: comm is ignored then, because it is
 // attacker-controlled. A protected exe path counts only when the process is
-// verifiably that host binary (hostExe, or hostMntNS for a replaced image),
-// runs without a loader injection, runs in its own unit when the set names one
-// for that path (units, which also stands in for the mount namespace check on a
-// replaced image), and, for the built-in name list, runs as root. Any
+// verifiably that host binary (hostExe, and hostMntNS too for a replaced image
+// at a path bound to no unit), runs without a loader injection, runs in its own
+// unit when the set names one for that path (units, which also stands in for
+// the mount namespace check on a replaced image), and, for the built-in name
+// list, runs as root. Any
 // failed or impossible verification means NOT protected: the protection exists
 // to keep host daemons alive, and must not become a way for the processes a
 // Kill policy targets to exempt themselves.
@@ -318,7 +433,8 @@ func (s *ProtectedProcessSet) matchIdentity(id procIdentity) (bool, string) {
 		if _, bound := s.units[exe]; !bound && id.hostMntNS != triYes {
 			return false, ""
 		}
-	} else if id.hostExe != triYes {
+	}
+	if id.hostExe != triYes {
 		return false, ""
 	}
 	if unit, ok := s.units[exe]; ok && id.cgroup != "/system.slice/"+unit {
@@ -392,8 +508,10 @@ func procDir(procRoot string, pid uint32) string {
 func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) procIdentity {
 	var id procIdentity
 	dir := procDir(procRoot, pid)
+	var link string // what /proc/<pid>/exe says; id.exe may name the configured path instead
 	if target, err := os.Readlink(filepath.Join(dir, "exe")); err == nil {
-		id.exe = target
+		link = target
+		id.exe = s.configuredLink(target)
 	}
 	if data, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil {
 		id.comm = strings.TrimRight(string(data), "\n\x00")
@@ -413,16 +531,75 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 	if !s.isCandidate(id.exe) {
 		return id
 	}
+	exe, _ := protectedExeCandidate(id.exe)
 	id.hostMntNS = sameHostMountNS(procRoot, dir)
-	if exe, deleted := protectedExeCandidate(id.exe); !deleted {
-		id.hostExe = hostExeCheck(procRoot, dir, exe)
-	}
+	id.hostExe, id.untrusted, id.exeFile = hostExeCheck(procRoot, dir, link, s.walkOf(exe))
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
-	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {
-		id.cgroup = systemdCgroup(filepath.Join(dir, "cgroup"))
+	if s.units[exe] != "" {
+		id.cgroup = unitCgroup(procRoot, dir, pid, s.units[exe])
 	}
 	return id
+}
+
+// hostCgroupRoots are the places, inside PID 1's root, where the hierarchy
+// that systemd places its units in is mounted: the unified one, or the named
+// systemd hierarchy of a hybrid or v1 host.
+var hostCgroupRoots = []string{"sys/fs/cgroup", "sys/fs/cgroup/unified", "sys/fs/cgroup/systemd"}
+
+// sharesHostCgroupNS reports whether this process is in the cgroup namespace of
+// PID 1. /proc/<pid>/cgroup is rendered relative to the reader's namespace root,
+// so from a private one a unit outside it reads "/../../system.slice/<unit>".
+// A link that cannot be read counts as shared: PID 1's links are gated like its
+// exe link, and procIdentityDenied reports that case.
+func sharesHostCgroupNS(procRoot string) bool {
+	own, err := os.Readlink(filepath.Join(procRoot, "self", "ns", "cgroup"))
+	if err != nil {
+		return true
+	}
+	host, err := os.Readlink(filepath.Join(procRoot, "1", "ns", "cgroup"))
+	if err != nil {
+		return true
+	}
+	return own == host
+}
+
+// unitCgroup returns the cgroup of the process in the form matchIdentity
+// compares. In the namespace of PID 1 that is the path in /proc/<pid>/cgroup.
+// In a private one it is "/system.slice/<unit>" when the cgroup.procs of that
+// unit under PID 1's root lists the process (a direct member, which the exact
+// path says too) and "" when it does not: that file does not depend on the
+// reader's namespace.
+func unitCgroup(procRoot, dir string, pid uint32, unit string) string {
+	if sharesHostCgroupNS(procRoot) {
+		return systemdCgroup(filepath.Join(dir, "cgroup"))
+	}
+	for _, root := range hostCgroupRoots {
+		data, err := os.ReadFile(filepath.Join(procRoot, "1", "root", root, "system.slice", unit, "cgroup.procs"))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err == nil && slices.Contains(strings.Fields(string(data)), strconv.FormatUint(uint64(pid), 10)) {
+			return "/system.slice/" + unit
+		}
+		return ""
+	}
+	return ""
+}
+
+// unitCheckAvailable reports whether the unit of a protected path can be told:
+// the agent shares PID 1's cgroup namespace, or PID 1's root shows a
+// system.slice directory the agent can read.
+func unitCheckAvailable(procRoot string) bool {
+	if sharesHostCgroupNS(procRoot) {
+		return true
+	}
+	for _, root := range hostCgroupRoots {
+		if _, err := os.Stat(filepath.Join(procRoot, "1", "root", root, "system.slice")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // systemdCgroup returns the cgroup path from a /proc/<pid>/cgroup file: the
@@ -474,31 +651,86 @@ func sameHostMountNS(procRoot, dir string) tri {
 }
 
 // hostExeCheck reports whether the running image of the process in dir is the
-// file at exe in the host's filesystem (procRoot/1/root, so an agent running in
-// a container with the host PID namespace compares against the host view), and
+// host's file for the exe link text (procRoot/1/root, so an agent running in a
+// container with the host PID namespace compares against the host view), and
 // whether that file and its directory could only have been put there by root
 // (trustedFile): a file an unprivileged account owns, or can replace through
 // its directory, is not a host binary however it got its name.
 // /proc/<pid>/exe is a magic link: stat follows it to the real inode whatever
-// mount namespace the process lives in. A variable so tests can substitute it.
-var hostExeCheck = func(procRoot, dir, exe string) tri {
+// mount namespace the process lives in, a replaced one included. A replaced
+// image has no file at the path to compare with, so it passes when it is on the
+// filesystem of the directory the path names. The string is the path that an
+// account other than root can write, set only when the running image is that
+// file (or, for a replaced image, on that filesystem).
+//
+// walk is the walk of the configured path the process is matched by, nil for a
+// process matched by name. A configured path is judged by that walk and by
+// nothing else (configuredExeCheck), and the string then names what stopped the
+// walk: a directory above the last one that an account other than root can write
+// could show the agent a view of the path that root never made. The file is the
+// running image that was judged, nil when it cannot be read: a later read of the
+// image is the same file only if the process did not exec in between. A variable
+// so tests can substitute it.
+var hostExeCheck = func(procRoot, dir, link string, walk *exeWalk) (tri, string, os.FileInfo) {
 	running, err := os.Stat(filepath.Join(dir, "exe"))
 	if err != nil {
-		return triUnknown
+		return triUnknown, "", nil
+	}
+	ok, path := runningIsHostExe(procRoot, running, link, walk)
+	return ok, path, running
+}
+
+// runningIsHostExe is hostExeCheck for the running image, once it is read.
+func runningIsHostExe(procRoot string, running os.FileInfo, link string, walk *exeWalk) (tri, string) {
+	exe, deleted := protectedExeCandidate(link)
+	if walk != nil {
+		return configuredExeCheck(running, link, deleted, walk)
 	}
 	hostPath := filepath.Join(procRoot, "1", "root", exe)
-	host, err := os.Stat(hostPath)
-	if err != nil {
-		return triNo // no such host file: the image is not a host binary
-	}
-	if !os.SameFile(running, host) {
-		return triNo
-	}
 	parent, err := os.Stat(filepath.Dir(hostPath))
 	if err != nil {
-		return triNo
+		return triNo, "" // no such host directory: the image is not a host binary
 	}
-	return triOf(trustedFile(host) && trustedFile(parent))
+	if deleted {
+		if !sameDevice(running, parent) {
+			return triNo, ""
+		}
+	} else {
+		host, err := os.Stat(hostPath)
+		if err != nil || !os.SameFile(running, host) {
+			return triNo, ""
+		}
+	}
+	switch {
+	case !trustedFile(running):
+		return triNo, link
+	case !trustedFile(parent):
+		return triNo, filepath.Dir(exe)
+	}
+	return triYes, ""
+}
+
+// configuredExeCheck is hostExeCheck for a process matched by a configured path:
+// running must be the file that the walk of the path reached, where the file and
+// every directory on the way are root's alone. A replaced image has no file at
+// the path: it passes when it is on the filesystem of the directory that held it
+// (walk.dir, reached on the same terms) and is root's alone itself. The string
+// names what stopped the walk, or the replaced image that an account other than
+// root could write.
+func configuredExeCheck(running fs.FileInfo, link string, deleted bool, walk *exeWalk) (tri, string) {
+	switch {
+	case deleted && walk.dir == nil:
+		return triNo, walk.dirStop
+	case deleted && !sameDevice(running, walk.dir):
+		return triNo, ""
+	case deleted && !trustedFile(running):
+		return triNo, link
+	case deleted:
+		return triYes, ""
+	case walk.file == nil:
+		return triNo, walk.untrusted
+	}
+	return triOf(os.SameFile(running, walk.file)), ""
 }
 
 // rootUIDs parses the "Uid:" line of /proc/<pid>/status (real, effective,
@@ -562,6 +794,13 @@ type protectedTGID struct {
 	// unit: the systemd unit the exe path is bound to ("" when it is not), so
 	// the image this process runs keeps the entry only inside that unit.
 	unit string
+	// name: the basename of the executable of a process matched by name; ""
+	// for one matched by a configured path.
+	name string
+	// file is the image the process ran when the scan verified it. The PID and
+	// the start time stay the same across an exec, so a later read of the image
+	// counts only if it is this file (kernelImages).
+	file os.FileInfo
 }
 
 // image is the trace_protected_images value for the file the process runs: the
@@ -574,20 +813,25 @@ func (p protectedTGID) image() (protectedImage, bool) {
 	case p.configured:
 		return protectedImage{Flags: protectedImageAny}, true
 	}
-	return protectedImage{Flags: protectedImageRoot}, true
+	return rootImage(p.name), true
 }
 
 // scanProtectedTGIDs walks procRoot and returns the protected processes
 // (excluding pid<=1 and selfPID, which the kernel guards already) with their
 // start times. Unreadable entries are skipped: a process we cannot identify
 // here is still covered by the userspace guard at kill time, and one whose
-// start time cannot be read gets no kernel entry.
-func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) ([]protectedTGID, error) {
+// start time cannot be read gets no kernel entry. The second result lists the
+// paths an account other than root can write, for the processes that would be
+// protected if that were not so (hostExeCheck): they are left out of the first.
+// It also lists what stopped the walk of a configured path (refreshExeLeads), a
+// directory that holds a symlink among them.
+func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) ([]protectedTGID, []string, error) {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []protectedTGID
+	var untrusted []string
 	for _, e := range entries {
 		pid, err := strconv.ParseUint(e.Name(), 10, 32)
 		if err != nil || pid <= 1 || int64(pid) == int64(selfPID) {
@@ -601,6 +845,12 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 			continue
 		}
 		if ok, _ := s.matchIdentity(id); !ok {
+			if id.untrusted != "" {
+				id.hostExe = triYes
+				if ok, _ := s.matchIdentity(id); ok {
+					untrusted = append(untrusted, id.untrusted)
+				}
+			}
 			continue
 		}
 		stat, err := os.ReadFile(filepath.Join(procDir(procRoot, uint32(pid)), "stat"))
@@ -613,9 +863,17 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 		}
 		exe, _ := protectedExeCandidate(id.exe)
 		_, configured := s.exes[exe]
-		out = append(out, protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe]})
+		p := protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe], file: id.exeFile}
+		if !configured {
+			p.name = filepath.Base(exe)
+		}
+		out = append(out, p)
 	}
-	return out, nil
+	if leads := s.leads.Load(); leads != nil {
+		untrusted = append(untrusted, leads.untrusted...)
+	}
+	slices.Sort(untrusted)
+	return out, slices.Compact(untrusted), nil
 }
 
 // protectedImageDirs are the directories searched for the built-in and extra
@@ -646,7 +904,7 @@ func (s *ProtectedProcessSet) imagePaths() map[string]protectedImage {
 	for n := range s.names {
 		for _, dir := range protectedImageDirs {
 			if _, bound := s.units[dir+n]; !bound {
-				out[dir+n] = protectedImage{Flags: protectedImageRoot}
+				out[dir+n] = rootImage(n)
 			}
 		}
 	}

@@ -128,8 +128,9 @@ Kill policies never terminate a protected process. The built-in set is `sshd`
 (including `sshd-session` and `sshd-auth`), `systemd`, `systemd-executor`,
 `systemd-journald`, `containerd`, `dockerd`, `kubelet` and `nginx`, each counted
 only when it runs the host binary as root, the WAF agent and systemd-networkd.
-For `nginx` that is the master process: its workers run as the configured user
-and do not count. The WAF agent is matched by
+For `nginx` that is the master process: its workers, the cache manager and the
+cache loader lose the mark when they switch to the configured user. The WAF
+agent is matched by
 the exact path `/usr/local/bin/wafio-waf-agent` (the unit installer) or
 `/opt/wafio/wafio-waf-agent` (the installer in the WAF agent bundle) and counts
 only inside its own unit, the cgroup `/system.slice/wafio-waf-agent.service`: it
@@ -140,18 +141,37 @@ trusted. systemd-networkd is matched the same way, by
 counts only in the cgroup `/system.slice/systemd-networkd.service`; it runs as
 its own user (`systemd-network`). A copy elsewhere, a session scope, a user unit of the same name and a
 process with no readable cgroup do not count. The unit check follows the path,
-also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. The unit gives the agent
-its own mount namespace, so a binary replaced on disk still counts until the
-next restart if the process is in that cgroup. `systemd-executor` is the helper
+also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. It also works when the
+agent runs in a cgroup namespace of its own, where `/proc/<pid>/cgroup` is
+relative to that namespace: the agent then reads the unit's `cgroup.procs` under
+PID 1's root (`/sys/fs/cgroup/system.slice/<unit>`) and counts a process the file
+lists. A binary replaced on disk
+(a package upgrade) counts until the next restart, but only while the running
+file is one that only root can write and sits on the filesystem of the directory
+its path names; for a path that is not bound to a unit the process must also be
+in the host mount namespace. `systemd-executor` is the helper
 systemd 255 and later run between PID 1 and each service.
 
 A protected process also gets `exe_verified` on its own trace events, so the
 control plane can tell the WAF agent reading its TLS key, or the nginx master
 loading its own, from another process reading it. The mark says only that the
-kernel saw the process in the protected set. A child forked by a protected process keeps it until the child execs or the
-next refresh (5 s) drops it, also when the child changes its user in between, and a thread can rename itself with
-`prctl(PR_SET_NAME)`. A rule that trusts the mark should therefore also match
-the process name and the user. The same set makes the WAF agent immune to Kill
+kernel saw the process in the protected set. A child forked by a protected
+process has it from its first instruction. It loses it when it gives up root
+without an `exec` (the exit of `setuid`, `setreuid` or `setresuid`), unless its
+program keeps the mark for any user (a path in `WAFIO_PROTECTED_EXE_PATHS`),
+inside its unit, or through its own switch of user. `sshd`, `sshd-session` and
+`sshd-auth` do the last: OpenSSH calls `setgid(0)` and `setuid(0)` right after
+the switch to check that root cannot come back, and the control plane downgrades
+those two events only for a verified process. The next refresh drops that mark,
+because a process under a name counts only as root. A child of PID 1 keeps the
+mark until its `exec`, because systemd switches to `User=` right before it. A
+kernel that rejects those three programs leaves the next refresh (5 s) to drop
+the mark, as does a 32-bit call on x86_64. The refresh reads the user IDs of a
+process again after it writes the entry and applies the same rule: a process
+that read as root in the scan and gave up root before the write loses the entry
+at once, because the kernel hook for `setuid` had no entry to drop.
+A thread can rename itself with `prctl(PR_SET_NAME)`. A rule that trusts the
+mark should therefore also match the process name and the user. The same set makes the WAF agent immune to Kill
 policies, so a policy cannot take down the sites it fronts.
 
 Across `exec` the kernel keeps the mark only when the new program is a file the
@@ -161,31 +181,61 @@ never by name. The trusted files are the protected names (built-in and from
 `/usr/bin`, `/usr/lib/openssh`, `/usr/lib/systemd` and the like), which keep the
 mark only for root; the paths in `WAFIO_PROTECTED_EXE_PATHS`, which keep it for
 any user; the WAF agent and systemd-networkd paths above, which keep it only
-inside their unit; the programs of processes the agent has already verified;
-and the `systemd-executor` file that PID 1 holds open. The agent rewrites the
-list every 5 s and at once when a file with one of those names changes in one
-of those directories, so a restart right after a package upgrade is still
-verified from its first event. A program that only carries a protected name (a
+inside their unit; the programs of processes the agent has already verified,
+while they still run the file it verified; and the `systemd-executor` file that
+PID 1 holds open. The agent rewrites the
+list every 5 s and again when a file with one of those names changes in one of
+those directories. The first change applies at once and later changes within a
+second wait up to a second, so a restart inside that second of the last rename
+in a burst (an `openssh-server` upgrade renames `sshd`, `sshd-session` and
+`sshd-auth`) loses the mark at `exec` until the next refresh. A program that only carries a protected name (a
 copy, a renamed file, a binary in another directory) loses the mark at `exec`,
 before its first instruction.
 
 A file is trusted only if root owns it and neither its group nor others can
-write it, and the same holds for its directory. An account that owns the file or
-the directory could rename a copy of its own over a trusted path, and the agent
-would then take the copy for the daemon. The agent reads the paths inside the
-root of PID 1, not its own: a symlink in a configured path is followed inside
-that root, while the system directories a protected name is searched in must
-not be symlinks and the file itself is never a symlink (on a host where `/bin`
-points to `usr/bin` the file is found as `/usr/bin/<name>`). Without `openat2`
-(before Linux 5.6, or a seccomp filter that refuses it) no path with a symlink
-is trusted. A directory
-that is group-writable, as `/usr/local/bin` is on some Debian hosts
+write it, and the same holds for the directory it is in and, for a configured
+path, for every directory on the way to it. An account
+that owns the file or one of those directories could rename a copy of its own
+over a trusted path, or point a symlink at any program, and the agent would then
+take that program for the daemon. The agent reads the paths inside the root of
+PID 1, not its own, one name at a time. A symlink in a configured path, in a
+directory or as the file itself (`/usr/local/bin/agentd` pointing to
+`/opt/agentd/agentd`), is followed inside that root, but only out of a directory
+that only root can write in, at most 40 links, and `..` never climbs above the
+root. The file it leads to is in the list of files the `exec` trusts. A process
+is matched by that file and by no other: the file it runs must be the one the
+walk reaches now, and `/proc/<pid>/exe` shows the resolved path, not the
+configured one (a symlink moved to another release leaves the process of the old
+one unprotected until it restarts). A program that has the configured path only
+in a mount namespace of its own, through a bind mount, is another file and does
+not count. A configured
+path that goes through a directory others can write has no match and no trusted
+file, whatever the symlink in it points at: with `ln -sf /usr/bin/bash` in a
+directory a service account owns, every shell of every user would otherwise
+count as the daemon. The agent names that directory in its log and on the
+self-check line as `untrusted_owner`, for a path that exists. The system
+directories a protected name is searched in must not be symlinks, and a protected
+name found there is never a symlink (on a host where `/bin` points to `usr/bin`
+the file is found as `/usr/bin/<name>`). Without `openat2` (before Linux 5.6, or a
+seccomp filter that refuses it) those directories still refuse every symlink; the
+walk of a configured path needs only `openat`, `readlinkat` and `statx`. A
+directory that is group-writable, as `/usr/local/bin` is on some Debian hosts
 (`root:staff`, mode 2775), makes the files in it untrusted until it is set to
-`755`. A directory that does not exist when the agent starts is watched as soon
-as it appears (at the next 5 s refresh), and one that is moved or replaced is
-watched again the same way. A WAF agent whose binary or directory an account
+`755`, and is not watched. A configured path under `/usr/local` also needs
+`/usr/local` itself at `755`; a protected name needs only its own directory at
+`755`, which is watched whatever the directories above it allow. A directory that
+does not exist when the agent starts is watched as soon as it appears (at the
+next 5 s refresh), and one that is moved or replaced, or that a symlink in a
+configured path now leads away from, is watched again the same way. When the last
+part of a configured path is a symlink, the directory of the file it leads to is
+watched as well, once a refresh has walked the path (a refresh that follows a
+change in a watched directory walks it again first, so a symlink moved to another
+release is followed at once). A WAF agent whose binary or directory an account
 other than root owns (an installer that hands `/opt/wafio` to the service
-account) is not protected and has no mark: leave both to root.
+account) is not protected and has no mark: leave both to root. The agent says so
+once in its log for each such path ("can be written by an account other than
+root"), at start with a warning too, and again if the path becomes writable
+again.
 
 The kernel checks the unit of the WAF agent and systemd-networkd at `exec` too.
 It keeps the mark only when the new process runs in a cgroup of the default
@@ -228,8 +278,11 @@ refused.
 Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
 `WAFIO_PROTECTED_EXE_PATHS` (absolute paths); `WAFIO_PROTECTED_REPLACE_DEFAULTS=true`
 replaces the built-in names and the built-in unit-bound paths (WAF agent, systemd-networkd) instead of extending them. A
-shell or interpreter in the list is accepted with a warning, because every root
-process running it would become unkillable.
+shell or interpreter in the list is accepted with a warning, because every
+process running it would become unkillable: any user for a path, root for a name.
+A path whose own name is harmless counts too when it is a symlink to one, such as
+busybox or `python3`; the warning and the self-check line show it as
+`<path>-><file>`.
 
 Check a running agent:
 
@@ -238,7 +291,35 @@ journalctl -u wafio-host-agent -b | grep 'protected-process self-check'
 ```
 
 `kernel_set=present` means the kernel side protects them too. `proc_access=denied`
-means the unit lacks `CAP_SYS_PTRACE`.
+means the unit lacks `CAP_SYS_PTRACE`. `untrusted_owner=<paths>` lists files or
+directories that an account other than root can write under a protected process,
+or on the way to a configured path that exists, a directory that holds a symlink
+among them: that process is not protected until root owns the path and neither
+its group nor others can write it. A path that ends in `(deleted)` is a file replaced while the
+process ran: find out how a file that an account other than root could write ran
+there, fix its directory and restart the process. `unit_check=unavailable` means the agent is in a cgroup
+namespace of its own and finds no readable `system.slice` under PID 1's root: the
+WAF agent and systemd-networkd are then not protected, and a warning names them.
+
+Read that line first. It names the kernel map (`map=trace_protected_tgids`), says
+how many entries the agent wrote at start (`protected_tgids=`) against how many
+processes matched (`matched_processes=`), and shows `kernel_missing=` when fewer
+were written. To see the map as it is now, list the maps and dump one by its id.
+`bpftool` cuts map names to 15 characters, so `trace_protected_tgids`,
+`trace_protected_images` and `trace_protected_budget` all show as
+`trace_protected`: `bpftool map dump name trace_protected_tgids` fails with
+"can't parse name", and `name trace_protected` dumps all three, one after the
+other.
+
+```sh
+sudo bpftool map list | grep -A1 'name trace_protected'
+sudo bpftool map dump id <id>
+```
+
+The tgid map is the `hash` with `key 4B value 8B`: each key is a process ID and
+each value the start time of that process in clock ticks (field 22 of
+`/proc/<pid>/stat`). The image map is the `hash` with `key 16B` and the budget map
+is the `array`.
 
 ### Memory use and map sizes
 

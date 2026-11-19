@@ -14,13 +14,18 @@ func (tm *TraceManager) runProtectedSelfCheck() protectedSelfCheck {
 		risky:      tm.protected.RiskyEntries(),
 		procDenied: procIdentityDenied(tm.proc()),
 	}
+	if !unitCheckAvailable(tm.proc()) {
+		c.unitUnavailable = tm.protected.unitExePaths()
+	}
 	if tm.protectedMap == nil {
-		tgids, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
-		c.matched, c.scanErr = len(tgids), err
+		tm.protected.refreshExeLeads(tm.proc())
+		tgids, untrusted, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
+		c.matched, c.untrusted, c.scanErr = len(tgids), untrusted, err
 		return c
 	}
 	c.valueSize = tm.protectedMap.ValueSize()
 	c.matched, c.scanErr = tm.syncProtectedTGIDs()
 	c.kernelTGIDs = len(tm.protectedTGIDs)
+	c.untrusted = sortedKeys(tm.protectedUntrusted)
 	return c
 }

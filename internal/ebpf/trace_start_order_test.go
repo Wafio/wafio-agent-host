@@ -47,6 +47,11 @@ func TestTraceStartFillsProtectedSetBeforeAttach(t *testing.T) {
 	if selfCheck < attached {
 		t.Fatal("the self-check sync must also run after attach")
 	}
+	// The warning for risky entries names a symlinked path by the file it leads
+	// to, which only the walk of refreshExeLeads tells.
+	if leads, warn := strings.Index(body, "tm.protected.refreshExeLeads("), strings.Index(body, "tm.protected.RiskyWarning()"); leads < 0 || warn < 0 || leads > warn {
+		t.Fatalf("Start must refresh the leads (%d) before it logs the risky warning (%d)", leads, warn)
+	}
 	// What the guard does is run in TestDisableInheritWithoutExec; that Start
 	// asks it before each probe attaches cannot be run without a kernel.
 	if guard := strings.Index(body, "tm.disableInheritWithoutExec(probe.name)"); guard < 0 || guard > attach {
@@ -54,10 +59,10 @@ func TestTraceStartFillsProtectedSetBeforeAttach(t *testing.T) {
 	}
 }
 
-// With the fork budget set before attach, the
-// exec and exit maintenance programs must attach before fork, or a child
-// forked and exec'd into another image between the two attaches would keep
-// an inherited protected entry.
+// With the fork budget set before attach, the exec, exit and UID call
+// maintenance programs must attach before fork, or a child forked and exec'd
+// into another image, or one that gave up root, between the two attaches would
+// keep an inherited protected entry.
 func TestTraceProbesAttachExecAndExitBeforeFork(t *testing.T) {
 	at := map[string]int{}
 	for i, p := range traceProbes {
@@ -67,7 +72,7 @@ func TestTraceProbesAttachExecAndExitBeforeFork(t *testing.T) {
 	if !ok {
 		t.Fatal("sched_process_fork not in traceProbes")
 	}
-	for _, name := range []string{"sched_process_exec", "sched_process_exit"} {
+	for _, name := range []string{"sched_process_exec", "sched_process_exit", "sys_exit_setuid", "sys_exit_setreuid", "sys_exit_setresuid"} {
 		i, ok := at[name]
 		if !ok {
 			t.Fatalf("%s not in traceProbes", name)
