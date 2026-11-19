@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -217,12 +218,18 @@ func protectedInheritBudget(entries int, execKeep bool) int64 {
 }
 
 // ProtectedProcessSet decides whether a process may be targeted by enforcement.
-// Immutable after construction; safe for concurrent use.
+// Immutable after construction except leads; safe for concurrent use.
 type ProtectedProcessSet struct {
 	names map[string]struct{} // executable basenames (full, untruncated)
 	comms map[string]struct{} // same names truncated to TASK_COMM_LEN-1
 	exes  map[string]struct{} // exact executable paths
 	units map[string]string   // exe path -> system unit it must run in
+
+	// leads maps the path a configured exe path leads to now, inside PID 1's
+	// root, to that configured path, for each one that goes through a symlink:
+	// /proc/<pid>/exe shows the resolved path, never the configured one.
+	// Replaced by refreshExeLeads.
+	leads atomic.Pointer[map[string]string]
 
 	defaultsReplaced bool // DefaultProtectedProcessNames dropped by configuration
 }
@@ -232,6 +239,27 @@ func truncateComm(name string) string {
 		return name[:taskCommLen-1]
 	}
 	return name
+}
+
+// configuredLink maps an exe link that is the file a configured symlinked path
+// leads to onto that path. Any other link is returned as it is.
+func (s *ProtectedProcessSet) configuredLink(link string) string {
+	if s == nil {
+		return link
+	}
+	leads := s.leads.Load()
+	if leads == nil {
+		return link
+	}
+	exe, deleted := protectedExeCandidate(link)
+	configured, ok := (*leads)[exe]
+	switch {
+	case !ok:
+		return link
+	case deleted:
+		return configured + " (deleted)"
+	}
+	return configured
 }
 
 // tri is a three-valued check result: a check that could not be performed is
@@ -255,7 +283,7 @@ func triOf(ok bool) tri {
 // process. exe and comm are always read; the verification fields are read only
 // for a process whose exe names a protected binary (see readProcIdentity).
 type procIdentity struct {
-	exe  string // /proc/<pid>/exe link text; "" when unreadable
+	exe  string // /proc/<pid>/exe link text, or the configured path it is the target of (configuredLink); "" when unreadable
 	comm string
 
 	// hostExe: the running image is the very file at the same path in the
@@ -432,8 +460,10 @@ func procDir(procRoot string, pid uint32) string {
 func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) procIdentity {
 	var id procIdentity
 	dir := procDir(procRoot, pid)
+	var link string // what /proc/<pid>/exe says; id.exe may name the configured path instead
 	if target, err := os.Readlink(filepath.Join(dir, "exe")); err == nil {
-		id.exe = target
+		link = target
+		id.exe = s.configuredLink(target)
 	}
 	if data, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil {
 		id.comm = strings.TrimRight(string(data), "\n\x00")
@@ -454,7 +484,7 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 		return id
 	}
 	id.hostMntNS = sameHostMountNS(procRoot, dir)
-	id.hostExe, id.untrusted = hostExeCheck(procRoot, dir, id.exe)
+	id.hostExe, id.untrusted = hostExeCheck(procRoot, dir, link)
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
 	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {

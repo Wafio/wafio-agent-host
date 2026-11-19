@@ -83,6 +83,7 @@ func killVerifiedPidfd(pid uint32, startNs uint64) error {
 // decision and records the outcome in the enforcement log. Order:
 // protection guards → verified pidfd kill → deferred kernel request.
 func (tm *TraceManager) userspaceKill(evt *TraceEvent, policyID uint32) {
+	tm.protected.refreshExeLeads("/proc")
 	if reason := tm.protected.protectedPIDReason("/proc", evt.PID, os.Getpid(), evt.Comm); reason != "" {
 		err := fmt.Errorf("refusing to kill protected process: %s", reason)
 		evt.SignalOutcome = "failed"
@@ -278,6 +279,7 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 	if err != nil {
 		withStart = false // no guard possible: fall back to the scan alone
 	}
+	tm.protected.refreshExeLeads(tm.proc())
 	tgids, untrusted, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
 	if err != nil {
 		return 0, err

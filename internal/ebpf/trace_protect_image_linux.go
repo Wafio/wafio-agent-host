@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -208,6 +209,40 @@ var afterImageRead func(dir string)
 // system directories (imagePaths): symlinks are refused in its directory part.
 func systemDirOnly(img protectedImage) bool {
 	return img.Flags&^protectedImageKeepOnSetuid == protectedImageRoot
+}
+
+// refreshExeLeads records where each configured exe path that goes through a
+// symlink leads inside PID 1's root (configuredLink matches a process by it).
+// The directory is resolved with the same walk as the image set and the watch;
+// it need not be trusted here, so a writable one is still reported as such by
+// the scan. A root that cannot be opened leaves no entries.
+func (s *ProtectedProcessSet) refreshExeLeads(procRoot string) {
+	if s == nil {
+		return
+	}
+	leads := make(map[string]string)
+	if root, err := unix.Open(filepath.Join(procRoot, "1", "root"), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
+		// d_path shows a file relative to the reader's root; the root descriptor
+		// gives the part to cut off (nothing when the roots are the same).
+		prefix, _ := os.Readlink("/proc/self/fd/" + strconv.Itoa(root))
+		for p := range s.exes {
+			dir, err := openDirIn(root, filepath.Dir(p), true)
+			if err != nil {
+				continue
+			}
+			resolved, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(dir))
+			_ = unix.Close(dir) // an O_PATH descriptor holds no data to flush
+			if err != nil {
+				continue
+			}
+			target := filepath.Join("/", strings.TrimPrefix(resolved, prefix), filepath.Base(p))
+			if _, listed := s.exes[target]; target != p && !listed {
+				leads[target] = p
+			}
+		}
+		_ = unix.Close(root) // an O_PATH descriptor holds no data to flush
+	}
+	s.leads.Store(&leads)
 }
 
 // kernelImages is the content of trace_protected_images: the files the kernel

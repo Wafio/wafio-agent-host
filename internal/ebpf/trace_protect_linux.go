@@ -18,6 +18,7 @@ func (tm *TraceManager) runProtectedSelfCheck() protectedSelfCheck {
 		c.unitUnavailable = tm.protected.unitExePaths()
 	}
 	if tm.protectedMap == nil {
+		tm.protected.refreshExeLeads(tm.proc())
 		tgids, untrusted, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
 		c.matched, c.untrusted, c.scanErr = len(tgids), untrusted, err
 		return c
