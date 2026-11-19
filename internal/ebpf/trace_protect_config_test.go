@@ -311,6 +311,12 @@ func TestProtectedSelfCheckWarning(t *testing.T) {
 	if !strings.HasPrefix(w, "WARNING: ") || !strings.Contains(w, "/usr/local/bin/wafio-waf-agent, /usr/lib/systemd/systemd-networkd") || strings.Contains(w, "\n") {
 		t.Fatalf("unit check warning = %q", w)
 	}
+	// A replaced file cannot be chowned: its line says to restart after the fix.
+	w = protectedSelfCheck{kernelSet: true, valueSize: 8, untrusted: []string{"/usr/sbin/sshd (deleted)", "/usr/local/bin/kubelet"}}.Warning()
+	if lines := strings.Split(w, "\n"); len(lines) != 2 || !strings.Contains(lines[0], "/usr/local/bin/kubelet") || !strings.Contains(lines[0], "make root the owner") ||
+		!strings.Contains(lines[1], "/usr/sbin/sshd (deleted)") || !strings.Contains(lines[1], "restart the process") || strings.Contains(lines[1], "make root the owner") {
+		t.Fatalf("replaced image warning = %q", w)
+	}
 	both := protectedSelfCheck{kernelSet: true, valueSize: 8, procDenied: true, untrusted: []string{"/usr/local/bin/kubelet"}}.Warning()
 	if lines := strings.Split(both, "\n"); len(lines) != 2 || !strings.Contains(lines[0], "CAP_SYS_PTRACE") || !strings.Contains(lines[1], "/usr/local/bin/kubelet") {
 		t.Fatalf("two causes did not give two lines: %q", both)

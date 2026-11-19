@@ -353,6 +353,20 @@ func TestProtectedRefreshLoopLimitsChangeRefreshes(t *testing.T) {
 	}
 }
 
+// The log line for a replaced image says to restart the process after the fix,
+// not to change the owner of a file that is gone.
+func TestNoteUntrustedHintForReplacedImage(t *testing.T) {
+	var out bytes.Buffer
+	tm := &TraceManager{log: log.New(&out, "", 0)}
+	tm.noteUntrusted([]string{"/usr/sbin/sshd (deleted)", "/usr/local/bin/kubelet"})
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		deleted := strings.HasPrefix(line, "/usr/sbin/sshd (deleted)")
+		if deleted != strings.Contains(line, "restart the process") || deleted == strings.Contains(line, "make root the owner") {
+			t.Errorf("wrong hint for %q", line)
+		}
+	}
+}
+
 // A protected process whose file an account other than root can write is not
 // protected: the refresh says so once for each path, forgets a path that was
 // fixed and says so again when it comes back.

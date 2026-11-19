@@ -265,7 +265,9 @@ journalctl -u wafio-host-agent -b | grep 'protected-process self-check'
 means the unit lacks `CAP_SYS_PTRACE`. `untrusted_owner=<paths>` lists files or
 directories that an account other than root can write under a protected process:
 that process is not protected until root owns the path and neither its group nor
-others can write it. `unit_check=unavailable` means the agent is in a cgroup
+others can write it. A path that ends in `(deleted)` is a file replaced while the
+process ran: find out how a file that an account other than root could write ran
+there, fix its directory and restart the process. `unit_check=unavailable` means the agent is in a cgroup
 namespace of its own and finds no readable `system.slice` under PID 1's root: the
 WAF agent and systemd-networkd are then not protected, and a warning names them.
 

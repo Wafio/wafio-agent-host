@@ -349,7 +349,7 @@ func (tm *TraceManager) noteUntrusted(paths []string) {
 	for _, p := range paths {
 		now[p] = struct{}{}
 		if _, seen := tm.protectedUntrusted[p]; !seen {
-			tm.log.Printf("%s can be written by an account other than root, so the protected process that runs from it is not protected: %s", p, protectedUntrustedHint)
+			tm.log.Printf("%s can be written by an account other than root, so the protected process that runs from it is not protected: %s", p, untrustedHint(p))
 		}
 	}
 	tm.protectedUntrusted = now

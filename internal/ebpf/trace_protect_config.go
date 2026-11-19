@@ -363,6 +363,18 @@ const protectedUnitCheckHint = "the agent runs in a cgroup namespace of its own 
 // warning.
 const protectedUntrustedHint = "make root the owner and remove group and other write"
 
+// protectedUntrustedDeletedHint replaces it for a path that ends in " (deleted)":
+// the file the process runs is gone from disk, so no chown or chmod reaches it.
+const protectedUntrustedDeletedHint = "find out how a file that an account other than root could write ran at this path, fix its directory and restart the process"
+
+// untrustedHint is the fix for one path of the untrusted list.
+func untrustedHint(path string) string {
+	if strings.HasSuffix(path, " (deleted)") {
+		return protectedUntrustedDeletedHint
+	}
+	return protectedUntrustedHint
+}
+
 // protectedProcDeniedHint names the fix on the self-check line and in the
 // startup warning.
 const protectedProcDeniedHint = "grant CAP_SYS_PTRACE (AmbientCapabilities and CapabilityBoundingSet): /proc/<pid>/exe of root daemons is unreadable, so only pid 1 and the agent are protected from Kill"
@@ -416,8 +428,18 @@ func (c protectedSelfCheck) Warning() string {
 	if c.procDenied {
 		lines = append(lines, "WARNING: protected-process identity check denied: "+protectedProcDeniedHint)
 	}
-	if len(c.untrusted) > 0 {
-		lines = append(lines, "WARNING: protected processes without protection, an account other than root can write "+strings.Join(c.untrusted, ", ")+": "+protectedUntrustedHint)
+	var live, replaced []string
+	for _, p := range c.untrusted {
+		if untrustedHint(p) == protectedUntrustedHint {
+			live = append(live, p)
+		} else {
+			replaced = append(replaced, p)
+		}
+	}
+	for _, paths := range [][]string{live, replaced} {
+		if len(paths) > 0 {
+			lines = append(lines, "WARNING: protected processes without protection, an account other than root can write "+strings.Join(paths, ", ")+": "+untrustedHint(paths[0]))
+		}
 	}
 	if len(c.unitUnavailable) > 0 {
 		lines = append(lines, "WARNING: protected-process unit check unavailable, not protected: "+strings.Join(c.unitUnavailable, ", ")+": "+protectedUnitCheckHint)
