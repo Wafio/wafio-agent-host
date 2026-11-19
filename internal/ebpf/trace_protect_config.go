@@ -3,6 +3,7 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -37,8 +38,9 @@ type ProtectedProcessConfig struct {
 	// ExePaths are exact absolute executable paths. They protect that host
 	// binary whatever user it runs as.
 	ExePaths []string
-	// ReplaceDefaults drops DefaultProtectedProcessNames so only Names and
-	// ExePaths apply. Honored only when at least one valid entry remains.
+	// ReplaceDefaults drops DefaultProtectedProcessNames and
+	// DefaultProtectedUnitExes so only Names and ExePaths apply. Honored only
+	// when at least one valid entry remains.
 	ReplaceDefaults bool
 }
 
@@ -176,10 +178,16 @@ func (c ProtectedProcessConfig) EffectiveNames() []string {
 	return slices.Compact(names)
 }
 
-// EffectiveExePaths is the sorted, de-duplicated list of valid configured
-// exact executable paths.
+// EffectiveExePaths is the sorted, de-duplicated list of protected exact
+// executable paths: the valid configured ones plus the built-in unit
+// executables (DefaultProtectedUnitExes), unless the defaults are replaced.
 func (c ProtectedProcessConfig) EffectiveExePaths() []string {
-	return c.validExePaths()
+	paths := c.validExePaths()
+	if !c.defaultsReplaced() {
+		paths = slices.AppendSeq(paths, maps.Keys(DefaultProtectedUnitExes))
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths)
 }
 
 // NewProtectedProcessSetFromConfig builds the protected set from cfg. Invalid
@@ -189,7 +197,11 @@ func NewProtectedProcessSetFromConfig(cfg ProtectedProcessConfig) *ProtectedProc
 		names:            make(map[string]struct{}),
 		comms:            make(map[string]struct{}),
 		exes:             make(map[string]struct{}),
+		units:            make(map[string]string),
 		defaultsReplaced: cfg.defaultsReplaced(),
+	}
+	if !s.defaultsReplaced {
+		maps.Copy(s.units, DefaultProtectedUnitExes)
 	}
 	for _, n := range cfg.EffectiveNames() {
 		s.names[n] = struct{}{}

@@ -22,8 +22,9 @@ func TestTraceProtectedInheritance(t *testing.T) {
 	c.WriteString(`typedef uint32_t __u32; typedef uint64_t __u64; typedef uint8_t __u8; typedef int64_t __s64;
 #define BPF_ANY 0
 #define BPF_CORE_READ(t, f) ((t)->f)
+#define TRACE_COMM_LEN 16
 struct signal_struct { struct { int counter; } live; };
-struct task_struct { __u32 pid, tgid; struct task_struct *group_leader; __u64 start_boottime; struct signal_struct *signal; };
+struct task_struct { __u32 pid, tgid; struct task_struct *group_leader; __u64 start_boottime; struct signal_struct *signal; struct task_struct *real_parent; };
 struct protected_comm_key { char comm[16]; };
 
 /* A tiny map: linear table of fixed-size keys and values. */
@@ -45,7 +46,7 @@ static void *bpf_get_current_task(void) { return cur_task; }
 			c.WriteString(line + "\n")
 		}
 	}
-	for _, name := range []string{"is_protected_tgid", "protected_inherit_refused", "protected_inherit_take", "protect_forked_child", "protect_on_exec", "protect_on_exit"} {
+	for _, name := range []string{"is_protected_tgid", "protected_inherit_refused", "protected_inherit_take", "protect_forked_child", "comm_is_number", "protect_on_exec", "protect_on_exit"} {
 		body := regexp.MustCompile(`(?s)static __always_inline \w+\s*\n?` + name + `\(.*?\n\}`).FindString(string(source))
 		if body == "" {
 			t.Fatalf("missing helper %s", name)
@@ -62,9 +63,10 @@ static struct task_struct mk_task(__u32 pid, __u32 tgid, __u64 start) { struct t
 static __s64 budget_slot(__u32 slot) { __s64 *v = bpf_map_lookup_elem(&trace_protected_budget, &slot); return v ? *v : -999; }
 static void set_budget(__s64 n) { __u32 slot = TRACE_PROTECTED_BUDGET_SLOT; bpf_map_update_elem(&trace_protected_budget, &slot, &n, BPF_ANY); }
 static void run_exec(__u32 tgid, const char *name, __u32 uid) { cur_pid_tgid = ((__u64)tgid << 32) | tgid; strncpy(cur_comm, name, 15); cur_uid_gid = uid; protect_on_exec(); }
+static void run_exec_of(struct task_struct *t, const char *name, __u32 uid) { cur_task = t; run_exec(t->tgid, name, uid); }
 
 int main(void) {
-  comm("sshd", TRACE_PROTECTED_COMM_ROOT); comm("sshd-session", TRACE_PROTECTED_COMM_ROOT); comm("agentd", 0);
+  comm("sshd", TRACE_PROTECTED_COMM_ROOT); comm("sshd-session", TRACE_PROTECTED_COMM_ROOT); comm("agentd", 0); comm("wafio-waf-agent", 0);
   { __s64 zero = 0; __u32 refused = TRACE_PROTECTED_REFUSED_SLOT; bpf_map_update_elem(&trace_protected_budget, &refused, &zero, BPF_ANY); }
 
   /* No budget (before the first refresh, or an agent that never writes it):
@@ -134,6 +136,34 @@ int main(void) {
   /* exec of a process that was never protected inserts nothing. */
   run_exec(600, "sshd", 0);
   EXPECT(!has(600), "exec inserted an entry");
+
+  /* systemd 255 and later: PID 1's child execs systemd-executor as
+   * /proc/self/fd/<n>, so its comm is a number. As root it keeps the entry
+   * through that exec, and the exec of the service binary decides. */
+  struct task_struct unit = mk_task(700, 700, 9100000000ULL); unit.group_leader = &unit; unit.real_parent = &init;
+  protect(700, unit.start_boottime);
+  run_exec_of(&unit, "23", 0);
+  EXPECT(has(700), "root exec of PID 1's child with a numeric comm dropped the entry");
+  run_exec_of(&unit, "wafio-waf-agent", 999);
+  EXPECT(has(700), "exec of the WAF agent as its service account dropped the entry");
+  run_exec_of(&unit, "sh", 999);
+  EXPECT(!has(700), "exec of sh kept the entry after the numeric comm");
+  /* The numeric comm is trusted for PID 1's child only, only as root, and only as digits. */
+  struct task_struct sub = mk_task(701, 701, 9200000000ULL); sub.group_leader = &sub; sub.real_parent = &sshd;
+  protect(701, sub.start_boottime);
+  run_exec_of(&sub, "23", 0);
+  EXPECT(!has(701), "numeric comm of a child of another protected process kept the entry");
+  struct task_struct user = mk_task(702, 702, 9300000000ULL); user.group_leader = &user; user.real_parent = &init;
+  protect(702, user.start_boottime);
+  run_exec_of(&user, "23", 1000);
+  EXPECT(!has(702), "non-root exec with a numeric comm kept the entry");
+  struct task_struct hex = mk_task(703, 703, 9400000000ULL); hex.group_leader = &hex; hex.real_parent = &init;
+  protect(703, hex.start_boottime);
+  run_exec_of(&hex, "2a", 0);
+  EXPECT(!has(703), "comm 2a counted as a number");
+  protect(703, hex.start_boottime);
+  run_exec_of(&hex, "", 0);
+  EXPECT(!has(703), "empty comm counted as a number");
 
   /* exit: only when the whole thread group is gone, and only for the
    * entry's own process. */

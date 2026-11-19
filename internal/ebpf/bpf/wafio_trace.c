@@ -94,8 +94,10 @@ struct {
  * The kernel maintains the map between refreshes too. A process forked
  * by a protected process (or by PID 1) is inserted at sched_process_fork,
  * before it first runs; exec keeps an entry only for a protected image
- * (trace_protected_comms); the leader's exit removes it. The refresh
- * reconciles against the map's content and drops what it cannot verify. */
+ * (trace_protected_comms), or for the root exec of PID 1's child that
+ * systemd 255 and later route through systemd-executor; the leader's exit
+ * removes it. The refresh reconciles against the map's content and drops what
+ * it cannot verify. */
 #define TRACE_MAX_PROTECTED 1024
 #define TRACE_NSEC_PER_USER_HZ_TICK 10000000ULL
 struct {
@@ -199,12 +201,32 @@ protect_forked_child(struct task_struct *parent, struct task_struct *child)
         protected_inherit_refused();
 }
 
+/* True when the comm is a decimal number: one or more digits, nothing else. */
+static __always_inline int
+comm_is_number(const char *comm)
+{
+    if (comm[0] < '0' || comm[0] > '9')
+        return 0;
+#pragma clang loop unroll(full)
+    for (int i = 1; i < TRACE_COMM_LEN; i++) {
+        if (comm[i] == 0)
+            return 1;
+        if (comm[i] < '0' || comm[i] > '9')
+            return 0;
+    }
+    return 0;
+}
+
 /* exec replaces the image the protection was granted for. The entry is
  * kept only when the new comm is a protected name (as root, when the name
  * requires it); the next refresh verifies the binary by inode. Anything else
  * (the user's shell after sshd-session, a service binary after PID 1) loses
- * the protection it inherited at fork. Called at sched_process_exec, after
- * the kernel set the new comm. */
+ * the protection it inherited at fork.
+ * One exception: systemd 255 and later start each unit through
+ * systemd-executor, which PID 1's child execs as /proc/self/fd/<n>, so the
+ * comm is that number. PID 1's own child keeps its entry through that one
+ * root exec; the exec of the service binary decides. Called at
+ * sched_process_exec, after the kernel set the new comm. */
 static __always_inline void
 protect_on_exec(void)
 {
@@ -214,9 +236,15 @@ protect_on_exec(void)
     struct protected_comm_key key = {};
     bpf_get_current_comm(&key.comm, sizeof(key.comm));
     __u8 *flags = bpf_map_lookup_elem(&trace_protected_comms, &key);
-    if (flags && (!(*flags & TRACE_PROTECTED_COMM_ROOT) ||
-                  (__u32)bpf_get_current_uid_gid() == 0))
+    __u32 uid = (__u32)bpf_get_current_uid_gid();
+    if (flags && (!(*flags & TRACE_PROTECTED_COMM_ROOT) || uid == 0))
         return;
+    if (uid == 0 && comm_is_number(key.comm)) {
+        struct task_struct *task = (void *)bpf_get_current_task();
+        struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+        if (BPF_CORE_READ(parent, tgid) == 1)
+            return;
+    }
     bpf_map_delete_elem(&trace_protected_tgids, &tgid);
 }
 

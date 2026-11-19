@@ -81,19 +81,24 @@ func TestProtectedProcessConfigEffective(t *testing.T) {
 		slices.Sort(out)
 		return slices.Compact(out)
 	}
+	// The WAF agent's path is built in, so it is in every list that keeps the defaults.
+	const waf = "/usr/local/bin/wafio-waf-agent"
 	for _, tc := range []struct {
 		name      string
 		cfg       ProtectedProcessConfig
 		wantNames []string
 		wantExes  []string
 	}{
-		{"no config keeps built-ins", ProtectedProcessConfig{}, withDefaults(), nil},
+		{"no config keeps built-ins", ProtectedProcessConfig{}, withDefaults(), []string{waf}},
 		{"names merged and de-duplicated",
 			ProtectedProcessConfig{Names: []string{"nginx", " sshd ", "nginx"}},
-			withDefaults("nginx"), nil},
+			withDefaults("nginx"), []string{waf}},
 		{"invalid entries dropped",
 			ProtectedProcessConfig{Names: []string{"bad/name", "", "haproxy"}, ExePaths: []string{"rel/x", "/opt/b", "/opt/a", "/opt/b", "/opt/../x"}},
-			withDefaults("haproxy"), []string{"/opt/a", "/opt/b"}},
+			withDefaults("haproxy"), []string{"/opt/a", "/opt/b", waf}},
+		{"configured copy of the built-in path is not doubled",
+			ProtectedProcessConfig{ExePaths: []string{waf}},
+			withDefaults(), []string{waf}},
 		{"replace drops built-ins",
 			ProtectedProcessConfig{Names: []string{"nginx"}, ReplaceDefaults: true},
 			[]string{"nginx"}, nil},
@@ -103,7 +108,7 @@ func TestProtectedProcessConfigEffective(t *testing.T) {
 		// A configuration whose every entry is invalid never empties the set.
 		{"replace with only invalid entries keeps built-ins",
 			ProtectedProcessConfig{Names: []string{"a/b"}, ExePaths: []string{"rel"}, ReplaceDefaults: true},
-			withDefaults(), nil},
+			withDefaults(), []string{waf}},
 	} {
 		if got := tc.cfg.EffectiveNames(); !slices.Equal(got, tc.wantNames) {
 			t.Errorf("%s: EffectiveNames() = %q, want %q", tc.name, got, tc.wantNames)
@@ -130,12 +135,20 @@ func TestProtectedProcessConfigEffective(t *testing.T) {
 func TestProtectedSetFromConfigMatching(t *testing.T) {
 	merged := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ExePaths: []string{"/opt/acme/bin/agentd"}})
 	replaced := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ReplaceDefaults: true})
+	wafInUnit := hostRoot("/usr/local/bin/wafio-waf-agent", "wafio-waf-agent")
+	wafInUnit.rootUIDs = triNo
+	wafInUnit.cgroup = "/system.slice/wafio-waf-agent.service"
+	wafInSession := wafInUnit
+	wafInSession.cgroup = "/user.slice/user-1000.slice/session-3.scope"
 	for _, tc := range []struct {
 		name             string
 		id               procIdentity
 		merged, replaced bool
 	}{
 		{"built-in sshd", hostRoot("/usr/sbin/sshd", "sshd"), true, false},
+		// The built-in WAF agent entry carries its unit; replacing the defaults drops both.
+		{"built-in waf agent in its unit", wafInUnit, true, false},
+		{"built-in waf agent outside its unit", wafInSession, false, false},
 		{"configured name", hostRoot("/usr/sbin/nginx", "nginx"), true, true},
 		{"configured exe", hostRoot("/opt/acme/bin/agentd", "agentd"), true, false},
 		// Configured names get the same trust rules as the built-ins.
@@ -166,7 +179,7 @@ func TestTraceManagerConfigProtectedConfig(t *testing.T) {
 func TestProtectedSetSummary(t *testing.T) {
 	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ExePaths: []string{"/opt/b", "/opt/a"}})
 	got := s.Summary()
-	want := "names=[containerd,dockerd,kubelet,nginx,sshd,sshd-auth,sshd-session,systemd,systemd-journald] exe_paths=[/opt/a,/opt/b] builtin_defaults=merged"
+	want := "names=[containerd,dockerd,kubelet,nginx,sshd,sshd-auth,sshd-session,systemd,systemd-executor,systemd-journald] exe_paths=[/opt/a,/opt/b,/usr/local/bin/wafio-waf-agent] builtin_defaults=merged"
 	if got != want {
 		t.Errorf("Summary() = %q\nwant        %q", got, want)
 	}

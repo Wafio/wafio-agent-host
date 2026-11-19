@@ -125,13 +125,27 @@ daemons to protect them; without it only PID 1 and the agent are protected.
 ### Protected processes
 
 Kill policies never terminate a protected process. The built-in set is `sshd`
-(including `sshd-session` and `sshd-auth`), `systemd`, `systemd-journald`,
-`containerd`, `dockerd` and `kubelet`, each counted only when it runs the host
-binary. Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
+(including `sshd-session` and `sshd-auth`), `systemd`, `systemd-executor`,
+`systemd-journald`, `containerd`, `dockerd` and `kubelet`, each counted only when
+it runs the host binary as root, and the WAF agent. The WAF agent is matched by
+the exact path `/usr/local/bin/wafio-waf-agent` and counts only inside its own
+unit, the cgroup `/system.slice/wafio-waf-agent.service`: it runs as a service
+account and reads key and library paths from its own configuration, so the path
+alone would let any local user run the binary and be trusted. A copy elsewhere,
+a session scope, a user unit of the same name and a process with no readable
+cgroup do not count. `systemd-executor` is the helper systemd 255 and later run
+between PID 1 and each service.
+
+A protected process also gets `exe_verified` on its own trace events, so the
+control plane can tell the WAF agent reading its TLS key from another process
+reading it. The same set makes the WAF agent immune to Kill policies, so a
+policy cannot take down the sites it fronts.
+
+Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
 `WAFIO_PROTECTED_EXE_PATHS` (absolute paths); `WAFIO_PROTECTED_REPLACE_DEFAULTS=true`
-replaces the built-in names instead of extending them. A shell or interpreter in
-the list is accepted with a warning, because every root process running it
-would become unkillable.
+replaces the built-in names and the WAF agent entry instead of extending them. A
+shell or interpreter in the list is accepted with a warning, because every root
+process running it would become unkillable.
 
 Check a running agent:
 
