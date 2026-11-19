@@ -301,6 +301,26 @@ there, fix its directory and restart the process. `unit_check=unavailable` means
 namespace of its own and finds no readable `system.slice` under PID 1's root: the
 WAF agent and systemd-networkd are then not protected, and a warning names them.
 
+Read that line first. It names the kernel map (`map=trace_protected_tgids`), says
+how many entries the agent wrote at start (`protected_tgids=`) against how many
+processes matched (`matched_processes=`), and shows `kernel_missing=` when fewer
+were written. To see the map as it is now, list the maps and dump one by its id.
+`bpftool` cuts map names to 15 characters, so `trace_protected_tgids`,
+`trace_protected_images` and `trace_protected_budget` all show as
+`trace_protected`: `bpftool map dump name trace_protected_tgids` fails with
+"can't parse name", and `name trace_protected` dumps whichever of the three comes
+first.
+
+```sh
+sudo bpftool map list | grep -A1 'name trace_protected'
+sudo bpftool map dump id <id>
+```
+
+The tgid map is the `hash` with `key 4B value 8B`: each key is a process ID and
+each value the start time of that process in clock ticks (field 22 of
+`/proc/<pid>/stat`). The image map is the `hash` with `key 16B` and the budget map
+is the `array`.
+
 ### Memory use and map sizes
 
 The firewall keeps its state in BPF maps that the kernel preallocates when the

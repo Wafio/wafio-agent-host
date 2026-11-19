@@ -59,6 +59,21 @@ afterwards. Never stop sshd, the interface or other services on the machine to
 clean up. The private-network tests create their own veth pair, namespace and
 pin directory and remove only those.
 
+To see which processes the kernel protects, read the `protected-process
+self-check` line in the agent's log first (see "Protected processes" in the
+README). It names the map as `trace_protected_tgids`, but `bpftool` cuts map names
+to 15 characters, so that name finds nothing: all three protected-set maps show as
+`trace_protected` and `bpftool map dump name trace_protected_tgids` fails with
+"can't parse name". List them and dump by id:
+
+```sh
+sudo bpftool map list | grep -A1 'name trace_protected'
+sudo bpftool map dump id <id>
+```
+
+The process map is the `hash` with `key 4B value 8B`: keys are process IDs, values
+start times in clock ticks.
+
 ## Upgrade order
 
 Upgrade the control plane before the host agent: telemetry v2 needs the
