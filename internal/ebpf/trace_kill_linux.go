@@ -347,13 +347,18 @@ func (tm *TraceManager) disableInheritWithoutExec(probe string) {
 // updateProtectedBudget writes the kernel's fork-insert budget and its limit for
 // the next refresh period, and reports inserts the kernel refused since the
 // last one. The limit goes first: the kernel gives units back up to it, so a
-// lower budget never meets a higher limit.
+// lower budget never meets a higher limit. An object whose budget map has two
+// slots has no limit and gives nothing back, and its budget stays 0 (no exec
+// keep), so the limit slot is skipped there.
 func (tm *TraceManager) updateProtectedBudget(entries int) {
 	if tm.protectedBudgetMap == nil {
 		return
 	}
 	budget := protectedInheritBudget(entries, tm.execKeep)
 	for _, slot := range []uint32{protectedLimitSlot, protectedBudgetSlot} {
+		if slot >= tm.protectedBudgetMap.MaxEntries() {
+			continue
+		}
 		if err := tm.protectedBudgetMap.Update(slot, budget, ebpf.UpdateAny); err != nil {
 			tm.log.Printf("protected-process fork budget update (slot %d): %v", slot, err)
 		}

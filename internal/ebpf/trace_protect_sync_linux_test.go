@@ -17,23 +17,27 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 // fakeKernelMap stands in for a BPF map and records every write in a log it
 // shares with the other fakes, so a test can check the order of writes across
 // maps.
 type fakeKernelMap struct {
-	name      string
-	valueSize uint32
-	ops       *[]string
-	data      map[any]any
+	name       string
+	valueSize  uint32
+	maxEntries uint32 // the budget map of the current object: 3 slots
+	ops        *[]string
+	data       map[any]any
 }
 
 func newFakeKernelMap(name string, valueSize uint32, ops *[]string) *fakeKernelMap {
-	return &fakeKernelMap{name: name, valueSize: valueSize, ops: ops, data: make(map[any]any)}
+	return &fakeKernelMap{name: name, valueSize: valueSize, maxEntries: 3, ops: ops, data: make(map[any]any)}
 }
 
 func (m *fakeKernelMap) ValueSize() uint32 { return m.valueSize }
+
+func (m *fakeKernelMap) MaxEntries() uint32 { return m.maxEntries }
 
 func (m *fakeKernelMap) Update(key, value any, _ ebpf.MapUpdateFlags) error {
 	*m.ops = append(*m.ops, fmt.Sprintf("%s update %v", m.name, key))
@@ -198,6 +202,34 @@ func TestUpdateProtectedBudgetValues(t *testing.T) {
 	if _, ok := failing.data[protectedBudgetSlot]; !ok {
 		t.Error("the budget was not written after the limit failed")
 	}
+}
+
+// An object with a two-slot budget map has no limit slot: the refresh leaves it
+// out, so the kernel's refusal of the write never reaches the log.
+func TestUpdateProtectedBudgetOnTwoSlotMap(t *testing.T) {
+	var out bytes.Buffer
+	budget := newFakeKernelMap("budget", 8, new([]string))
+	budget.maxEntries = 2
+	tm := &TraceManager{log: log.New(&out, "", 0), protectedBudgetMap: arrayMap{budget}}
+	for range 3 {
+		tm.updateProtectedBudget(5)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("the refresh logged:\n%s", out.String())
+	}
+	if got := budget.data[protectedBudgetSlot]; got != int64(0) {
+		t.Fatalf("budget slot holds %v, want 0", got)
+	}
+}
+
+// arrayMap refuses a key past the capacity, as the kernel does for an array.
+type arrayMap struct{ *fakeKernelMap }
+
+func (m arrayMap) Update(key, value any, flags ebpf.MapUpdateFlags) error {
+	if k, ok := key.(uint32); ok && k >= m.maxEntries {
+		return unix.E2BIG
+	}
+	return m.fakeKernelMap.Update(key, value, flags)
 }
 
 type failingMap struct{ *fakeKernelMap }
