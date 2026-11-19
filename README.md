@@ -128,8 +128,9 @@ Kill policies never terminate a protected process. The built-in set is `sshd`
 (including `sshd-session` and `sshd-auth`), `systemd`, `systemd-executor`,
 `systemd-journald`, `containerd`, `dockerd`, `kubelet` and `nginx`, each counted
 only when it runs the host binary as root, the WAF agent and systemd-networkd.
-For `nginx` that is the master process: its workers run as the configured user
-and do not count. The WAF agent is matched by
+For `nginx` that is the master process: its workers, the cache manager and the
+cache loader lose the mark when they switch to the configured user. The WAF
+agent is matched by
 the exact path `/usr/local/bin/wafio-waf-agent` (the unit installer) or
 `/opt/wafio/wafio-waf-agent` (the installer in the WAF agent bundle) and counts
 only inside its own unit, the cgroup `/system.slice/wafio-waf-agent.service`: it
@@ -154,10 +155,15 @@ systemd 255 and later run between PID 1 and each service.
 A protected process also gets `exe_verified` on its own trace events, so the
 control plane can tell the WAF agent reading its TLS key, or the nginx master
 loading its own, from another process reading it. The mark says only that the
-kernel saw the process in the protected set. A child forked by a protected process keeps it until the child execs or the
-next refresh (5 s) drops it, also when the child changes its user in between, and a thread can rename itself with
-`prctl(PR_SET_NAME)`. A rule that trusts the mark should therefore also match
-the process name and the user. The same set makes the WAF agent immune to Kill
+kernel saw the process in the protected set. A child forked by a protected
+process has it from its first instruction. It loses it when it gives up root
+without an `exec` (the exit of `setuid`, `setreuid` or `setresuid`), unless its
+program keeps the mark for any user (a path in `WAFIO_PROTECTED_EXE_PATHS`) or
+inside its unit; a child of PID 1 keeps it until its `exec`, because systemd
+switches to `User=` right before it. A kernel that rejects those three programs
+leaves the next refresh (5 s) to drop the mark, as does a 32-bit call on x86_64.
+A thread can rename itself with `prctl(PR_SET_NAME)`. A rule that trusts the
+mark should therefore also match the process name and the user. The same set makes the WAF agent immune to Kill
 policies, so a policy cannot take down the sites it fronts.
 
 Across `exec` the kernel keeps the mark only when the new program is a file the

@@ -11,8 +11,10 @@ import (
 // structures mocked, and checks the kernel-side lifecycle: a child forked by a
 // protected process is protected at once, exec keeps the protection only for an
 // image listed by its file identity (never by comm) and only when the task meets
-// the condition of that image (root, or the systemd unit), the leader's exit
-// drops the entry, and every entry the kernel drops gives its budget unit back.
+// the condition of that image (root, or the systemd unit), a task that gives up
+// root without exec keeps it only under the same condition (a child of PID 1
+// is left to its exec), the leader's exit drops the entry, and every entry the
+// kernel drops gives its budget unit back.
 // Verifier acceptance and the real tracepoints are covered on the Linux lab,
 // not here.
 func TestTraceProtectedInheritance(t *testing.T) {
@@ -39,7 +41,7 @@ struct cgroup;
 struct cgroup_subsys_state { struct cgroup *cgroup; struct cgroup_subsys_state *parent; };
 struct cgroup { struct cgroup_subsys_state self; int level; struct kernfs_node *kn; };
 struct css_set { struct cgroup *dfl_cgrp; };
-struct task_struct { __u32 pid, tgid; struct task_struct *group_leader; __u64 start_boottime; struct signal_struct *signal; struct mm_struct *mm; struct css_set *cgroups; };
+struct task_struct { __u32 pid, tgid; struct task_struct *group_leader; __u64 start_boottime; struct signal_struct *signal; struct mm_struct *mm; struct css_set *cgroups; struct task_struct *real_parent; };
 `)
 	c.WriteString(bpfSourceDefines(t, "wafio_trace.c", "TRACE_NSEC_PER_USER_HZ_TICK", "TRACE_PROTECTED_", "TRACE_UNIT_NAME_LEN"))
 	c.WriteString(bpfSourceStruct(t, "wafio_trace.c", "protected_image_key"))
@@ -64,22 +66,20 @@ static void *bpf_get_current_task(void) { return cur_task; }
 static int fail_str_read;
 static long bpf_probe_read_kernel_str(void *dst, __u32 size, const void *src) { if (fail_str_read || !src) return -14; strncpy(dst, src, size - 1); ((char *)dst)[size - 1] = 0; return (long)strlen(dst) + 1; }
 `)
-	for _, name := range []string{"is_protected_tgid", "protected_inherit_refused", "protected_inherit_take", "protected_inherit_give", "protect_forked_child", "exec_image_key", "cgroup_dir_name", "task_in_unit", "protected_image_keeps", "protect_on_exec", "protect_on_exit"} {
+	for _, name := range []string{"is_protected_tgid", "protected_inherit_refused", "protected_inherit_take", "protected_inherit_give", "protect_forked_child", "exec_image_key", "cgroup_dir_name", "task_in_unit", "protected_image_keeps", "protect_on_exec", "protect_on_setuid", "protect_on_exit"} {
 		c.WriteString(bpfSourceHelper(t, "wafio_trace.c", name) + "\n")
 	}
 	c.WriteString(protectedLifecycleC)
 	runNativeC(t, "protected_set_lifecycle", c.String())
 
-	// A fork child keeps its entry through a UID change (the dropped child of
-	// sshd-session still runs that binary): nothing but fork, exec and exit may
-	// write the map, so no setuid hook can drop an entry.
+	// Nothing but fork, exec, the UID calls and exit may write the map.
 	for _, write := range []string{"bpf_map_update_elem(&trace_protected_tgids", "bpf_map_delete_elem(&trace_protected_tgids"} {
 		inHelpers := 0
-		for _, name := range []string{"protect_forked_child", "protect_on_exec", "protect_on_exit"} {
+		for _, name := range []string{"protect_forked_child", "protect_on_exec", "protect_on_setuid", "protect_on_exit"} {
 			inHelpers += strings.Count(bpfSourceHelper(t, "wafio_trace.c", name), write)
 		}
 		if total := strings.Count(string(source), write); total != inHelpers {
-			t.Errorf("%s: %d writes in wafio_trace.c, %d in the fork, exec and exit helpers", write, total, inHelpers)
+			t.Errorf("%s: %d writes in wafio_trace.c, %d in the fork, exec, setuid and exit helpers", write, total, inHelpers)
 		}
 	}
 }
@@ -119,6 +119,15 @@ static void run_exec(__u32 tgid, __u64 ino, __u32 dev, __u32 gen, const char *co
   exec_sb.s_dev = dev; exec_inode.i_ino = ino; exec_inode.i_sb = &exec_sb; exec_inode.i_generation = gen;
   exec_file.f_inode = &exec_inode; exec_mm.exe_file = &exec_file; exec_task.mm = &exec_mm; cur_task = &exec_task;
   cur_pid_tgid = ((__u64)tgid << 32) | tgid; strncpy(cur_comm, comm, 15); cur_uid_gid = uid; protect_on_exec();
+}
+/* The task at the exit of a UID call: it runs the image with this identity, its
+ * parent is the process with parent_tgid, and its real UID is now uid. */
+static struct task_struct setuid_parent;
+static void run_setuid(__u32 tgid, __u32 parent_tgid, __u64 ino, __u32 dev, __u32 gen, __u32 uid) {
+  exec_sb.s_dev = dev; exec_inode.i_ino = ino; exec_inode.i_sb = &exec_sb; exec_inode.i_generation = gen;
+  exec_file.f_inode = &exec_inode; exec_mm.exe_file = &exec_file; exec_task.mm = &exec_mm; cur_task = &exec_task;
+  setuid_parent.tgid = parent_tgid; exec_task.real_parent = &setuid_parent;
+  cur_pid_tgid = ((__u64)tgid << 32) | tgid; cur_uid_gid = uid; protect_on_setuid();
 }
 /* n times "u", in a buffer of its own. */
 static const char *u_run(int n) { static char buf[128]; memset(buf, 0, sizeof buf); memset(buf, 'u', (size_t)n); return buf; }
@@ -334,16 +343,67 @@ int main(void) {
   EXPECT(!has(720), "an exec kept the entry with no image listed");
   image(SSHD_SESSION, DEV, 7, TRACE_PROTECTED_IMAGE_ROOT, NULL);
 
-  /* A forked child that changes its UID without exec keeps its entry: it still
-   * runs the verified binary's code, and the refresh decides. */
+  /* A forked child that gives up root without exec (an nginx worker, the child
+   * of sshd that switches to the user) keeps its entry only when its image
+   * keeps it for a task without root. The budget unit comes back. */
+  image(AGENT, DEV, 8, TRACE_PROTECTED_IMAGE_ANY, NULL); image(WAF, DEV, 11, TRACE_PROTECTED_IMAGE_UNIT, "wafio-waf-agent.service");
   struct task_struct priv = mk_task(800, 800, 9600000000ULL); priv.group_leader = &priv;
   protect(800, 9600000000ULL);
   struct task_struct dropped = mk_task(801, 801, 9700000000ULL); dropped.group_leader = &dropped;
   set_budget(2);
   protect_forked_child(&priv, &dropped);
   EXPECT(has(801), "child of a protected process not inherited");
-  cur_uid_gid = 1000; /* setuid without exec: no kernel hook looks at it */
-  EXPECT(has(801), "a UID change dropped the inherited entry");
+  EXPECT(budget() == 1, "the inherited child did not take a budget unit");
+  run_setuid(801, 800, SSHD_SESSION, DEV, 7, 1000);
+  EXPECT(!has(801) && budget() == 2, "a child of a protected process that dropped root in a root-only image kept the entry or the budget unit");
+  /* a child of PID 1 is left to its exec: systemd switches to User= right
+   * before it execs the service binary, */
+  protect(802, 9800000000ULL); set_slot(TRACE_PROTECTED_BUDGET_SLOT, 1);
+  run_setuid(802, 1, SSHD_SESSION, DEV, 7, 998);
+  EXPECT(has(802) && budget() == 1, "a child of PID 1 lost the entry at its UID change");
+  /* and its exec decides: a root-only image as a service account loses it, the
+   * image of the WAF agent in its unit keeps it. */
+  run_exec(802, SSHD_SESSION, DEV, 7, "sshd-session", 998);
+  EXPECT(!has(802) && budget() == 2, "the exec after a UID change did not decide");
+  /* An image that keeps the entry for any task, or inside the unit the task is
+   * in, keeps it through the UID change, whoever the parent is. */
+  protect(803, 9900000000ULL);
+  run_setuid(803, 800, AGENT, DEV, 8, 998);
+  EXPECT(has(803), "an image for any task lost the entry at a UID change");
+  in_cgroup("wafio-waf-agent.service", 2, "system.slice");
+  protect(804, 9910000000ULL);
+  run_setuid(804, 800, WAF, DEV, 11, 999);
+  EXPECT(has(804), "a unit-bound image in its unit lost the entry at a UID change");
+  in_cgroup("sshd.service", 2, "system.slice");
+  run_setuid(804, 800, WAF, DEV, 11, 999);
+  EXPECT(!has(804), "a unit-bound image outside its unit kept the entry at a UID change");
+  /* A real UID that is still 0 changes nothing, whatever the image. */
+  protect(805, 9920000000ULL);
+  run_setuid(805, 800, SSHD_SESSION, DEV, 7, 0);
+  run_setuid(805, 800, 4242, DEV, 3, 0);
+  EXPECT(has(805), "a task that is still root lost the entry");
+  /* An image the table does not list, a read that fails and a delete that
+   * fails: the first two drop the entry, the last gives nothing back. */
+  run_setuid(805, 800, 4242, DEV, 3, 998);
+  EXPECT(!has(805), "an unlisted image kept the entry at a UID change");
+  protect(806, 9930000000ULL);
+  { struct task_struct t = mk_task(806, 806, 9930000000ULL); cur_task = &t; cur_pid_tgid = ((__u64)806 << 32) | 806; cur_uid_gid = 998; protect_on_setuid(); }
+  EXPECT(!has(806), "a UID change whose image could not be read kept the entry");
+  protect(807, 9940000000ULL); set_slot(TRACE_PROTECTED_BUDGET_SLOT, 1);
+  fail_delete = 1;
+  run_setuid(807, 800, 4242, DEV, 3, 998);
+  fail_delete = 0;
+  EXPECT(has(807) && budget() == 1, "a delete that removed nothing gave a unit back at a UID change");
+  bpf_map_delete_elem(&trace_protected_tgids, &(__u32){ 807 });
+  /* A task with no entry has nothing to drop and gives nothing back. */
+  run_setuid(808, 800, SSHD_SESSION, DEV, 7, 998);
+  EXPECT(!has(808) && budget() == 1, "a UID change of a process without an entry changed the map or the budget");
+  /* A parent that cannot be read is not PID 1. */
+  protect(809, 9950000000ULL);
+  exec_sb.s_dev = DEV; exec_inode.i_ino = SSHD_SESSION; exec_inode.i_sb = &exec_sb; exec_inode.i_generation = 7;
+  exec_file.f_inode = &exec_inode; exec_mm.exe_file = &exec_file; exec_task.mm = &exec_mm; exec_task.real_parent = NULL; cur_task = &exec_task;
+  cur_pid_tgid = ((__u64)809 << 32) | 809; cur_uid_gid = 998; protect_on_setuid();
+  EXPECT(!has(809), "a parent that could not be read kept a root-only entry like PID 1's child");
 
   /* exit: only when the whole thread group is gone, and only for the
    * entry's own process. */

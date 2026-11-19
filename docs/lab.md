@@ -28,7 +28,7 @@ reusing old pinned maps is not supported.
 | Integration fixtures | see `internal/ebpf/integration/README.md` | root, `WAFIO_EBPF_INTEGRATION=1`, an authorized lab |
 | Lockout and Kill scenarios | `.github/workflows/ebpf-vm.yml` (dispatch) | a VM per kernel: 5.10, 5.15, 6.1 and 6.12 |
 | Full maps | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectMapSizes\|TestTraceProtectedImagesMapMatchesAgent\|TestKernelMapFull' ./internal/ebpf/` | root, objects |
-| Protected set in the kernel | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestKernelProtected\|TestKernelBTFHasUnitCheckFields' ./internal/ebpf/` | root, objects, cgroup v2 with `/sys/fs/cgroup/system.slice` (a systemd host), a root-owned `sleep` on ext4, XFS or btrfs; attaches the fork, exec and exit programs for a few seconds and makes cgroups named `wafio-itest-*`, which it removes |
+| Protected set in the kernel | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestKernelProtected\|TestKernelBTFHasUnitCheckFields' ./internal/ebpf/` | root, objects, cgroup v2 with `/sys/fs/cgroup/system.slice` (a systemd host), a root-owned `sleep` and `setpriv` (util-linux) on ext4, XFS or btrfs; attaches the fork, exec, exit and the exit programs of `setuid`, `setreuid` and `setresuid` for a few seconds and makes cgroups named `wafio-itest-*`, which it removes |
 | Restart, kill and load at the smallest sizes | `WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_EBPF_FLOOR_LOAD=1 go test ./internal/ebpf/integration -run 'TestVMScenarioMapScale\|TestVMScenarioKilledAgent\|TestVMScenarioLastGood\|TestMapFloorLoad'` | root, objects, veth, a disposable VM |
 
 `scripts/ci-local.sh` runs the first three rows (the third only as root). The

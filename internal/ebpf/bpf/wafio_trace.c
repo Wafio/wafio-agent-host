@@ -96,10 +96,10 @@ struct {
  * before it first runs; exec keeps an entry only when the new image is a file
  * listed in trace_protected_images (identified by device, inode and
  * generation, never by name) and the task meets that file's condition; the
- * leader's exit removes it. The refresh
- * reconciles against the map's content and drops what it cannot verify. A
- * fork child keeps its entry through a UID change until it execs or the
- * refresh drops it. */
+ * leader's exit removes it; so does the exit of setuid, setreuid or setresuid
+ * that leaves a task without root, unless its image keeps the entry for that
+ * task (protect_on_setuid). The refresh
+ * reconciles against the map's content and drops what it cannot verify. */
 #define TRACE_MAX_PROTECTED 1024
 #define TRACE_NSEC_PER_USER_HZ_TICK 10000000ULL
 struct {
@@ -222,9 +222,10 @@ protected_inherit_give(void)
 }
 
 /* A child forked by a protected process runs that process's verified
- * image until it execs, so it is protected from its first instruction instead
- * of after the next 5 s refresh (sshd's per-connection child, sshd-session's
- * pre-auth child). PID 1 is guarded by number, so its children count too.
+ * image until it execs or gives up root, so it is protected from its first
+ * instruction instead of after the next 5 s refresh (sshd's per-connection
+ * child, sshd-session's pre-auth child). PID 1 is guarded by number, so its
+ * children count too.
  * A new thread shares the parent's TGID and needs no entry. Inserts are
  * bounded by trace_protected_budget; a refused insert only delays the child's
  * kernel protection to the next refresh. Called at sched_process_fork, before
@@ -370,6 +371,35 @@ protect_on_exec(void)
     if (!bpf_map_lookup_elem(&trace_protected_tgids, &tgid))
         return;
     struct task_struct *task = (void *)bpf_get_current_task();
+    struct protected_image_key key = {};
+    exec_image_key(task, &key);
+    struct protected_image *image = bpf_map_lookup_elem(&trace_protected_images, &key);
+    if (image && protected_image_keeps(image, task))
+        return;
+    if (bpf_map_delete_elem(&trace_protected_tgids, &tgid) == 0)
+        protected_inherit_give();
+}
+
+/* A task that gives up root without an exec still runs the image its entry
+ * was granted for. At the exit of setuid, setreuid and setresuid the entry
+ * stays only when that image keeps it for this task, as exec decides (a
+ * configured path, the unit of the WAF agent). A root-only image loses it, as
+ * an nginx worker or sshd's child that switches to the user does, and the
+ * budget unit comes back. A child of PID 1 is left to its exec: systemd
+ * switches to User= right before it. A real UID that is still 0 changes
+ * nothing. */
+static __always_inline void
+protect_on_setuid(void)
+{
+    if ((__u32)bpf_get_current_uid_gid() == 0)
+        return;
+    __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    if (!bpf_map_lookup_elem(&trace_protected_tgids, &tgid))
+        return;
+    struct task_struct *task = (void *)bpf_get_current_task();
+    struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+    if (BPF_CORE_READ(parent, tgid) == 1)
+        return;
     struct protected_image_key key = {};
     exec_image_key(task, &key);
     struct protected_image *image = bpf_map_lookup_elem(&trace_protected_images, &key);
@@ -1265,6 +1295,29 @@ SEC("tracepoint/sched/sched_process_exec")
 int trace_sched_process_exec(void *ctx)
 {
     protect_on_exec();
+    return 0;
+}
+
+/* ── set*uid exits: protected-set maintenance only ───────────────────────── */
+/* No event: sys_enter_setuid reports the request, before the credentials change. */
+SEC("tracepoint/syscalls/sys_exit_setuid")
+int trace_sys_exit_setuid(void *ctx)
+{
+    protect_on_setuid();
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setreuid")
+int trace_sys_exit_setreuid(void *ctx)
+{
+    protect_on_setuid();
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setresuid")
+int trace_sys_exit_setresuid(void *ctx)
+{
+    protect_on_setuid();
     return 0;
 }
 
