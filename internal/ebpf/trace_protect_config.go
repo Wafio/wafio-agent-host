@@ -39,7 +39,8 @@ type ProtectedProcessConfig struct {
 	// binary whatever user it runs as.
 	ExePaths []string
 	// ReplaceDefaults drops DefaultProtectedProcessNames and
-	// DefaultProtectedUnitExes so only Names and ExePaths apply. Honored only
+	// DefaultProtectedUnitExes so only Names and ExePaths apply. A built-in
+	// unit path listed again in ExePaths keeps its unit requirement. Honored only
 	// when at least one valid entry remains.
 	ReplaceDefaults bool
 }
@@ -200,9 +201,9 @@ func NewProtectedProcessSetFromConfig(cfg ProtectedProcessConfig) *ProtectedProc
 		units:            make(map[string]string),
 		defaultsReplaced: cfg.defaultsReplaced(),
 	}
-	if !s.defaultsReplaced {
-		maps.Copy(s.units, DefaultProtectedUnitExes)
-	}
+	// The unit requirement follows the path, so an operator who replaces the
+	// defaults and lists a built-in path again still gets the unit check.
+	maps.Copy(s.units, DefaultProtectedUnitExes)
 	for _, n := range cfg.EffectiveNames() {
 		s.names[n] = struct{}{}
 		s.comms[truncateComm(n)] = struct{}{}

@@ -108,7 +108,8 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 	const wafExe, wafUnit = "/usr/local/bin/wafio-waf-agent", "/system.slice/wafio-waf-agent.service"
 	const wafBundleExe = "/opt/wafio/wafio-waf-agent" // where the WAF agent bundle installer puts it
 	waf := func(exe, cgroup string) procIdentity {
-		return with(hostRoot(exe, "wafio-waf-agent"), func(i *procIdentity) { i.rootUIDs = triNo; i.cgroup = cgroup })
+		// The shipped unit gives the agent its own mount namespace.
+		return with(hostRoot(exe, "wafio-waf-agent"), func(i *procIdentity) { i.rootUIDs = triNo; i.hostMntNS = triNo; i.cgroup = cgroup })
 	}
 	for _, tc := range []struct {
 		name string
@@ -159,6 +160,8 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		// inode are not enough, because any local user can run the genuine binary.
 		{"waf agent in its unit", waf(wafExe, wafUnit), true},
 		{"waf agent deleted image in its unit", waf(wafExe+" (deleted)", wafUnit), true},
+		{"waf agent deleted image in a session scope", waf(wafExe+" (deleted)", "/user.slice/user-1000.slice/session-3.scope"), false},
+		{"waf agent deleted image cgroup unreadable", waf(wafExe+" (deleted)", ""), false},
 		{"waf agent in a session scope", waf(wafExe, "/user.slice/user-1000.slice/session-3.scope"), false},
 		{"waf agent in a user unit of the same name", waf(wafExe, "/user.slice/user-1000.slice/user@1000.service/app.slice/wafio-waf-agent.service"), false},
 		{"waf agent in a sub-cgroup", waf(wafExe, wafUnit+"/sub"), false},

@@ -134,7 +134,10 @@ only inside its own unit, the cgroup `/system.slice/wafio-waf-agent.service`: it
 runs as a service account and reads key and library paths from its own
 configuration, so the path alone would let any local user run the binary and be
 trusted. A copy elsewhere, a session scope, a user unit of the same name and a
-process with no readable cgroup do not count. `systemd-executor` is the helper
+process with no readable cgroup do not count. The unit check follows the path,
+also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. The unit gives the agent
+its own mount namespace, so a binary replaced on disk still counts until the
+next restart if the process is in that cgroup. `systemd-executor` is the helper
 systemd 255 and later run between PID 1 and each service.
 
 A protected process also gets `exe_verified` on its own trace events, so the

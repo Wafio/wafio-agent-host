@@ -145,7 +145,7 @@ type procIdentity struct {
 	hostExe tri
 	// hostMntNS: the process shares pid 1's mount namespace. Used for a
 	// replaced-on-disk image ("(deleted)"), whose inode no longer exists at
-	// the path.
+	// the path, unless the path is bound to a unit.
 	hostMntNS tri
 	// rootUIDs: real, effective, saved and filesystem UID are all 0. An
 	// unprivileged user can run a genuine, non-setuid protected binary, but
@@ -189,7 +189,8 @@ func kernelThread(statPath string) tri {
 // attacker-controlled. A protected exe path counts only when the process is
 // verifiably that host binary (hostExe, or hostMntNS for a replaced image),
 // runs without a loader injection, runs in its own unit when the set names one
-// for that path (units), and, for the built-in name list, runs as root. Any
+// for that path (units, which also stands in for the mount namespace check on a
+// replaced image), and, for the built-in name list, runs as root. Any
 // failed or impossible verification means NOT protected: the protection exists
 // to keep host daemons alive, and must not become a way for the processes a
 // Kill policy targets to exempt themselves.
@@ -222,7 +223,9 @@ func (s *ProtectedProcessSet) matchIdentity(id procIdentity) (bool, string) {
 		return false, ""
 	}
 	if deleted {
-		if id.hostMntNS != triYes {
+		// A unit-bound path needs no host mount namespace: its unit may give the
+		// process its own, and the cgroup check below decides.
+		if _, bound := s.units[exe]; !bound && id.hostMntNS != triYes {
 			return false, ""
 		}
 	} else if id.hostExe != triYes {

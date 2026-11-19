@@ -167,6 +167,23 @@ func TestProtectedSetFromConfigMatching(t *testing.T) {
 	}
 }
 
+// Replacing the defaults drops the built-in WAF agent entry, but listing its
+// path again must not skip the unit requirement.
+func TestProtectedSetReplacedDefaultsKeepUnitRequirement(t *testing.T) {
+	const exe = "/usr/local/bin/wafio-waf-agent"
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{exe}, ReplaceDefaults: true})
+	id := hostRoot(exe, "wafio-waf-agent")
+	id.rootUIDs = triNo
+	id.cgroup = "/system.slice/wafio-waf-agent.service"
+	if ok, _ := s.matchIdentity(id); !ok {
+		t.Error("built-in path in its unit not protected")
+	}
+	id.cgroup = "/user.slice/user-1000.slice/session-3.scope"
+	if ok, _ := s.matchIdentity(id); ok {
+		t.Error("built-in path in a session scope protected after replacing the defaults")
+	}
+}
+
 func TestTraceManagerConfigProtectedConfig(t *testing.T) {
 	cfg := TraceManagerConfig{
 		ProtectedProcessNames:    []string{"nginx"},
