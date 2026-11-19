@@ -175,8 +175,9 @@ mark only for root; the paths in `WAFIO_PROTECTED_EXE_PATHS`, which keep it for
 any user; the WAF agent and systemd-networkd paths above, which keep it only
 inside their unit; the programs of processes the agent has already verified;
 and the `systemd-executor` file that PID 1 holds open. The agent rewrites the
-list every 5 s and at once when a file with one of those names changes in one
-of those directories, so a restart right after a package upgrade is still
+list every 5 s and again when a file with one of those names changes in one of
+those directories, at most once a second (the last change of a burst waits for
+the second to pass), so a restart right after a package upgrade is still
 verified from its first event. A program that only carries a protected name (a
 copy, a renamed file, a binary in another directory) loses the mark at `exec`,
 before its first instruction.
@@ -194,8 +195,9 @@ is trusted. A directory
 that is group-writable, as `/usr/local/bin` is on some Debian hosts
 (`root:staff`, mode 2775), makes the files in it untrusted until it is set to
 `755`. A directory that does not exist when the agent starts is watched as soon
-as it appears (at the next 5 s refresh), and one that is moved or replaced is
-watched again the same way. A WAF agent whose binary or directory an account
+as it appears (at the next 5 s refresh), and one that is moved or replaced, or
+that a symlink in a configured path now leads away from, is watched again the
+same way. A WAF agent whose binary or directory an account
 other than root owns (an installer that hands `/opt/wafio` to the service
 account) is not protected and has no mark: leave both to root. The agent says so
 once in its log for each such path ("can be written by an account other than
