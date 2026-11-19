@@ -14,6 +14,9 @@ func (tm *TraceManager) runProtectedSelfCheck() protectedSelfCheck {
 		risky:      tm.protected.RiskyEntries(),
 		procDenied: procIdentityDenied(tm.proc()),
 	}
+	if !unitCheckAvailable(tm.proc()) {
+		c.unitUnavailable = tm.protected.unitExePaths()
+	}
 	if tm.protectedMap == nil {
 		tgids, untrusted, err := tm.protected.scanProtectedTGIDs(tm.proc(), os.Getpid())
 		c.matched, c.untrusted, c.scanErr = len(tgids), untrusted, err

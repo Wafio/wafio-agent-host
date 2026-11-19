@@ -140,7 +140,11 @@ trusted. systemd-networkd is matched the same way, by
 counts only in the cgroup `/system.slice/systemd-networkd.service`; it runs as
 its own user (`systemd-network`). A copy elsewhere, a session scope, a user unit of the same name and a
 process with no readable cgroup do not count. The unit check follows the path,
-also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. A binary replaced on disk
+also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. It also works when the
+agent runs in a cgroup namespace of its own, where `/proc/<pid>/cgroup` is
+relative to that namespace: the agent then reads the unit's `cgroup.procs` under
+PID 1's root (`/sys/fs/cgroup/system.slice/<unit>`) and counts a process the file
+lists. A binary replaced on disk
 (a package upgrade) counts until the next restart, but only while the running
 file is one that only root can write and sits on the filesystem of the directory
 its path names; for a path that is not bound to a unit the process must also be
@@ -246,7 +250,9 @@ journalctl -u wafio-host-agent -b | grep 'protected-process self-check'
 means the unit lacks `CAP_SYS_PTRACE`. `untrusted_owner=<paths>` lists files or
 directories that an account other than root can write under a protected process:
 that process is not protected until root owns the path and neither its group nor
-others can write it.
+others can write it. `unit_check=unavailable` means the agent is in a cgroup
+namespace of its own and finds no readable `system.slice` under PID 1's root: the
+WAF agent and systemd-networkd are then not protected, and a warning names them.
 
 ### Memory use and map sizes
 

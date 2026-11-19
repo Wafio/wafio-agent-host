@@ -228,7 +228,7 @@ func TestProtectedSelfCheckString(t *testing.T) {
 			"present",
 			protectedSelfCheck{kernelSet: true, valueSize: 8, kernelTGIDs: 3, matched: 3},
 			[]string{"protected-process self-check: kernel_set=present map=trace_protected_tgids value=start_ticks protected_tgids=3 matched_processes=3 userspace_guard=on"},
-			[]string{"kernel_missing", "scan_error", "note=", "proc_access", "hint=", "untrusted_owner"},
+			[]string{"kernel_missing", "scan_error", "note=", "proc_access", "hint=", "untrusted_owner", "unit_check"},
 		},
 		{
 			"identity links denied (no CAP_SYS_PTRACE)",
@@ -259,6 +259,12 @@ func TestProtectedSelfCheckString(t *testing.T) {
 			protectedSelfCheck{kernelSet: true, valueSize: 8, kernelTGIDs: 3, matched: 3, untrusted: []string{"/usr/local/bin", "/usr/local/bin/kubelet"}},
 			[]string{" untrusted_owner=/usr/local/bin,/usr/local/bin/kubelet"},
 			nil,
+		},
+		{
+			"unit check unavailable",
+			protectedSelfCheck{kernelSet: true, valueSize: 8, kernelTGIDs: 3, matched: 3, unitUnavailable: []string{"/usr/local/bin/wafio-waf-agent"}},
+			[]string{" unit_check=unavailable hint=", "cgroup namespace"},
+			[]string{"untrusted_owner"},
 		},
 		{
 			"scan error",
@@ -300,6 +306,10 @@ func TestProtectedSelfCheckWarning(t *testing.T) {
 	w = protectedSelfCheck{kernelSet: true, valueSize: 8, matched: 3, kernelTGIDs: 3, untrusted: []string{"/usr/local/bin/kubelet"}}.Warning()
 	if !strings.HasPrefix(w, "WARNING: ") || !strings.Contains(w, "/usr/local/bin/kubelet") || !strings.Contains(w, "make root the owner") || strings.Contains(w, "\n") {
 		t.Fatalf("untrusted owner warning = %q", w)
+	}
+	w = protectedSelfCheck{kernelSet: true, valueSize: 8, unitUnavailable: []string{"/usr/local/bin/wafio-waf-agent", "/usr/lib/systemd/systemd-networkd"}}.Warning()
+	if !strings.HasPrefix(w, "WARNING: ") || !strings.Contains(w, "/usr/local/bin/wafio-waf-agent, /usr/lib/systemd/systemd-networkd") || strings.Contains(w, "\n") {
+		t.Fatalf("unit check warning = %q", w)
 	}
 	both := protectedSelfCheck{kernelSet: true, valueSize: 8, procDenied: true, untrusted: []string{"/usr/local/bin/kubelet"}}.Warning()
 	if lines := strings.Split(both, "\n"); len(lines) != 2 || !strings.Contains(lines[0], "CAP_SYS_PTRACE") || !strings.Contains(lines[1], "/usr/local/bin/kubelet") {

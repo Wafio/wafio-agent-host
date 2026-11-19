@@ -263,8 +263,9 @@ type procIdentity struct {
 	// whose live threads renamed themselves.
 	kthread tri
 
-	// cgroup: the systemd cgroup path of the process (see systemdCgroup). Read
-	// only for an exe that must run in a unit; "" when unreadable.
+	// cgroup: the cgroup path of the process in the form matchIdentity compares
+	// (see unitCgroup). Read only for an exe that must run in a unit; "" when
+	// unreadable or not in that unit.
 	cgroup string
 
 	// untrusted: the file or directory an account other than root can write
@@ -437,9 +438,69 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
 	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {
-		id.cgroup = systemdCgroup(filepath.Join(dir, "cgroup"))
+		id.cgroup = unitCgroup(procRoot, dir, pid, s.units[exe])
 	}
 	return id
+}
+
+// hostCgroupRoots are the places, inside PID 1's root, where the hierarchy
+// that systemd places its units in is mounted: the unified one, or the named
+// systemd hierarchy of a hybrid or v1 host.
+var hostCgroupRoots = []string{"sys/fs/cgroup", "sys/fs/cgroup/unified", "sys/fs/cgroup/systemd"}
+
+// sharesHostCgroupNS reports whether this process is in the cgroup namespace of
+// PID 1. /proc/<pid>/cgroup is rendered relative to the reader's namespace root,
+// so from a private one a unit outside it reads "/../../system.slice/<unit>".
+// A link that cannot be read counts as shared: PID 1's links are gated like its
+// exe link, and procIdentityDenied reports that case.
+func sharesHostCgroupNS(procRoot string) bool {
+	own, err := os.Readlink(filepath.Join(procRoot, "self", "ns", "cgroup"))
+	if err != nil {
+		return true
+	}
+	host, err := os.Readlink(filepath.Join(procRoot, "1", "ns", "cgroup"))
+	if err != nil {
+		return true
+	}
+	return own == host
+}
+
+// unitCgroup returns the cgroup of the process in the form matchIdentity
+// compares. In the namespace of PID 1 that is the path in /proc/<pid>/cgroup.
+// In a private one it is "/system.slice/<unit>" when the cgroup.procs of that
+// unit under PID 1's root lists the process (a direct member, which the exact
+// path says too) and "" when it does not: that file does not depend on the
+// reader's namespace.
+func unitCgroup(procRoot, dir string, pid uint32, unit string) string {
+	if sharesHostCgroupNS(procRoot) {
+		return systemdCgroup(filepath.Join(dir, "cgroup"))
+	}
+	for _, root := range hostCgroupRoots {
+		data, err := os.ReadFile(filepath.Join(procRoot, "1", "root", root, "system.slice", unit, "cgroup.procs"))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err == nil && slices.Contains(strings.Fields(string(data)), strconv.FormatUint(uint64(pid), 10)) {
+			return "/system.slice/" + unit
+		}
+		return ""
+	}
+	return ""
+}
+
+// unitCheckAvailable reports whether the unit of a protected path can be told:
+// the agent shares PID 1's cgroup namespace, or PID 1's root shows a
+// system.slice directory the agent can read.
+func unitCheckAvailable(procRoot string) bool {
+	if sharesHostCgroupNS(procRoot) {
+		return true
+	}
+	for _, root := range hostCgroupRoots {
+		if _, err := os.Stat(filepath.Join(procRoot, "1", "root", root, "system.slice")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // systemdCgroup returns the cgroup path from a /proc/<pid>/cgroup file: the

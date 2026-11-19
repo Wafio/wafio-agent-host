@@ -231,6 +231,19 @@ func (s *ProtectedProcessSet) ExePaths() []string {
 	return sortedKeys(s.exes)
 }
 
+// unitExePaths returns the executable paths bound to a unit, sorted.
+func (s *ProtectedProcessSet) unitExePaths() []string {
+	if s == nil {
+		return nil
+	}
+	paths := make([]string, 0, len(s.units))
+	for p := range s.units {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
 // riskyProtectedNames are shells, interpreters and multi-call binaries.
 // Protecting one exempts every root process running that host binary from
 // Kill enforcement — which is what a post-exploitation shell or one-liner
@@ -337,7 +350,14 @@ type protectedSelfCheck struct {
 	// untrusted: paths an account other than root can write, under protected
 	// processes that are therefore not protected (scanProtectedTGIDs).
 	untrusted []string
+	// unitUnavailable: the executable paths bound to a unit when the unit of a
+	// process cannot be told (unitCheckAvailable): none of them is protected.
+	unitUnavailable []string
 }
+
+// protectedUnitCheckHint names the fix on the self-check line and in the
+// startup warning.
+const protectedUnitCheckHint = "the agent runs in a cgroup namespace of its own and PID 1's root shows no readable system.slice: run it in the host cgroup namespace"
 
 // protectedUntrustedHint names the fix on the log line and in the startup
 // warning.
@@ -377,6 +397,9 @@ func (c protectedSelfCheck) String() string {
 	if len(c.untrusted) > 0 {
 		fmt.Fprintf(&b, " untrusted_owner=%s", strings.Join(c.untrusted, ","))
 	}
+	if len(c.unitUnavailable) > 0 {
+		fmt.Fprintf(&b, " unit_check=unavailable hint=%q", protectedUnitCheckHint)
+	}
 	if !c.kernelSet {
 		b.WriteString(" note=\"trace object predates the protected set; kernel kill paths skip only pid<=1 and the agent\"")
 	}
@@ -395,6 +418,9 @@ func (c protectedSelfCheck) Warning() string {
 	}
 	if len(c.untrusted) > 0 {
 		lines = append(lines, "WARNING: protected processes without protection, an account other than root can write "+strings.Join(c.untrusted, ", ")+": "+protectedUntrustedHint)
+	}
+	if len(c.unitUnavailable) > 0 {
+		lines = append(lines, "WARNING: protected-process unit check unavailable, not protected: "+strings.Join(c.unitUnavailable, ", ")+": "+protectedUnitCheckHint)
 	}
 	return strings.Join(lines, "\n")
 }

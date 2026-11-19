@@ -405,6 +405,94 @@ func TestScanProtectedTGIDs(t *testing.T) {
 	}
 }
 
+// In a cgroup namespace of its own the agent reads a unit outside it as
+// "/../../system.slice/<unit>", which never equals the unit's path. It asks
+// the unit's cgroup.procs under PID 1's root instead: a process the file lists
+// is a direct member, one it does not list is not, whatever its relative path
+// says.
+func TestUnitCheckInPrivateCgroupNamespace(t *testing.T) {
+	const self = 300
+	const unit = "wafio-waf-agent.service"
+	const relative = "0::/../../system.slice/" + unit + "\n"
+	waf := func(start uint64, cgroup string) fakeProcEntry {
+		return fakeProcEntry{exe: "/usr/local/bin/wafio-waf-agent", comm: "wafio-waf-agent", uid: "999", mntns: hostNS, hostExe: true, start: start, cgroup: cgroup}
+	}
+	build := func(t *testing.T, selfNS, procsDir, procs string) string {
+		t.Helper()
+		root := fakeProc(t, map[uint32]fakeProcEntry{
+			1:   hostDaemon("/usr/lib/systemd/systemd", "systemd", 1),
+			108: waf(1108, relative),
+			109: waf(1109, relative),
+		})
+		for dir, target := range map[string]string{"self": selfNS, "1": "cgroup:[4026531835]"} {
+			if err := os.MkdirAll(filepath.Join(root, dir, "ns"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(root, dir, "ns", "cgroup")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if procsDir != "" {
+			dir := filepath.Join(root, "1", "root", procsDir, "system.slice", unit)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(procs), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	tgids := func(root string) []uint32 {
+		t.Helper()
+		got, _, err := NewProtectedProcessSet(nil, nil).scanProtectedTGIDs(root, self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pids []uint32
+		for _, p := range got {
+			pids = append(pids, p.tgid)
+		}
+		slices.Sort(pids)
+		return pids
+	}
+
+	// A private namespace: only the process the unit lists is protected.
+	for _, dir := range hostCgroupRoots {
+		root := build(t, "cgroup:[4026532500]", dir, "42\n108\n")
+		if got := tgids(root); !slices.Equal(got, []uint32{108}) {
+			t.Errorf("private namespace, unit listed under %s: protected %v, want [108]", dir, got)
+		}
+		if !unitCheckAvailable(root) {
+			t.Errorf("a readable system.slice under %s reported as unavailable", dir)
+		}
+	}
+	// No unit directory to ask, or none of the places has system.slice at all.
+	if got := tgids(build(t, "cgroup:[4026532500]", "", "")); len(got) != 0 {
+		t.Errorf("private namespace without a system.slice: protected %v, want none", got)
+	}
+	if unitCheckAvailable(build(t, "cgroup:[4026532500]", "", "")) {
+		t.Error("a private namespace with no readable system.slice reported as available")
+	}
+	// The same namespace as PID 1: the path in /proc/<pid>/cgroup, as before,
+	// and the file of the unit is not asked.
+	root := build(t, "cgroup:[4026531835]", "sys/fs/cgroup", "108\n109\n")
+	if got := tgids(root); len(got) != 0 {
+		t.Errorf("shared namespace, relative path: protected %v, want none", got)
+	}
+	if !unitCheckAvailable(build(t, "cgroup:[4026531835]", "", "")) {
+		t.Error("the shared namespace reported the unit check as unavailable")
+	}
+	for _, pid := range []string{"108", "109"} {
+		if err := os.WriteFile(filepath.Join(root, pid, "cgroup"), []byte("0::/system.slice/"+unit+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := tgids(root); !slices.Equal(got, []uint32{108, 109}) {
+		t.Errorf("shared namespace, exact path: protected %v, want [108 109]", got)
+	}
+}
+
 // A host agent confined to a capability subset without CAP_SYS_PTRACE gets
 // EPERM on /proc/<pid>/exe of every root daemon (cap_ptrace_access_check):
 // the scan then matches nothing, silently. procIdentityDenied detects that
