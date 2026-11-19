@@ -67,6 +67,18 @@ var trustedExeDirs = []string{
 	"/usr/local/sbin/", "/usr/local/bin/", "/snap/",
 }
 
+// trustedUID is the owner a trusted file and its directory must have. It is 0;
+// a test that builds its files as an unprivileged user sets its own UID.
+var trustedUID uint32
+
+// trustedOwnerMode reports whether a file with this owner and permission bits
+// could only have been written by root: owned by trustedUID and writable by
+// neither its group nor others. Anyone else who can write the file, or its
+// directory, can replace a trusted binary with one of their own.
+func trustedOwnerMode(uid uint32, perm uint32) bool {
+	return uid == trustedUID && perm&0o022 == 0
+}
+
 // taskCommLen mirrors TASK_COMM_LEN: the kernel keeps 15 bytes + NUL.
 const taskCommLen = 16
 
