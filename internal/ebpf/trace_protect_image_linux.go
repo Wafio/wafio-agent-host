@@ -406,6 +406,22 @@ func startTicksAt(dir string) (uint64, bool) {
 // of its start time. Tests use it to change the process in between.
 var afterImageRead func(dir string)
 
+// beforeProtectedPut runs before the refresh writes the entry of a tgid. Tests
+// use it to change the process after the scan.
+var beforeProtectedPut func(tgid uint32)
+
+// protectedStillRuns reports whether the process still has the start time and
+// the image the scan verified. The PID and the start time stay the same across
+// an exec, so the image decides, as in kernelImages.
+func protectedStillRuns(procRoot string, p protectedTGID) bool {
+	dir := procDir(procRoot, p.tgid)
+	if ticks, ok := startTicksAt(dir); !ok || ticks != p.startTicks {
+		return false
+	}
+	now, err := os.Stat(filepath.Join(dir, "exe"))
+	return err == nil && os.SameFile(now, p.file)
+}
+
 // systemDirOnly says that a path comes from a protected name searched in the
 // system directories (imagePaths): symlinks are refused in its directory part.
 func systemDirOnly(img protectedImage) bool {

@@ -299,12 +299,14 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 		tgids = tgids[:maxProtectedTGIDs]
 	}
 	want := make(map[uint32]uint64, len(tgids))
+	scanned := make(map[uint32]protectedTGID, len(tgids))
 	for _, p := range tgids {
 		v := uint64(1)
 		if tm.protectedMap.ValueSize() == 8 {
 			v = p.startTicks
 		}
 		want[p.tgid] = v
+		scanned[p.tgid] = p
 	}
 	// Reconcile against the map itself, not our own writes: the kernel adds
 	// and removes entries between refreshes.
@@ -323,6 +325,9 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 		delete(have, tgid)
 	}
 	for tgid, v := range put {
+		if beforeProtectedPut != nil {
+			beforeProtectedPut(tgid)
+		}
 		var err error
 		if tm.protectedMap.ValueSize() == 8 {
 			err = tm.protectedMap.Update(tgid, v, ebpf.UpdateAny)
@@ -332,6 +337,16 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 		if err != nil {
 			tm.log.Printf("protected-process map update %d: %v", tgid, err)
 			continue
+		}
+		// The exec and exit hooks of the kernel see only an entry that exists. A
+		// process that exec'd another image or exited after the scan met none,
+		// and the write put its entry back: check it now, after the write.
+		if !protectedStillRuns(tm.proc(), scanned[tgid]) {
+			derr := tm.protectedMap.Delete(tgid)
+			if derr == nil || errors.Is(derr, ebpf.ErrKeyNotExist) {
+				continue
+			}
+			tm.log.Printf("protected-process map delete %d: %v", tgid, derr)
 		}
 		have[tgid] = v
 	}

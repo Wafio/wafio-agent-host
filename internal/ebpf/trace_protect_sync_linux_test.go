@@ -102,6 +102,7 @@ func TestSyncProtectedTGIDsWritesImagesFirst(t *testing.T) {
 	proc := fakeProc(t, map[uint32]fakeProcEntry{
 		700: {exe: agent, comm: "agentd", uid: "999", mntns: hostNS, hostExe: true, start: 1234},
 	})
+	reportRunningImage(t)
 	if err := os.Symlink("/proc/self", filepath.Join(proc, "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +136,108 @@ func TestSyncProtectedTGIDsWritesImagesFirst(t *testing.T) {
 	for _, slot := range []uint32{protectedLimitSlot, protectedBudgetSlot} {
 		if got := tm.protectedBudgetMap.(*fakeKernelMap).data[slot]; got != int64(maxInheritedFill-1) {
 			t.Errorf("budget slot %d holds %v, want %d", slot, got, maxInheritedFill-1)
+		}
+	}
+}
+
+// reportRunningImage makes the host-binary check that fakeProc installs return
+// the file each process runs, as the real one does.
+func reportRunningImage(t *testing.T) {
+	t.Helper()
+	check := hostExeCheck
+	hostExeCheck = func(procRoot, dir, link string, walk *exeWalk) (tri, string, os.FileInfo) {
+		ok, path, _ := check(procRoot, dir, link, walk)
+		running, _ := os.Stat(filepath.Join(dir, "exe"))
+		return ok, path, running
+	}
+}
+
+// The refresh writes an entry for a process the scan verified, and the kernel
+// hooks for exec and exit act only on an entry that exists. A process that
+// exec'd another image, exited or was replaced by a new process under the same
+// PID after the scan must not keep the entry the write put back, for a process
+// matched by a configured path and for one matched by name.
+func TestSyncProtectedTGIDsDropsProcessChangedAfterScan(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	svc := writeFile(t, filepath.Join(dir, "svc"), "svc", 0o755)
+	other := writeFile(t, filepath.Join(dir, "other"), "other", 0o755)
+	prevDirs := trustedExeDirs
+	trustedExeDirs = []string{dir + "/"}
+	t.Cleanup(func() { trustedExeDirs = prevDirs })
+
+	changes := map[string]func(t *testing.T, procDir string){
+		"unchanged": func(*testing.T, string) {},
+		"exec": func(t *testing.T, procDir string) {
+			link := filepath.Join(procDir, "exe")
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(other, link); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"exit": func(t *testing.T, procDir string) {
+			if err := os.RemoveAll(procDir); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"pid reused": func(t *testing.T, procDir string) {
+			if err := os.WriteFile(filepath.Join(procDir, "stat"), statLineFlags("svc", 1235, 0), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	kinds := map[string]struct {
+		set *ProtectedProcessSet
+		uid string
+	}{
+		"configured path": {NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{svc}, ReplaceDefaults: true}), "999"},
+		"name":            {NewProtectedProcessSet([]string{"svc"}, nil), "0"},
+	}
+	for kind, k := range kinds {
+		for change, apply := range changes {
+			t.Run(kind+"/"+change, func(t *testing.T) {
+				proc := fakeProc(t, map[uint32]fakeProcEntry{
+					700: {exe: svc, comm: "svc", uid: k.uid, mntns: hostNS, hostExe: true, start: 1234},
+				})
+				reportRunningImage(t)
+				if err := os.Symlink("/proc/self", filepath.Join(proc, "1")); err != nil {
+					t.Fatal(err)
+				}
+				beforeProtectedPut = func(tgid uint32) {
+					if tgid == 700 {
+						apply(t, filepath.Join(proc, "700"))
+					}
+				}
+				t.Cleanup(func() { beforeProtectedPut = nil })
+				var ops []string
+				tm := &TraceManager{
+					log:                log.New(io.Discard, "", 0),
+					protected:          k.set,
+					procRoot:           proc,
+					execKeep:           true,
+					protectedMap:       newFakeKernelMap("tgids", 8, &ops),
+					protectedImagesMap: newFakeKernelMap("images", uint32(len(protectedImage{}.Unit))+8, &ops),
+					protectedBudgetMap: newFakeKernelMap("budget", 8, &ops),
+				}
+				if matched, err := tm.syncProtectedTGIDs(); err != nil || matched != 1 {
+					t.Fatalf("sync: matched %d, error %v", matched, err)
+				}
+				kernel := tm.protectedMap.(*fakeKernelMap).data
+				if change == "unchanged" {
+					if kernel[uint32(700)] != uint64(1234) || tm.protectedTGIDs[700] != 1234 {
+						t.Fatalf("a process that did not change lost its entry: kernel %v, kept %v", kernel, tm.protectedTGIDs)
+					}
+					return
+				}
+				if len(kernel) != 0 || len(tm.protectedTGIDs) != 0 {
+					t.Fatalf("entry left for a process that changed after the scan: kernel %v, kept %v\n%s", kernel, tm.protectedTGIDs, strings.Join(ops, "\n"))
+				}
+				if !slices.Contains(ops, "tgids delete 700") {
+					t.Fatalf("the entry was not deleted after the write; operations:\n%s", strings.Join(ops, "\n"))
+				}
+			})
 		}
 	}
 }
