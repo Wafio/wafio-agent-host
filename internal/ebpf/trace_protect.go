@@ -239,15 +239,16 @@ type procIdentity struct {
 	comm string
 
 	// hostExe: the running image is the very file at the same path in the
-	// host's mount namespace (same device and inode), and that file and its
-	// directory belong to root and are writable by no one else. A path string
-	// alone is not identity: in a container /usr/sbin/sshd is whatever the image
-	// put there, and an account that can write the file or its directory can
-	// put its own copy at a trusted path.
+	// host's mount namespace (same device and inode), or, for a replaced image,
+	// a file on the filesystem of the directory the path names, and that file
+	// and its directory belong to root and are writable by no one else. A path
+	// string alone is not identity: in a container /usr/sbin/sshd is whatever
+	// the image put there, and an account that can write the file or its
+	// directory can put its own copy at a trusted path.
 	hostExe tri
-	// hostMntNS: the process shares pid 1's mount namespace. Used for a
-	// replaced-on-disk image ("(deleted)"), whose inode no longer exists at
-	// the path, unless the path is bound to a unit.
+	// hostMntNS: the process shares pid 1's mount namespace. A replaced-on-disk
+	// image ("(deleted)") at a path that is bound to no unit needs it on top of
+	// hostExe: nothing is at the path to compare the inode with.
 	hostMntNS tri
 	// rootUIDs: real, effective, saved and filesystem UID are all 0. An
 	// unprivileged user can run a genuine, non-setuid protected binary, but
@@ -289,10 +290,11 @@ func kernelThread(statPath string) tri {
 //
 // exe is authoritative when known: comm is ignored then, because it is
 // attacker-controlled. A protected exe path counts only when the process is
-// verifiably that host binary (hostExe, or hostMntNS for a replaced image),
-// runs without a loader injection, runs in its own unit when the set names one
-// for that path (units, which also stands in for the mount namespace check on a
-// replaced image), and, for the built-in name list, runs as root. Any
+// verifiably that host binary (hostExe, and hostMntNS too for a replaced image
+// at a path bound to no unit), runs without a loader injection, runs in its own
+// unit when the set names one for that path (units, which also stands in for
+// the mount namespace check on a replaced image), and, for the built-in name
+// list, runs as root. Any
 // failed or impossible verification means NOT protected: the protection exists
 // to keep host daemons alive, and must not become a way for the processes a
 // Kill policy targets to exempt themselves.
@@ -330,7 +332,8 @@ func (s *ProtectedProcessSet) matchIdentity(id procIdentity) (bool, string) {
 		if _, bound := s.units[exe]; !bound && id.hostMntNS != triYes {
 			return false, ""
 		}
-	} else if id.hostExe != triYes {
+	}
+	if id.hostExe != triYes {
 		return false, ""
 	}
 	if unit, ok := s.units[exe]; ok && id.cgroup != "/system.slice/"+unit {
@@ -426,9 +429,7 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 		return id
 	}
 	id.hostMntNS = sameHostMountNS(procRoot, dir)
-	if exe, deleted := protectedExeCandidate(id.exe); !deleted {
-		id.hostExe = hostExeCheck(procRoot, dir, exe)
-	}
+	id.hostExe, _ = hostExeCheck(procRoot, dir, id.exe)
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
 	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {
@@ -486,31 +487,46 @@ func sameHostMountNS(procRoot, dir string) tri {
 }
 
 // hostExeCheck reports whether the running image of the process in dir is the
-// file at exe in the host's filesystem (procRoot/1/root, so an agent running in
-// a container with the host PID namespace compares against the host view), and
+// host's file for the exe link text (procRoot/1/root, so an agent running in a
+// container with the host PID namespace compares against the host view), and
 // whether that file and its directory could only have been put there by root
 // (trustedFile): a file an unprivileged account owns, or can replace through
 // its directory, is not a host binary however it got its name.
 // /proc/<pid>/exe is a magic link: stat follows it to the real inode whatever
-// mount namespace the process lives in. A variable so tests can substitute it.
-var hostExeCheck = func(procRoot, dir, exe string) tri {
+// mount namespace the process lives in, a replaced one included. A replaced
+// image has no file at the path to compare with, so it passes when it is on the
+// filesystem of the directory the path names. The string is the path that an
+// account other than root can write, set only when the running image is that
+// file (or, for a replaced image, on that filesystem). A variable so tests can
+// substitute it.
+var hostExeCheck = func(procRoot, dir, link string) (tri, string) {
+	exe, deleted := protectedExeCandidate(link)
 	running, err := os.Stat(filepath.Join(dir, "exe"))
 	if err != nil {
-		return triUnknown
+		return triUnknown, ""
 	}
 	hostPath := filepath.Join(procRoot, "1", "root", exe)
-	host, err := os.Stat(hostPath)
-	if err != nil {
-		return triNo // no such host file: the image is not a host binary
-	}
-	if !os.SameFile(running, host) {
-		return triNo
-	}
 	parent, err := os.Stat(filepath.Dir(hostPath))
 	if err != nil {
-		return triNo
+		return triNo, "" // no such host directory: the image is not a host binary
 	}
-	return triOf(trustedFile(host) && trustedFile(parent))
+	if deleted {
+		if !sameDevice(running, parent) {
+			return triNo, ""
+		}
+	} else {
+		host, err := os.Stat(hostPath)
+		if err != nil || !os.SameFile(running, host) {
+			return triNo, ""
+		}
+	}
+	switch {
+	case !trustedFile(running):
+		return triNo, link
+	case !trustedFile(parent):
+		return triNo, filepath.Dir(exe)
+	}
+	return triYes, ""
 }
 
 // rootUIDs parses the "Uid:" line of /proc/<pid>/status (real, effective,

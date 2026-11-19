@@ -132,6 +132,10 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"deleted host ns", hostRoot("/usr/sbin/sshd (deleted)", "sshd"), true},
 		{"deleted other ns", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostMntNS = triNo }), false},
 		{"deleted ns unknown", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostMntNS = triUnknown }), false},
+		// The namespace is not identity either: the replaced image must be a file only root can write, on the filesystem of its directory.
+		{"deleted image not the host's", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"deleted image unverified", with(hostRoot("/usr/sbin/sshd (deleted)", "sshd"), func(i *procIdentity) { i.hostExe = triUnknown }), false},
+		{"deleted configured exe not the host's", with(hostRoot("/opt/acme/bin/agentd (deleted)", "agentd"), func(i *procIdentity) { i.hostExe = triNo }), false},
 		// Container image (or any other file) at a protected path: not the host binary.
 		{"container sshd", with(hostRoot("/usr/sbin/sshd", "sshd"), func(i *procIdentity) { i.hostExe = triNo; i.hostMntNS = triNo }), false},
 		{"host binary unverified", with(hostRoot("/usr/sbin/sshd", "sshd"), func(i *procIdentity) { i.hostExe = triUnknown }), false},
@@ -179,6 +183,7 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"bundle waf agent cgroup unreadable", waf(wafBundleExe, ""), false},
 		{"other binary in /opt/wafio", waf("/opt/wafio/other", wafUnit), false},
 		{"waf agent other image", with(waf(wafExe, wafUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"waf agent deleted image not the host's", with(waf(wafExe+" (deleted)", wafUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
 		// systemd 255 and later: the helper between PID 1 and the service, as root.
 		{"systemd-executor", hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), true},
 		{"systemd-executor non-root", with(hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), func(i *procIdentity) { i.rootUIDs = triNo }), false},
@@ -201,6 +206,7 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		{"networkd preloaded", with(networkd(netExe, netUnit), func(i *procIdentity) { i.preload = true }), false},
 		{"networkd copy in tmp", networkd("/tmp/systemd-networkd", netUnit), false},
 		{"networkd other image", with(networkd(netExe, netUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"networkd deleted image not the host's", with(networkd(netExe+" (deleted)", netUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
 		{"other systemd binary in its unit", networkd("/usr/lib/systemd/systemd-resolved", netUnit), false},
 		// Rejected configuration entries never match.
 		{"bad name", hostRoot("/usr/bin/bad/name", "name"), false},
@@ -277,9 +283,9 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 		}
 	}
 	orig := hostExeCheck
-	hostExeCheck = func(_, dir, _ string) tri {
+	hostExeCheck = func(_, dir, _ string) (tri, string) {
 		_, err := os.Stat(filepath.Join(dir, "fake_host_exe"))
-		return triOf(err == nil)
+		return triOf(err == nil), ""
 	}
 	t.Cleanup(func() { hostExeCheck = orig })
 	return root

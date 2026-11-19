@@ -140,9 +140,11 @@ trusted. systemd-networkd is matched the same way, by
 counts only in the cgroup `/system.slice/systemd-networkd.service`; it runs as
 its own user (`systemd-network`). A copy elsewhere, a session scope, a user unit of the same name and a
 process with no readable cgroup do not count. The unit check follows the path,
-also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. The unit gives the agent
-its own mount namespace, so a binary replaced on disk still counts until the
-next restart if the process is in that cgroup. `systemd-executor` is the helper
+also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. A binary replaced on disk
+(a package upgrade) counts until the next restart, but only while the running
+file is one that only root can write and sits on the filesystem of the directory
+its path names; for a path that is not bound to a unit the process must also be
+in the host mount namespace. `systemd-executor` is the helper
 systemd 255 and later run between PID 1 and each service.
 
 A protected process also gets `exe_verified` on its own trace events, so the

@@ -38,6 +38,7 @@ func TestTrustedOwnerMode(t *testing.T) {
 // its path, and the directory of that file, could only be written by root. A
 // non-root account that owns the file, or the directory, can rename a copy of
 // its own over a trusted path, and the image then equals the file at the path.
+// The string it returns names what the account can write.
 func TestHostExeCheckRefusesWhatOthersCanWrite(t *testing.T) {
 	prev := trustedUID
 	t.Cleanup(func() { trustedUID = prev })
@@ -75,57 +76,105 @@ func TestHostExeCheckRefusesWhatOthersCanWrite(t *testing.T) {
 	if err := os.MkdirAll(pidDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(file, filepath.Join(pidDir, "exe")); err != nil {
-		t.Fatal(err)
+	// run points the process at the file it runs.
+	run := func(image string) {
+		t.Helper()
+		_ = os.Remove(filepath.Join(pidDir, "exe"))
+		if err := os.Symlink(image, filepath.Join(pidDir, "exe")); err != nil {
+			t.Fatal(err)
+		}
 	}
+	check := func(link string) (tri, string) { return hostExeCheck(proc, pidDir, link) }
+	run(file)
 
 	trustedUID = uint32(os.Getuid())
-	if got := hostExeCheck(proc, pidDir, exe); got != triYes {
-		t.Fatalf("a file and a directory only their owner can write: %v, want yes", got)
+	if got, path := check(exe); got != triYes || path != "" {
+		t.Fatalf("a file and a directory only their owner can write: %v %q, want yes", got, path)
 	}
 	for _, mode := range []os.FileMode{0o775, 0o757, 0o777} {
 		set(file, mode)
-		if got := hostExeCheck(proc, pidDir, exe); got != triNo {
-			t.Errorf("a file with mode %o: %v, want no", mode, got)
+		if got, path := check(exe); got != triNo || path != exe {
+			t.Errorf("a file with mode %o: %v %q, want no naming %s", mode, got, path, exe)
 		}
 	}
 	set(file, 0o755)
 	for _, mode := range []os.FileMode{0o775, 0o757, 0o777} {
 		set(dir, mode)
-		if got := hostExeCheck(proc, pidDir, exe); got != triNo {
-			t.Errorf("a directory with mode %o: %v, want no", mode, got)
+		if got, path := check(exe); got != triNo || path != "/opt/acme" {
+			t.Errorf("a directory with mode %o: %v %q, want no naming /opt/acme", mode, got, path)
 		}
 	}
 	set(dir, 0o755)
 
 	// The owner is the one the policy trusts, nobody else.
 	trustedUID = uint32(os.Getuid()) + 1
-	if got := hostExeCheck(proc, pidDir, exe); got != triNo {
-		t.Errorf("a file and directory of another owner than the trusted one: %v, want no", got)
+	if got, path := check(exe); got != triNo || path != exe {
+		t.Errorf("a file and directory of another owner than the trusted one: %v %q, want no naming %s", got, path, exe)
 	}
 	trustedUID = 0
 	if os.Getuid() != 0 {
-		if got := hostExeCheck(proc, pidDir, exe); got != triNo {
+		if got, _ := check(exe); got != triNo {
 			t.Errorf("a file of an unprivileged user under the real owner policy: %v, want no", got)
 		}
 	}
 
 	// A different file at the path, a missing one and an unreadable image keep
-	// their earlier answers.
+	// their earlier answers, and none of them names a path: the image is not
+	// the file the account can write.
 	trustedUID = uint32(os.Getuid())
-	if err := os.Remove(filepath.Join(pidDir, "exe")); err != nil {
-		t.Fatal(err)
+	run(other)
+	set(file, 0o777)
+	if got, path := check(exe); got != triNo || path != "" {
+		t.Errorf("another file than the one at the path: %v %q, want no and silent", got, path)
 	}
-	if err := os.Symlink(other, filepath.Join(pidDir, "exe")); err != nil {
-		t.Fatal(err)
-	}
-	if got := hostExeCheck(proc, pidDir, exe); got != triNo {
-		t.Errorf("another file than the one at the path: %v, want no", got)
-	}
-	if got := hostExeCheck(proc, pidDir, "/opt/acme/missing"); got != triNo {
+	set(file, 0o755)
+	if got, _ := check("/opt/acme/missing"); got != triNo {
 		t.Errorf("no file at the path: %v, want no", got)
 	}
-	if got := hostExeCheck(proc, filepath.Join(proc, "11"), exe); got != triUnknown {
+	if got, _ := hostExeCheck(proc, filepath.Join(proc, "11"), exe); got != triUnknown {
 		t.Errorf("no running image: %v, want unknown", got)
+	}
+
+	// A replaced image has no file at the path to compare with: it is the
+	// running inode itself that must be root's alone, on the filesystem of the
+	// directory its path names. The file now at the path is not looked at.
+	deleted := exe + " (deleted)"
+	run(other)
+	if got, path := check(deleted); got != triYes || path != "" {
+		t.Fatalf("a replaced image only its owner can write: %v %q, want yes", got, path)
+	}
+	for _, mode := range []os.FileMode{0o775, 0o757, 0o777} {
+		set(other, mode)
+		if got, path := check(deleted); got != triNo || path != deleted {
+			t.Errorf("a replaced image with mode %o: %v %q, want no naming %s", mode, got, path, deleted)
+		}
+	}
+	set(other, 0o755)
+	trustedUID = uint32(os.Getuid()) + 1
+	if got, path := check(deleted); got != triNo || path != deleted {
+		t.Errorf("a replaced image of another owner than the trusted one: %v %q, want no naming %s", got, path, deleted)
+	}
+	trustedUID = uint32(os.Getuid())
+	set(dir, 0o777)
+	if got, path := check(deleted); got != triNo || path != "/opt/acme" {
+		t.Errorf("a replaced image in a directory with mode 777: %v %q, want no naming /opt/acme", got, path)
+	}
+	set(dir, 0o755)
+	if got, _ := check("/opt/missing/agentd (deleted)"); got != triNo {
+		t.Errorf("a replaced image whose directory is not on the host: %v, want no", got)
+	}
+	// An image on another filesystem than its directory is another file whatever
+	// its owner: a copy a container or a mount put there.
+	if st, err := os.Stat("/proc/self/status"); err == nil {
+		here, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sameDevice(st, here) {
+			run("/proc/self/status")
+			if got, path := check(deleted); got != triNo || path != "" {
+				t.Errorf("a replaced image on another filesystem: %v %q, want no and silent", got, path)
+			}
+		}
 	}
 }
