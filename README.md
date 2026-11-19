@@ -308,8 +308,8 @@ were written. To see the map as it is now, list the maps and dump one by its id.
 `bpftool` cuts map names to 15 characters, so `trace_protected_tgids`,
 `trace_protected_images` and `trace_protected_budget` all show as
 `trace_protected`: `bpftool map dump name trace_protected_tgids` fails with
-"can't parse name", and `name trace_protected` dumps whichever of the three comes
-first.
+"can't parse name", and `name trace_protected` dumps all three, one after the
+other.
 
 ```sh
 sudo bpftool map list | grep -A1 'name trace_protected'
