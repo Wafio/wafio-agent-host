@@ -181,9 +181,10 @@ any user; the WAF agent and systemd-networkd paths above, which keep it only
 inside their unit; the programs of processes the agent has already verified;
 and the `systemd-executor` file that PID 1 holds open. The agent rewrites the
 list every 5 s and again when a file with one of those names changes in one of
-those directories, at most once a second (the last change of a burst waits for
-the second to pass), so a restart right after a package upgrade is still
-verified from its first event. A program that only carries a protected name (a
+those directories. The first change applies at once and later changes within a
+second wait up to a second, so a restart inside that second of the last rename
+in a burst (an `openssh-server` upgrade renames `sshd`, `sshd-session` and
+`sshd-auth`) loses the mark at `exec` until the next refresh. A program that only carries a protected name (a
 copy, a renamed file, a binary in another directory) loses the mark at `exec`,
 before its first instruction.
 
