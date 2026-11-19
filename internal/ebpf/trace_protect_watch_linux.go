@@ -88,17 +88,19 @@ func watchProtectedImages(s *ProtectedProcessSet, procRoot string) (*imageWatch,
 
 // rearm watches the directories that are not watched: one that did not exist
 // when the watch started, that was moved or removed since, or whose name leads
-// to another directory now (a symlink pointed at a new release). It returns how
-// many it armed. Call it before each refresh: a file that appeared in a
+// to another directory now (a symlink pointed at a new release). A directory is
+// found by the same walk as the image set (trustedWalk), so one that only root
+// can write in, behind symlinks of such directories, is watched and any other is
+// not: no trusted image can be in it. It returns how many it armed. Call it before each refresh: a file that appeared in a
 // directory before it was armed is then seen by the refresh itself.
 func (w *imageWatch) rearm() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n := 0
 	for _, dir := range w.dirs {
-		fd, err := openDirIn(w.root, dir, true)
+		fd, _, err := trustedWalk(w.root, dir)
 		if err != nil {
-			continue // not there (yet), or not a directory
+			continue // not there (yet), not a directory, or not root's alone
 		}
 		var st unix.Stat_t
 		if err := unix.Fstat(fd, &st); err != nil {

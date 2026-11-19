@@ -19,12 +19,39 @@ import (
 )
 
 // asTrustedOwner lets the test use files it owns: the owner the trust decision
-// asks for is root, which an unprivileged test run cannot be.
+// asks for is root, which an unprivileged test run cannot be. The trusted walk
+// also asks it of every directory above the files, and /tmp is writable by
+// everyone, so the temporary directory and the ones above it count as root's. A
+// umask of 022 keeps the directories the test makes from being group-writable.
 func asTrustedOwner(t *testing.T) {
 	t.Helper()
-	prev := trustedUID
+	prevUID, prevDirs := trustedUID, assumeTrustedDirs
 	trustedUID = uint32(os.Getuid())
-	t.Cleanup(func() { trustedUID = prev })
+	assumeTrustedDirs = dirsAbove(os.TempDir(), os.Getenv("WAFIO_TEST_IMAGE_DIR"))
+	prevMask := unix.Umask(0o022)
+	t.Cleanup(func() {
+		trustedUID, assumeTrustedDirs = prevUID, prevDirs
+		unix.Umask(prevMask)
+	})
+}
+
+// dirsAbove returns each of dirs and every directory above it, by real path.
+func dirsAbove(dirs ...string) map[string]bool {
+	out := make(map[string]bool)
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(d)
+		if err != nil {
+			continue
+		}
+		for ; real != "/"; real = filepath.Dir(real) {
+			out[real] = true
+		}
+		out["/"] = true
+	}
+	return out
 }
 
 // requireGeneration fails the test when the filesystem of path reports no inode
@@ -351,7 +378,7 @@ func TestOpenTrusted(t *testing.T) {
 		"/relative/agent":        {follow: true},
 		"/absolute/agent":        {follow: true},
 		"real/agent":             {follow: true, nosym: true}, // a relative spelling means the same
-		"/real/alias":            {},                          // the file itself is a symlink
+		"/real/alias":            {follow: true},              // the file itself is a symlink, in a directory only root can write
 		"/real/missing":          {},
 		"/real":                  {}, // a directory
 		"/escape/agent":          {}, // resolves to /outside inside the root: not there
@@ -369,12 +396,15 @@ func TestOpenTrusted(t *testing.T) {
 		}
 	}
 
-	// Without openat2 the walk refuses every symlink.
+	// Without openat2 a configured path still follows its symlinks (the trusted
+	// walk needs none), and the system directories still refuse every one.
 	noOpenat2 = true
 	t.Cleanup(func() { noOpenat2 = false })
-	for path, expect := range map[string]bool{"/real/agent": true, "/relative/agent": false, "/absolute/agent": false} {
-		if _, ok := imageAt(t, r, path, true); ok != expect {
-			t.Errorf("%s with the fallback: trusted %t, want %t", path, ok, expect)
+	for path, expect := range map[string][2]bool{"/real/agent": {true, true}, "/relative/agent": {true, false}, "/absolute/agent": {true, false}} {
+		for i, follow := range []bool{true, false} {
+			if _, ok := imageAt(t, r, path, follow); ok != expect[i] {
+				t.Errorf("%s with the fallback (follow symlinks %t): trusted %t, want %t", path, follow, ok, expect[i])
+			}
 		}
 	}
 	noOpenat2 = false
@@ -733,6 +763,7 @@ func TestKernelImagesNameDerivedPaths(t *testing.T) {
 // directory that does not exist yet or was replaced is watched once rearm finds
 // it.
 func TestWatchProtectedImages(t *testing.T) {
+	asTrustedOwner(t)
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "agentd")
 	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{exe}, ReplaceDefaults: true})
@@ -842,6 +873,7 @@ func TestWatchProtectedImages(t *testing.T) {
 // The watch looks at the directories of PID 1's root, not at the agent's own
 // view of the same names.
 func TestWatchProtectedImagesUsesPID1Root(t *testing.T) {
+	asTrustedOwner(t)
 	fakeRoot := t.TempDir()
 	proc := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(proc, "1"), 0o755); err != nil {
@@ -913,6 +945,7 @@ func signalAfterWriting(t *testing.T, w *imageWatch, path string) {
 // A configured path that goes through a symlink is watched where the link leads
 // now: the link moves in a directory nobody watches, so only rearm can see it.
 func TestWatchFollowsRetargetedSymlink(t *testing.T) {
+	asTrustedOwner(t)
 	base := t.TempDir()
 	rel1, rel2 := filepath.Join(base, "rel1"), filepath.Join(base, "rel2")
 	for _, d := range []string{rel1, rel2} {
@@ -961,6 +994,7 @@ func TestWatchFollowsRetargetedSymlink(t *testing.T) {
 // Two names for one directory share a watch: moving one of them leaves the
 // other watched.
 func TestWatchRetargetKeepsSharedWatch(t *testing.T) {
+	asTrustedOwner(t)
 	base := t.TempDir()
 	rel1, rel2 := filepath.Join(base, "rel1"), filepath.Join(base, "rel2")
 	for _, d := range []string{rel1, rel2} {

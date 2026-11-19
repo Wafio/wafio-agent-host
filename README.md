@@ -189,27 +189,34 @@ copy, a renamed file, a binary in another directory) loses the mark at `exec`,
 before its first instruction.
 
 A file is trusted only if root owns it and neither its group nor others can
-write it, and the same holds for its directory. An account that owns the file or
-the directory could rename a copy of its own over a trusted path, and the agent
-would then take the copy for the daemon. The agent reads the paths inside the
-root of PID 1, not its own: a symlink in a configured path, in a directory or as
-the file itself (`/usr/local/bin/agentd` pointing to `/opt/agentd/agentd`), is
-followed inside that root, and a process is matched by the file the symlink
-leads to now, because `/proc/<pid>/exe` shows the resolved path (a symlink
-moved to another release leaves the process of the old one unprotected until it
-restarts). A configured path that is itself a symlink is not in the list of
-files the `exec` trusts: the file it leads to joins the list once a refresh has
-seen a process run it. The system directories a protected name is searched in must not
-be symlinks, and a protected name found there is never a symlink (on a host
-where `/bin` points to `usr/bin` the file is found as `/usr/bin/<name>`).
-Without `openat2` (before Linux 5.6, or a
-seccomp filter that refuses it) no path with a symlink is trusted. A directory
-that is group-writable, as `/usr/local/bin` is on some Debian hosts
+write it, and the same holds for every directory on the way to it. An account
+that owns the file or one of those directories could rename a copy of its own
+over a trusted path, or point a symlink at any program, and the agent would then
+take that program for the daemon. The agent reads the paths inside the root of
+PID 1, not its own, one name at a time. A symlink in a configured path, in a
+directory or as the file itself (`/usr/local/bin/agentd` pointing to
+`/opt/agentd/agentd`), is followed inside that root, but only out of a directory
+that only root can write in, at most 40 links, and `..` never climbs above the
+root. The file it leads to is in the list of files the `exec` trusts, and a
+process is matched by the file the symlink leads to now, because
+`/proc/<pid>/exe` shows the resolved path (a symlink moved to another release
+leaves the process of the old one unprotected until it restarts). A configured
+path that goes through a directory others can write has no match and no trusted
+file, whatever the symlink in it points at: with `ln -sf /usr/bin/bash` in a
+directory a service account owns, every shell of every user would otherwise
+count as the daemon. The agent names that directory in its log and on the
+self-check line as `untrusted_owner`, for a path that exists. The system
+directories a protected name is searched in must not be symlinks, and a protected
+name found there is never a symlink (on a host where `/bin` points to `usr/bin`
+the file is found as `/usr/bin/<name>`). Without `openat2` (before Linux 5.6, or a
+seccomp filter that refuses it) those directories still refuse every symlink; the
+walk of a configured path needs only `openat`, `readlinkat` and `statx`. A
+directory that is group-writable, as `/usr/local/bin` is on some Debian hosts
 (`root:staff`, mode 2775), makes the files in it untrusted until it is set to
-`755`. A directory that does not exist when the agent starts is watched as soon
-as it appears (at the next 5 s refresh), and one that is moved or replaced, or
-that a symlink in a configured path now leads away from, is watched again the
-same way. A WAF agent whose binary or directory an account
+`755`, and is not watched. A directory that does not exist when the agent starts
+is watched as soon as it appears (at the next 5 s refresh), and one that is moved
+or replaced, or that a symlink in a configured path now leads away from, is
+watched again the same way. A WAF agent whose binary or directory an account
 other than root owns (an installer that hands `/opt/wafio` to the service
 account) is not protected and has no mark: leave both to root. The agent says so
 once in its log for each such path ("can be written by an account other than
@@ -268,9 +275,10 @@ journalctl -u wafio-host-agent -b | grep 'protected-process self-check'
 
 `kernel_set=present` means the kernel side protects them too. `proc_access=denied`
 means the unit lacks `CAP_SYS_PTRACE`. `untrusted_owner=<paths>` lists files or
-directories that an account other than root can write under a protected process:
-that process is not protected until root owns the path and neither its group nor
-others can write it. A path that ends in `(deleted)` is a file replaced while the
+directories that an account other than root can write under a protected process,
+or on the way to a configured path that exists, a directory that holds a symlink
+among them: that process is not protected until root owns the path and neither
+its group nor others can write it. A path that ends in `(deleted)` is a file replaced while the
 process ran: find out how a file that an account other than root could write ran
 there, fix its directory and restart the process. `unit_check=unavailable` means the agent is in a cgroup
 namespace of its own and finds no readable `system.slice` under PID 1's root: the

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -24,9 +25,10 @@ const fsIocGetVersion = unix.FS_IOC_GETFLAGS + 0x1000
 // through (STATX_MNT_ID, Linux 5.8).
 const imageStatxMask = unix.STATX_TYPE | unix.STATX_MODE | unix.STATX_UID | unix.STATX_INO | unix.STATX_MNT_ID
 
-// noOpenat2 makes the path walk take its fallback, which refuses every
-// symlink. Tests set it; in production the fallback runs only where openat2 is
-// missing (before Linux 5.6) or refused (a seccomp filter).
+// noOpenat2 makes the directory walk of the system paths take its fallback. Tests
+// set it; in production the fallback runs only where openat2 is missing (before
+// Linux 5.6) or refused (a seccomp filter). The trusted walk of a configured path
+// never uses openat2.
 var noOpenat2 bool
 
 // readMounts parses a mountinfo file. The mount IDs in it are those of the
@@ -96,20 +98,16 @@ func imageKeyOf(st *unix.Statx_t, gen uint32, noGeneration bool, mounts map[uint
 }
 
 // openDirIn opens the directory at path as an O_PATH descriptor, resolved inside
-// the root directory rootFD refers to: ".." and an absolute symlink target stop
-// at that root, whatever the root of this process is (openat2 with
-// RESOLVE_IN_ROOT). With followSymlinks false a symlink anywhere in the path is
-// refused. Where openat2 is missing or refused, the walk refuses every symlink
-// whatever followSymlinks says.
-func openDirIn(rootFD int, path string, followSymlinks bool) (int, error) {
+// the root directory rootFD refers to, with no symlink anywhere in the path:
+// ".." and an absolute target stop at that root, whatever the root of this
+// process is (openat2 with RESOLVE_IN_ROOT). It serves the system directories a
+// protected name is searched in. Where openat2 is missing or refused, the walk
+// refuses every symlink the same way.
+func openDirIn(rootFD int, path string) (int, error) {
 	if !noOpenat2 {
-		resolve := uint64(unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS)
-		if followSymlinks {
-			resolve = unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS
-		}
 		fd, err := unix.Openat2(rootFD, path, &unix.OpenHow{
 			Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
-			Resolve: resolve,
+			Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS,
 		})
 		if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EPERM) {
 			return fd, err
@@ -143,19 +141,208 @@ func walkWithoutSymlinks(rootFD int, path string) (int, error) {
 	return fd, nil
 }
 
+// maxTrustedLinks is how many symlinks one trusted walk follows before it fails
+// with ELOOP, the limit of the kernel's own path walk.
+const maxTrustedLinks = 40
+
+// untrustedError says that the trusted walk met a directory or a file that an
+// account other than root can write, and names it.
+type untrustedError struct{ path string }
+
+func (e *untrustedError) Error() string {
+	return e.path + " can be written by an account other than root"
+}
+
+// assumeTrustedDirs lists directories, by their real path, that the trusted walk
+// takes as root's without reading their owner and mode. Tests set it: they build
+// their files below a directory they own, and the directories above it, /tmp
+// among them, are writable by everyone.
+var assumeTrustedDirs map[string]bool
+
+// walkDir is a directory the trusted walk has entered.
+type walkDir struct {
+	fd   int
+	name string // its name in the directory above; "" for the root
+	ok   bool   // only root can write in it
+}
+
+// walkStatxMask is what the trusted walk reads of each entry: its type, mode
+// and owner.
+const walkStatxMask = unix.STATX_TYPE | unix.STATX_MODE | unix.STATX_UID
+
+// statxOf reads walkStatxMask of the file fd refers to.
+func statxOf(fd int) (unix.Statx_t, error) {
+	var st unix.Statx_t
+	err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, walkStatxMask, &st)
+	if err == nil && st.Mask&walkStatxMask != walkStatxMask {
+		err = unix.ENOTSUP
+	}
+	return st, err
+}
+
+// readLinkOf reads the target of the symlink fd refers to, opened with O_PATH
+// and O_NOFOLLOW.
+func readLinkOf(fd int) (string, error) {
+	var buf [unix.PathMax]byte
+	n, err := unix.Readlinkat(fd, "", buf[:])
+	switch {
+	case err != nil:
+		return "", err
+	case n == 0:
+		return "", unix.ENOENT
+	case n == len(buf):
+		return "", unix.ENAMETOOLONG
+	}
+	return string(buf[:n]), nil
+}
+
+// pathParts splits path into its components, without the empty and "." ones.
+func pathParts(path string) []string {
+	return slices.DeleteFunc(strings.Split(path, "/"), func(s string) bool { return s == "" || s == "." })
+}
+
+// walkPath is the path of the entry name in the innermost of dirs.
+func walkPath(dirs []walkDir, name string) string {
+	parts := make([]string, 0, len(dirs))
+	for _, d := range dirs[1:] {
+		parts = append(parts, d.name)
+	}
+	if name != "" {
+		parts = append(parts, name)
+	}
+	return "/" + strings.Join(parts, "/")
+}
+
+// trustedWalk resolves path inside the root rootFD refers to, one component at a
+// time, and returns an O_PATH descriptor of what it leads to, with where that is
+// in the root (no symlink left in it). Every directory a component is looked up
+// in must be root's alone (trustedOwnerMode), the ones that hold a symlink
+// included, and so must the file the path leads to. A symlink is followed only
+// when its directory passed: the target is spliced in front of the rest of the
+// path, an absolute one restarting at the root and ".." never climbing above it,
+// at most maxTrustedLinks times. It reads with openat, readlinkat and statx only,
+// so it needs no openat2.
+//
+// A directory or file that others can write ends the walk with an
+// *untrustedError naming it, unless the entry the walk looks for is not there.
+func trustedWalk(rootFD int, path string) (int, string, error) {
+	top, err := unix.FcntlInt(uintptr(rootFD), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return -1, "", err
+	}
+	st, err := statxOf(top)
+	if err != nil {
+		_ = unix.Close(top) // an O_PATH descriptor holds no data to flush
+		return -1, "", err
+	}
+	dirs := []walkDir{{fd: top, ok: entryTrusted(top, &st)}}
+	defer func() {
+		for _, d := range dirs {
+			_ = unix.Close(d.fd) // an O_PATH descriptor holds no data to flush
+		}
+	}()
+
+	todo := pathParts(path)
+	links := 0
+	for len(todo) > 0 {
+		name := todo[0]
+		todo = todo[1:]
+		cur := dirs[len(dirs)-1]
+		if name == ".." {
+			if len(dirs) > 1 {
+				_ = unix.Close(cur.fd) // an O_PATH descriptor holds no data to flush
+				dirs = dirs[:len(dirs)-1]
+			}
+			continue
+		}
+		if !cur.ok {
+			// The directory matters only when the entry is in it.
+			var probe unix.Statx_t
+			if err := unix.Statx(cur.fd, name, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_TYPE, &probe); err != nil {
+				return -1, "", err
+			}
+			return -1, "", &untrustedError{walkPath(dirs, "")}
+		}
+		fd, err := unix.Openat(cur.fd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return -1, "", err
+		}
+		st, err := statxOf(fd)
+		if err != nil {
+			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+			return -1, "", err
+		}
+		here := walkPath(dirs, name)
+		switch {
+		case st.Mode&unix.S_IFMT == unix.S_IFLNK:
+			target, err := readLinkOf(fd)
+			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+			if err != nil {
+				return -1, "", err
+			}
+			if links++; links > maxTrustedLinks {
+				return -1, "", unix.ELOOP
+			}
+			if strings.HasPrefix(target, "/") {
+				for _, d := range dirs[1:] {
+					_ = unix.Close(d.fd) // an O_PATH descriptor holds no data to flush
+				}
+				dirs = dirs[:1]
+			}
+			todo = append(pathParts(target), todo...)
+		case len(todo) > 0 && st.Mode&unix.S_IFMT == unix.S_IFDIR:
+			dirs = append(dirs, walkDir{fd: fd, name: name, ok: entryTrusted(fd, &st)})
+		case len(todo) > 0:
+			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+			return -1, "", unix.ENOTDIR
+		case !entryTrusted(fd, &st):
+			_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+			return -1, "", &untrustedError{here}
+		default:
+			return fd, here, nil
+		}
+	}
+	// The path named the root, or ended in "..": the directory it stands in.
+	cur := dirs[len(dirs)-1]
+	here := walkPath(dirs, "")
+	if !cur.ok {
+		return -1, "", &untrustedError{here}
+	}
+	fd, err := unix.FcntlInt(uintptr(cur.fd), unix.F_DUPFD_CLOEXEC, 0)
+	return fd, here, err
+}
+
+// entryTrusted reports whether the entry that st describes, open as fd, is owned
+// by trustedUID and not writable by its group or others.
+func entryTrusted(fd int, st *unix.Statx_t) bool {
+	if assumeTrustedDirs != nil {
+		if real, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd)); err == nil && assumeTrustedDirs[real] {
+			return true
+		}
+	}
+	return trustedOwnerMode(st.Uid, uint32(st.Mode)&0o7777)
+}
+
 // trustedDir opens the directory at path inside the root rootFD refers to and
 // checks that only root can write in it: it is a directory owned by trustedUID
 // that its group and others cannot write. Anyone else who can write in the
-// directory can rename a file of their own over a trusted one.
+// directory can rename a file of their own over a trusted one. followSymlinks
+// says how the path is resolved: through trustedWalk, which also asks root's
+// alone of every directory above, or, for the system directories a protected
+// name is searched in, with no symlink at all (openDirIn).
 func trustedDir(rootFD int, path string, followSymlinks bool) (int, bool) {
-	fd, err := openDirIn(rootFD, path, followSymlinks)
+	var fd int
+	var err error
+	if followSymlinks {
+		fd, _, err = trustedWalk(rootFD, path)
+	} else {
+		fd, err = openDirIn(rootFD, path)
+	}
 	if err != nil {
 		return -1, false
 	}
-	const need = unix.STATX_TYPE | unix.STATX_MODE | unix.STATX_UID
 	var st unix.Statx_t
-	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, need, &st); err != nil ||
-		st.Mask&need != need || st.Mode&unix.S_IFMT != unix.S_IFDIR ||
+	if st, err = statxOf(fd); err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR ||
 		!trustedOwnerMode(st.Uid, uint32(st.Mode)&0o7777) {
 		_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
 		return -1, false
@@ -164,15 +351,24 @@ func trustedDir(rootFD int, path string, followSymlinks bool) (int, bool) {
 }
 
 // openTrusted opens the file at path inside the root rootFD refers to, for
-// reading, when the file and its directory are trusted (trustedDir). The file
-// itself must not be a symlink. followSymlinks says whether a symlink in the
-// directory part may be followed, inside that root: a configured path may sit
-// behind one (a release directory that a symlink points at), the system
-// directories a protected name is searched in may not, so the file the key
-// names really lives in the directory the path names. The open does not block
-// on a FIFO put at the path.
+// reading, when the file and every directory on the way are trusted. With
+// followSymlinks the path is resolved by trustedWalk, which follows a symlink,
+// the last part of the path included, only out of a directory root alone can
+// write: a configured path may lead through one (a release directory or a file
+// that a symlink points at). Without it, for the system directories a protected
+// name is searched in, no symlink is allowed anywhere and the directory is
+// trusted (trustedDir), so the file the key names really lives in the directory
+// the path names. The open does not block on a FIFO put at the path.
 func openTrusted(rootFD int, path string, followSymlinks bool) (int, bool) {
-	dir, ok := trustedDir(rootFD, filepath.Dir(path), followSymlinks)
+	if followSymlinks {
+		file, _, err := trustedWalk(rootFD, path)
+		if err != nil {
+			return -1, false
+		}
+		defer func() { _ = unix.Close(file) }() // an O_PATH descriptor holds no data to flush
+		return openImage("/proc/self/fd/" + strconv.Itoa(file))
+	}
+	dir, ok := trustedDir(rootFD, filepath.Dir(path), false)
 	if !ok {
 		return -1, false
 	}
@@ -211,65 +407,59 @@ func systemDirOnly(img protectedImage) bool {
 	return img.Flags&^protectedImageKeepOnSetuid == protectedImageRoot
 }
 
-// openFollowingIn opens path inside the root rootFD refers to as an O_PATH
-// descriptor, following every symlink, the last one too: ".." and an absolute
-// target stop at that root (openat2 with RESOLVE_IN_ROOT). It fails where
-// openat2 is missing or refused.
-func openFollowingIn(rootFD int, path string) (int, error) {
-	if noOpenat2 {
-		return -1, unix.ENOSYS
-	}
-	return unix.Openat2(rootFD, path, &unix.OpenHow{
-		Flags:   unix.O_PATH | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
-	})
-}
-
 // leadOf returns where the configured path p leads inside the root rootFD refers
-// to, symlinks in the directory part and in the file name followed. d_path shows
-// a file relative to the reader's root; prefix is the part to cut off (nothing
-// when the roots are the same).
-func leadOf(root int, prefix, p string) (string, bool) {
-	read := func(fd int) (string, bool) {
-		resolved, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+// to: trustedWalk follows its symlinks, in the directory part and in the file
+// name, and stops at a directory or file that others can write, with an
+// *untrustedError. A path with no file at its end (a replaced binary still runs
+// from there) leads where its directory does.
+func leadOf(root int, p string) (string, error) {
+	fd, lead, err := trustedWalk(root, p)
+	if err == nil {
 		_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
-		return filepath.Join("/", strings.TrimPrefix(resolved, prefix)), err == nil
+		return lead, nil
 	}
-	if fd, err := openFollowingIn(root, p); err == nil {
-		return read(fd)
+	var untrusted *untrustedError
+	if errors.As(err, &untrusted) {
+		return "", err
 	}
-	// No file at p (a replaced binary still runs from there), or no openat2: the
-	// directory says where the file was.
-	fd, err := openDirIn(root, filepath.Dir(p), true)
+	fd, dir, err := trustedWalk(root, filepath.Dir(p))
+	if errors.As(err, &untrusted) {
+		return "", unix.ENOENT // no file at p, so nothing there to name
+	}
 	if err != nil {
-		return "", false
+		return "", err
 	}
-	dir, ok := read(fd)
-	return filepath.Join(dir, filepath.Base(p)), ok
+	_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
+	return filepath.Join(dir, filepath.Base(p)), nil
 }
 
 // refreshExeLeads records where each configured exe path that goes through a
 // symlink, in its directory or as the file itself, leads inside PID 1's root
-// (configuredLink matches a process by it). The path is resolved with the same
-// walk as the image set and the watch; it need not be trusted here, so a
-// writable directory is still reported as such by the scan. A root that cannot
-// be opened leaves no entries.
+// (configuredLink matches a process by it), and the directories and files that
+// stopped the walk (scanProtectedTGIDs reports them). The path is resolved with
+// the walk of the image set and the watch. A root that cannot be opened leaves
+// no entries.
 func (s *ProtectedProcessSet) refreshExeLeads(procRoot string) {
 	if s == nil {
 		return
 	}
-	leads := make(map[string]string)
+	found := &exeLeads{byTarget: make(map[string]string)}
 	if root, err := unix.Open(filepath.Join(procRoot, "1", "root"), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
-		prefix, _ := os.Readlink("/proc/self/fd/" + strconv.Itoa(root))
 		for p := range s.exes {
-			target, ok := leadOf(root, prefix, p)
-			if _, listed := s.exes[target]; ok && target != p && !listed {
-				leads[target] = p
+			target, err := leadOf(root, p)
+			var untrusted *untrustedError
+			if errors.As(err, &untrusted) {
+				found.untrusted = append(found.untrusted, untrusted.path)
+			}
+			if _, listed := s.exes[target]; err == nil && target != p && !listed {
+				found.byTarget[target] = p
 			}
 		}
 		_ = unix.Close(root) // an O_PATH descriptor holds no data to flush
 	}
-	s.leads.Store(&leads)
+	slices.Sort(found.untrusted)
+	found.untrusted = slices.Compact(found.untrusted)
+	s.leads.Store(found)
 }
 
 // kernelImages is the content of trace_protected_images: the files the kernel

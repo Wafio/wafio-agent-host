@@ -225,11 +225,8 @@ type ProtectedProcessSet struct {
 	exes  map[string]struct{} // exact executable paths
 	units map[string]string   // exe path -> system unit it must run in
 
-	// leads maps the path a configured exe path leads to now, inside PID 1's
-	// root, to that configured path, for each one that goes through a symlink:
-	// /proc/<pid>/exe shows the resolved path, never the configured one.
-	// Replaced by refreshExeLeads.
-	leads atomic.Pointer[map[string]string]
+	// leads is what the last refreshExeLeads found. Replaced as a whole.
+	leads atomic.Pointer[exeLeads]
 
 	defaultsReplaced bool // DefaultProtectedProcessNames dropped by configuration
 }
@@ -239,6 +236,18 @@ func truncateComm(name string) string {
 		return name[:taskCommLen-1]
 	}
 	return name
+}
+
+// exeLeads is what refreshExeLeads found for the configured exe paths.
+type exeLeads struct {
+	// byTarget maps the file a configured path leads to now, inside PID 1's root,
+	// to that path, for each one that goes through a symlink: /proc/<pid>/exe
+	// shows the resolved path, never the configured one.
+	byTarget map[string]string
+	// untrusted names the directories and files an account other than root can
+	// write that stopped the walk of a configured path with something at its end:
+	// such a path has no lead and no image.
+	untrusted []string
 }
 
 // configuredLink maps an exe link that is the file a configured symlinked path
@@ -252,7 +261,7 @@ func (s *ProtectedProcessSet) configuredLink(link string) string {
 		return link
 	}
 	exe, deleted := protectedExeCandidate(link)
-	configured, ok := (*leads)[exe]
+	configured, ok := leads.byTarget[exe]
 	switch {
 	case !ok:
 		return link
@@ -730,6 +739,8 @@ func (p protectedTGID) image() (protectedImage, bool) {
 // start time cannot be read gets no kernel entry. The second result lists the
 // paths an account other than root can write, for the processes that would be
 // protected if that were not so (hostExeCheck): they are left out of the first.
+// It also lists what stopped the walk of a configured path (refreshExeLeads), a
+// directory that holds a symlink among them.
 func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) ([]protectedTGID, []string, error) {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -773,6 +784,9 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 			p.name = filepath.Base(exe)
 		}
 		out = append(out, p)
+	}
+	if leads := s.leads.Load(); leads != nil {
+		untrusted = append(untrusted, leads.untrusted...)
 	}
 	slices.Sort(untrusted)
 	return out, slices.Compact(untrusted), nil
