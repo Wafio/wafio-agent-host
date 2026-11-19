@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -55,6 +56,33 @@ func TestTraceProbesMatchObjectSource(t *testing.T) {
 		if !seen[fn] {
 			t.Errorf("program %s (SEC %s) is never attached", fn, inSource[fn])
 		}
+	}
+}
+
+// A program that the objects of an earlier release lack is not a capture gap
+// only when it emits no event. The maintenance probes are exactly the
+// optional programs of the protected set, and none of them submits one.
+func TestMaintenanceProbesEmitNoEvent(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("bpf", "wafio_trace.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range traceProbes {
+		if !p.maintenance {
+			continue
+		}
+		got = append(got, p.name)
+		if !p.optional {
+			t.Errorf("maintenance probe %s is not optional", p.name)
+		}
+		body := regexp.MustCompile(`(?s)\bint ` + p.funcName + `\(.*?\n}\n`).FindString(string(source))
+		if body == "" || strings.Contains(body, "new_event") || strings.Contains(body, "submit_event") {
+			t.Errorf("maintenance probe %s: program %s is missing or emits an event", p.name, p.funcName)
+		}
+	}
+	if want := []string{"sys_exit_setuid", "sys_exit_setreuid", "sys_exit_setresuid"}; !slices.Equal(got, want) {
+		t.Errorf("maintenance probes %v, want %v", got, want)
 	}
 }
 

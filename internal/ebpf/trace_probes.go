@@ -20,6 +20,10 @@ type traceProbe struct {
 	// (open/creat/unlink/rename/chmod on arm64, renameat on riscv,
 	// fchmodat2 before 6.6); a missing tracepoint is not a probe failure.
 	mayBeAbsent bool
+	// maintenance: the program emits no event and only keeps the protected set
+	// current, and an object of an earlier release may lack it. A program that is
+	// missing from the object is not a capture gap.
+	maintenance bool
 	// kprobeTwin: a syscall with a user-string argument (path, name, module
 	// parameters). The object also has trace_ksys_<syscall>, the same hook
 	// as a kprobe on the syscall's arch wrapper, used where the kernel's
@@ -46,9 +50,9 @@ var traceProbes = []traceProbe{
 	// leaves the refresh to drop the entry of a child that changed its user.
 	{funcName: "trace_sched_process_exec", group: "sched", name: "sched_process_exec"},
 	{funcName: "trace_sched_process_exit", group: "sched", name: "sched_process_exit"},
-	{funcName: "trace_sys_exit_setuid", group: "syscalls", name: "sys_exit_setuid", optional: true},
-	{funcName: "trace_sys_exit_setreuid", group: "syscalls", name: "sys_exit_setreuid", optional: true},
-	{funcName: "trace_sys_exit_setresuid", group: "syscalls", name: "sys_exit_setresuid", optional: true},
+	{funcName: "trace_sys_exit_setuid", group: "syscalls", name: "sys_exit_setuid", optional: true, maintenance: true},
+	{funcName: "trace_sys_exit_setreuid", group: "syscalls", name: "sys_exit_setreuid", optional: true, maintenance: true},
+	{funcName: "trace_sys_exit_setresuid", group: "syscalls", name: "sys_exit_setresuid", optional: true, maintenance: true},
 	{funcName: "trace_sched_process_fork", group: "sched", name: "sched_process_fork", raw: true},
 	{funcName: "trace_sys_enter_kill", group: "syscalls", name: "sys_enter_kill"},
 	{funcName: "trace_sys_enter_prctl", group: "syscalls", name: "sys_enter_prctl"},
