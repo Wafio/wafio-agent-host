@@ -84,7 +84,7 @@ func TestHostExeCheckRefusesWhatOthersCanWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	check := func(link string) (tri, string) { return hostExeCheck(proc, pidDir, link) }
+	check := func(link string) (tri, string) { return hostExeCheck(proc, pidDir, link, nil) }
 	run(file)
 
 	trustedUID = uint32(os.Getuid())
@@ -131,7 +131,7 @@ func TestHostExeCheckRefusesWhatOthersCanWrite(t *testing.T) {
 	if got, _ := check("/opt/acme/missing"); got != triNo {
 		t.Errorf("no file at the path: %v, want no", got)
 	}
-	if got, _ := hostExeCheck(proc, filepath.Join(proc, "11"), exe); got != triUnknown {
+	if got, _ := hostExeCheck(proc, filepath.Join(proc, "11"), exe, nil); got != triUnknown {
 		t.Errorf("no running image: %v, want unknown", got)
 	}
 

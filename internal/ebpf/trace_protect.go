@@ -248,6 +248,41 @@ type exeLeads struct {
 	// write that stopped the walk of a configured path with something at its end:
 	// such a path has no lead and no image.
 	untrusted []string
+	// walked is the walk of each configured path, which also decides whether a
+	// running process is the file at that path (hostExeCheck).
+	walked map[string]exeWalk
+}
+
+// exeWalk is what refreshExeLeads found for one configured path by walking it
+// inside PID 1's root.
+type exeWalk struct {
+	// lead is where the path leads now, with no symlink left in it; "" when the
+	// walk found no file and no directory to name.
+	lead string
+	// file is the file at lead, set when the walk reached it and the file and
+	// every directory on the way belong to root alone.
+	file os.FileInfo
+	// dir is the directory that holds lead, set when the walk to it passed on the
+	// same terms. A replaced image has no file at the path: it is compared with
+	// this directory.
+	dir os.FileInfo
+	// untrusted is the directory or file that stopped the walk of the path, dirStop
+	// the one that stopped the walk of its directory.
+	untrusted, dirStop string
+}
+
+// walkOf is the walk of exe when exe is a configured path, nil when it is not.
+// A path that has not been walked yet has an empty walk, which verifies nothing.
+func (s *ProtectedProcessSet) walkOf(exe string) *exeWalk {
+	if _, ok := s.exes[exe]; !ok {
+		return nil
+	}
+	if leads := s.leads.Load(); leads != nil {
+		if w, ok := leads.walked[exe]; ok {
+			return &w
+		}
+	}
+	return &exeWalk{}
 }
 
 // configuredLink maps an exe link that is the file a configured symlinked path
@@ -492,11 +527,12 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 	if !s.isCandidate(id.exe) {
 		return id
 	}
+	exe, _ := protectedExeCandidate(id.exe)
 	id.hostMntNS = sameHostMountNS(procRoot, dir)
-	id.hostExe, id.untrusted = hostExeCheck(procRoot, dir, link)
+	id.hostExe, id.untrusted = hostExeCheck(procRoot, dir, link, s.walkOf(exe))
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
-	if exe, _ := protectedExeCandidate(id.exe); s.units[exe] != "" {
+	if s.units[exe] != "" {
 		id.cgroup = unitCgroup(procRoot, dir, pid, s.units[exe])
 	}
 	return id
@@ -621,13 +657,22 @@ func sameHostMountNS(procRoot, dir string) tri {
 // image has no file at the path to compare with, so it passes when it is on the
 // filesystem of the directory the path names. The string is the path that an
 // account other than root can write, set only when the running image is that
-// file (or, for a replaced image, on that filesystem). A variable so tests can
-// substitute it.
-var hostExeCheck = func(procRoot, dir, link string) (tri, string) {
+// file (or, for a replaced image, on that filesystem).
+//
+// walk is the walk of the configured path the process is matched by, nil for a
+// process matched by name. A configured path is judged by that walk and by
+// nothing else (configuredExeCheck), and the string then names what stopped the
+// walk: a directory above the last one that an account other than root can write
+// could show the agent a view of the path that root never made. A variable so
+// tests can substitute it.
+var hostExeCheck = func(procRoot, dir, link string, walk *exeWalk) (tri, string) {
 	exe, deleted := protectedExeCandidate(link)
 	running, err := os.Stat(filepath.Join(dir, "exe"))
 	if err != nil {
 		return triUnknown, ""
+	}
+	if walk != nil {
+		return configuredExeCheck(running, link, deleted, walk)
 	}
 	hostPath := filepath.Join(procRoot, "1", "root", exe)
 	parent, err := os.Stat(filepath.Dir(hostPath))
@@ -651,6 +696,29 @@ var hostExeCheck = func(procRoot, dir, link string) (tri, string) {
 		return triNo, filepath.Dir(exe)
 	}
 	return triYes, ""
+}
+
+// configuredExeCheck is hostExeCheck for a process matched by a configured path:
+// running must be the file that the walk of the path reached, where the file and
+// every directory on the way are root's alone. A replaced image has no file at
+// the path: it passes when it is on the filesystem of the directory that held it
+// (walk.dir, reached on the same terms) and is root's alone itself. The string
+// names what stopped the walk, or the replaced image that an account other than
+// root could write.
+func configuredExeCheck(running fs.FileInfo, link string, deleted bool, walk *exeWalk) (tri, string) {
+	switch {
+	case deleted && walk.dir == nil:
+		return triNo, walk.dirStop
+	case deleted && !sameDevice(running, walk.dir):
+		return triNo, ""
+	case deleted && !trustedFile(running):
+		return triNo, link
+	case deleted:
+		return triYes, ""
+	case walk.file == nil:
+		return triNo, walk.untrusted
+	}
+	return triOf(os.SameFile(running, walk.file)), ""
 }
 
 // rootUIDs parses the "Uid:" line of /proc/<pid>/status (real, effective,

@@ -5,11 +5,13 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -164,12 +166,12 @@ func TestTrustedWalkDecidesImageAndLead(t *testing.T) {
 		"/releases/v1/open":         false,
 	} {
 		_, imaged := imageAt(t, root, path, true)
-		lead, err := leadOf(root, path)
-		if imaged != protected || (err == nil) != protected {
-			t.Errorf("%s: image %t, lead %q (%v), want protected %t", path, imaged, lead, err, protected)
+		w := walkExe(root, path)
+		if imaged != protected || (w.lead != "") != protected || (w.file != nil) != protected {
+			t.Errorf("%s: image %t, lead %q, file %v, want protected %t", path, imaged, w.lead, w.file, protected)
 		}
-		if protected && lead != "/releases/v1/agentd" {
-			t.Errorf("%s leads to %q, want /releases/v1/agentd", path, lead)
+		if protected && w.lead != "/releases/v1/agentd" {
+			t.Errorf("%s leads to %q, want /releases/v1/agentd", path, w.lead)
 		}
 		if _, ok := imageAt(t, root, path, false); ok {
 			t.Errorf("%s: trusted with no symlink allowed", path)
@@ -177,15 +179,14 @@ func TestTrustedWalkDecidesImageAndLead(t *testing.T) {
 	}
 	// No file at the path: the directory says where it was, but a writable
 	// directory names nothing.
-	if lead, err := leadOf(root, "/opt/app/current/gone"); err != nil || lead != "/releases/v1/gone" {
-		t.Errorf("a missing file in a root-only directory leads to %q (%v), want /releases/v1/gone", lead, err)
+	if w := walkExe(root, "/opt/app/current/gone"); w.lead != "/releases/v1/gone" || w.file != nil || w.dir == nil {
+		t.Errorf("a missing file in a root-only directory: %+v, want the lead /releases/v1/gone, no file and the directory", w)
 	}
-	var u *untrustedError
-	if lead, err := leadOf(root, "/loose/gone"); err == nil || errors.As(err, &u) {
-		t.Errorf("a missing file in a writable directory leads to %q (%v), want an error that names nothing", lead, err)
+	if w := walkExe(root, "/loose/gone"); w.lead != "" || w.untrusted != "" || w.dir != nil || w.dirStop != "/loose" {
+		t.Errorf("a missing file in a writable directory: %+v, want no lead, nothing named for the file and /loose for the directory", w)
 	}
-	if _, err := leadOf(root, "/loose/agentd"); !errors.As(err, &u) || u.path != "/loose" {
-		t.Errorf("a symlink in a writable directory: %v, want /loose named", err)
+	if w := walkExe(root, "/loose/agentd"); w.lead != "" || w.untrusted != "/loose" {
+		t.Errorf("a symlink in a writable directory: %+v, want /loose named", w)
 	}
 }
 
@@ -259,5 +260,111 @@ func TestSymlinkInWritableDirectoryProtectsNothing(t *testing.T) {
 	}
 	if images := s.kernelImages(proc, got); len(images) != 1 {
 		t.Fatalf("%d kernel images after the fix, want 1: %v", len(images), images)
+	}
+}
+
+// A process that runs the file at a configured path is protected only when the
+// file and every directory on the way are root's alone, not only the last one: an
+// account that owns a directory further up can show the agent a root-only view of
+// the path (a user namespace with a bind mount or an overlay of its own) and run
+// any program there. The scan, the guard and the kernel images follow the walk,
+// which names that directory.
+func TestConfiguredPathBehindWritableAncestorProtectsNothing(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	svc := filepath.Join(dir, "svc")
+	mkdirExact(t, svc, 0o777)
+	configured := writeFile(t, filepath.Join(svc, "bin", "app"), sleepBinary(t), 0o755)
+
+	child := exec.Command(configured, "30")
+	child.Env = []string{"PATH=" + os.Getenv("PATH")} // no loader variable of the test environment
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	proc := selfProc(t)
+	pid := child.Process.Pid
+	if err := os.Symlink(filepath.Join("/proc", strconv.Itoa(pid)), filepath.Join(proc, strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{configured}, ReplaceDefaults: true})
+	s.refreshExeLeads(proc)
+	got, untrusted, err := s.scanProtectedTGIDs(proc, os.Getpid())
+	if err != nil || len(got) != 0 || !slices.Equal(untrusted, []string{svc}) {
+		t.Fatalf("scan with a writable directory above the last: %+v, untrusted %v (%v), want no process and %s named", got, untrusted, err, svc)
+	}
+	if reason := s.protectedPIDReason(proc, uint32(pid), os.Getpid(), ""); reason != "" {
+		t.Fatalf("the guard says %q for a process behind a writable directory", reason)
+	}
+	if images := s.kernelImages(proc, got); len(images) != 0 {
+		t.Fatalf("%d kernel images for a path behind a writable directory, want none: %v", len(images), images)
+	}
+
+	// A set that has not walked its paths verifies no process.
+	fresh := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{configured}, ReplaceDefaults: true})
+	mkdirExact(t, svc, 0o755)
+	if got, _, err := fresh.scanProtectedTGIDs(proc, os.Getpid()); err != nil || len(got) != 0 {
+		t.Fatalf("scan before the first walk: %+v (%v), want no process", got, err)
+	}
+
+	s.refreshExeLeads(proc)
+	got, untrusted, err = s.scanProtectedTGIDs(proc, os.Getpid())
+	if err != nil || len(got) != 1 || len(untrusted) != 0 {
+		t.Fatalf("scan after the directory was fixed: %+v, untrusted %v (%v), want the child protected", got, untrusted, err)
+	}
+	if images := s.kernelImages(proc, got); len(images) != 1 {
+		t.Fatalf("%d kernel images after the fix, want 1: %v", len(images), images)
+	}
+}
+
+// configuredExeCheck takes a running image for the file at a configured path
+// only when it is the file the walk reached, and a replaced image only when it is
+// root's alone and on the filesystem of the directory the walk reached.
+func TestConfiguredExeCheck(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	file := writeFile(t, filepath.Join(dir, "agentd"), "x", 0o755)
+	other := writeFile(t, filepath.Join(dir, "other"), "y", 0o755)
+	loose := writeFile(t, filepath.Join(dir, "loose"), "z", 0o777)
+	stat := func(path string) fs.FileInfo {
+		t.Helper()
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi
+	}
+	walked := &exeWalk{lead: file, file: stat(file), dir: stat(dir)}
+	deleted := file + " (deleted)"
+	type want struct {
+		got  tri
+		name string
+	}
+	for _, tc := range []struct {
+		desc    string
+		running string
+		link    string
+		walk    *exeWalk
+		want    want
+	}{
+		{"the file the walk reached", file, file, walked, want{triYes, ""}},
+		{"another file under the name of the path", other, file, walked, want{triNo, ""}},
+		{"a walk that found no file", file, file, &exeWalk{untrusted: "/svc"}, want{triNo, "/svc"}},
+		{"a path that was not walked", file, file, &exeWalk{}, want{triNo, ""}},
+		{"a replaced image of root", other, deleted, walked, want{triYes, ""}},
+		{"a replaced image that others can write", loose, deleted, walked, want{triNo, deleted}},
+		{"a replaced image whose directory the walk refused", other, deleted, &exeWalk{dirStop: "/svc"}, want{triNo, "/svc"}},
+		{"a replaced image of a path that was not walked", other, deleted, &exeWalk{}, want{triNo, ""}},
+	} {
+		if got, name := configuredExeCheck(stat(tc.running), tc.link, strings.HasSuffix(tc.link, " (deleted)"), tc.walk); got != tc.want.got || name != tc.want.name {
+			t.Errorf("%s: %v %q, want %v %q", tc.desc, got, name, tc.want.got, tc.want.name)
+		}
+	}
+	// An image on another filesystem than the directory is another file whatever its owner.
+	if st, err := os.Stat("/proc/self/status"); err == nil && !sameDevice(st, walked.dir) {
+		if got, name := configuredExeCheck(st, deleted, true, walked); got != triNo || name != "" {
+			t.Errorf("a replaced image on another filesystem: %v %q, want no and silent", got, name)
+		}
 	}
 }

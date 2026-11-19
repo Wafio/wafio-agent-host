@@ -412,52 +412,72 @@ func systemDirOnly(img protectedImage) bool {
 	return img.Flags&^protectedImageKeepOnSetuid == protectedImageRoot
 }
 
-// leadOf returns where the configured path p leads inside the root rootFD refers
-// to: trustedWalk follows its symlinks, in the directory part and in the file
-// name, and stops at a directory or file that others can write, with an
-// *untrustedError. A path with no file at its end (a replaced binary still runs
-// from there) leads where its directory does.
-func leadOf(root int, p string) (string, error) {
-	fd, lead, err := trustedWalk(root, p)
-	if err == nil {
-		_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
-		return lead, nil
-	}
-	var untrusted *untrustedError
-	if errors.As(err, &untrusted) {
-		return "", err
-	}
-	fd, dir, err := trustedWalk(root, filepath.Dir(p))
-	if errors.As(err, &untrusted) {
-		return "", unix.ENOENT // no file at p, so nothing there to name
-	}
+// closeInfo reads the file info of the O_PATH descriptor fd and closes it. It
+// returns nil when the descriptor cannot be read.
+func closeInfo(fd int) os.FileInfo {
+	f := os.NewFile(uintptr(fd), "")
+	defer func() { _ = f.Close() }() // an O_PATH descriptor holds no data to flush
+	fi, err := f.Stat()
 	if err != nil {
-		return "", err
+		return nil
 	}
-	_ = unix.Close(fd) // an O_PATH descriptor holds no data to flush
-	return filepath.Join(dir, filepath.Base(p)), nil
+	return fi
 }
 
-// refreshExeLeads records where each configured exe path that goes through a
-// symlink, in its directory or as the file itself, leads inside PID 1's root
-// (configuredLink matches a process by it), and the directories and files that
-// stopped the walk (scanProtectedTGIDs reports them). The path is resolved with
-// the walk of the image set and the watch. A root that cannot be opened leaves
-// no entries.
+// walkExe walks the configured path p inside the root rootFD refers to.
+// trustedWalk follows its symlinks, in the directory part and in the file name,
+// and stops at a directory or file that others can write. The result says where
+// the path leads, the file there and the directory that holds it, each only when
+// the walk to it passed, and what stopped the walks. A path with no file at its
+// end (a replaced binary still runs from there) leads where its directory does.
+func walkExe(root int, p string) exeWalk {
+	var w exeWalk
+	var stop *untrustedError
+	fd, lead, err := trustedWalk(root, p)
+	switch {
+	case err == nil:
+		w.lead, w.file = lead, closeInfo(fd)
+	case errors.As(err, &stop):
+		w.untrusted = stop.path
+	}
+	held := p
+	if w.lead != "" {
+		held = w.lead
+	}
+	fd, dir, err := trustedWalk(root, filepath.Dir(held))
+	switch {
+	case err == nil:
+		w.dir = closeInfo(fd)
+		if w.lead == "" && w.untrusted == "" {
+			w.lead = filepath.Join(dir, filepath.Base(p))
+		}
+	case errors.As(err, &stop):
+		w.dirStop = stop.path
+	}
+	return w
+}
+
+// refreshExeLeads walks each configured exe path inside PID 1's root. It records
+// where a path that goes through a symlink, in its directory or as the file
+// itself, leads (configuredLink matches a process by it), the directories and
+// files that stopped a walk (scanProtectedTGIDs reports them), and the walk
+// itself, which decides whether a running process is the file at the path
+// (hostExeCheck). The walk is the one of the image set and the watch. A root that
+// cannot be opened leaves no entries.
 func (s *ProtectedProcessSet) refreshExeLeads(procRoot string) {
 	if s == nil {
 		return
 	}
-	found := &exeLeads{byTarget: make(map[string]string)}
+	found := &exeLeads{byTarget: make(map[string]string), walked: make(map[string]exeWalk)}
 	if root, err := unix.Open(filepath.Join(procRoot, "1", "root"), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); err == nil {
 		for p := range s.exes {
-			target, err := leadOf(root, p)
-			var untrusted *untrustedError
-			if errors.As(err, &untrusted) {
-				found.untrusted = append(found.untrusted, untrusted.path)
+			w := walkExe(root, p)
+			found.walked[p] = w
+			if w.untrusted != "" {
+				found.untrusted = append(found.untrusted, w.untrusted)
 			}
-			if _, listed := s.exes[target]; err == nil && target != p && !listed {
-				found.byTarget[target] = p
+			if _, listed := s.exes[w.lead]; w.lead != "" && w.lead != p && !listed {
+				found.byTarget[w.lead] = p
 			}
 		}
 		_ = unix.Close(root) // an O_PATH descriptor holds no data to flush

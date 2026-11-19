@@ -287,7 +287,7 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 		}
 	}
 	orig := hostExeCheck
-	hostExeCheck = func(_, dir, _ string) (tri, string) {
+	hostExeCheck = func(_, dir, _ string, _ *exeWalk) (tri, string) {
 		if path, err := os.ReadFile(filepath.Join(dir, "fake_untrusted")); err == nil {
 			return triNo, string(path)
 		}
