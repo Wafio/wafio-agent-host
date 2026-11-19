@@ -412,14 +412,38 @@ var beforeProtectedPut func(tgid uint32)
 
 // protectedStillRuns reports whether the process still has the start time and
 // the image the scan verified. The PID and the start time stay the same across
-// an exec, so the image decides, as in kernelImages.
+// an exec, so the image decides, as in kernelImages. An entry that only a root
+// process may hold (a name match whose image has no keep flag) also needs root
+// UIDs still, unless the parent is PID 1: protect_on_setuid takes that entry
+// away at the exit of setuid and leaves a child of PID 1 to its exec.
 func protectedStillRuns(procRoot string, p protectedTGID) bool {
 	dir := procDir(procRoot, p.tgid)
 	if ticks, ok := startTicksAt(dir); !ok || ticks != p.startTicks {
 		return false
 	}
 	now, err := os.Stat(filepath.Join(dir, "exe"))
-	return err == nil && os.SameFile(now, p.file)
+	if err != nil || !os.SameFile(now, p.file) {
+		return false
+	}
+	if img, ok := p.image(); ok && img.Flags&^protectedImageRoot != 0 {
+		return true // kept for any user, in its unit or through its own switch of user
+	}
+	status := filepath.Join(dir, "status")
+	return rootUIDs(status) == triYes || parentIsInit(status)
+}
+
+// parentIsInit reads the "PPid:" line of /proc/<pid>/status.
+func parentIsInit(statusPath string) bool {
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "PPid:"); ok {
+			return strings.TrimSpace(rest) == "1"
+		}
+	}
+	return false
 }
 
 // systemDirOnly says that a path comes from a protected name searched in the

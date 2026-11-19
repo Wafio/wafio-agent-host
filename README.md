@@ -166,7 +166,10 @@ those two events only for a verified process. The next refresh drops that mark,
 because a process under a name counts only as root. A child of PID 1 keeps the
 mark until its `exec`, because systemd switches to `User=` right before it. A
 kernel that rejects those three programs leaves the next refresh (5 s) to drop
-the mark, as does a 32-bit call on x86_64.
+the mark, as does a 32-bit call on x86_64. The refresh reads the user IDs of a
+process again after it writes the entry and applies the same rule: a process
+that read as root in the scan and gave up root before the write loses the entry
+at once, because the kernel hook for `setuid` had no entry to drop.
 A thread can rename itself with `prctl(PR_SET_NAME)`. A rule that trusts the
 mark should therefore also match the process name and the user. The same set makes the WAF agent immune to Kill
 policies, so a policy cannot take down the sites it fronts.

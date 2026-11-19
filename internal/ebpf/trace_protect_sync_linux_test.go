@@ -242,6 +242,87 @@ func TestSyncProtectedTGIDsDropsProcessChangedAfterScan(t *testing.T) {
 	}
 }
 
+// A process the scan read as root can call setuid before the refresh writes its
+// entry, and then the kernel hook for setuid has no entry to drop: the refresh
+// reads the UIDs again after the write and applies the rule of that hook. An
+// image for root alone loses the entry; one that keeps it through its own switch
+// of user (the OpenSSH names), a configured path and a child of PID 1 do not.
+func TestSyncProtectedTGIDsAppliesTheSetuidRuleAfterTheWrite(t *testing.T) {
+	asTrustedOwner(t)
+	dir := imageTestDir(t)
+	svc := writeFile(t, filepath.Join(dir, "svc"), "svc", 0o755)
+	sshd := writeFile(t, filepath.Join(dir, "sshd"), "sshd", 0o755)
+	prevDirs := trustedExeDirs
+	trustedExeDirs = []string{dir + "/"}
+	t.Cleanup(func() { trustedExeDirs = prevDirs })
+
+	byName := NewProtectedProcessSet([]string{"svc"}, nil)
+	byPath := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{svc}, ReplaceDefaults: true})
+	for _, tc := range []struct {
+		name  string
+		set   *ProtectedProcessSet
+		exe   string
+		to    string // UID of the process after the scan, "" = no status file
+		ppid  uint32
+		stays bool
+	}{
+		{"name, switched to a user", byName, svc, "33", 800, false},
+		{"name, status unreadable", byName, svc, "", 800, false},
+		{"name, still root", byName, svc, "0", 800, true},
+		{"name, child of PID 1", byName, svc, "33", 1, true},
+		{"OpenSSH name", byName, sshd, "33", 800, true},
+		{"configured path", byPath, svc, "999", 800, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			comm := filepath.Base(tc.exe)
+			proc := fakeProc(t, map[uint32]fakeProcEntry{
+				700: {exe: tc.exe, comm: comm, uid: "0", mntns: hostNS, hostExe: true, start: 1234, ppid: tc.ppid},
+			})
+			reportRunningImage(t)
+			if err := os.Symlink("/proc/self", filepath.Join(proc, "1")); err != nil {
+				t.Fatal(err)
+			}
+			status := filepath.Join(proc, "700", "status")
+			beforeProtectedPut = func(tgid uint32) {
+				var err error
+				if tc.to == "" {
+					err = os.Remove(status)
+				} else {
+					body := fmt.Sprintf("Name:\t%s\nPPid:\t%d\nUid:\t%[3]s\t%[3]s\t%[3]s\t%[3]s\n", comm, tc.ppid, tc.to)
+					err = os.WriteFile(status, []byte(body), 0o644)
+				}
+				if err != nil {
+					t.Error(err)
+				}
+			}
+			t.Cleanup(func() { beforeProtectedPut = nil })
+			var ops []string
+			tm := &TraceManager{
+				log:                log.New(io.Discard, "", 0),
+				protected:          tc.set,
+				procRoot:           proc,
+				execKeep:           true,
+				protectedMap:       newFakeKernelMap("tgids", 8, &ops),
+				protectedImagesMap: newFakeKernelMap("images", uint32(len(protectedImage{}.Unit))+8, &ops),
+				protectedBudgetMap: newFakeKernelMap("budget", 8, &ops),
+			}
+			if matched, err := tm.syncProtectedTGIDs(); err != nil || matched != 1 {
+				t.Fatalf("sync: matched %d, error %v", matched, err)
+			}
+			kernel := tm.protectedMap.(*fakeKernelMap).data
+			if tc.stays {
+				if kernel[uint32(700)] != uint64(1234) || tm.protectedTGIDs[700] != 1234 {
+					t.Fatalf("the entry was dropped: kernel %v, kept %v", kernel, tm.protectedTGIDs)
+				}
+				return
+			}
+			if len(kernel) != 0 || len(tm.protectedTGIDs) != 0 || !slices.Contains(ops, "tgids delete 700") {
+				t.Fatalf("entry left for a process that gave up root: kernel %v, kept %v\n%s", kernel, tm.protectedTGIDs, strings.Join(ops, "\n"))
+			}
+		})
+	}
+}
+
 // Fork inheritance is turned off before the fork probe attaches when the exec
 // probe is not linked, and the kernel is told: budget and limit both 0, so the
 // units it gives back at exit cannot raise it.

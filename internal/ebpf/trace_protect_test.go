@@ -233,6 +233,7 @@ type fakeProcEntry struct {
 	start     uint64 // stat starttime ticks; 0 = no stat file (unless kthread)
 	kthread   bool   // stat flags carry PF_KTHREAD
 	cgroup    string // /proc/<pid>/cgroup content; "" = no file
+	ppid      uint32 // PPid line of the status file; 0 = no line
 }
 
 // fakeProc builds a /proc-like tree: <pid>/exe symlink (dangling is fine,
@@ -261,7 +262,11 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 			write(filepath.Join(dir, "comm"), e.comm+"\n")
 		}
 		if e.uid != "" {
-			write(filepath.Join(dir, "status"), "Name:\t"+e.comm+"\nUid:\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\nGid:\t0\t0\t0\t0\n")
+			ppid := ""
+			if e.ppid != 0 {
+				ppid = "PPid:\t" + strconv.FormatUint(uint64(e.ppid), 10) + "\n"
+			}
+			write(filepath.Join(dir, "status"), "Name:\t"+e.comm+"\n"+ppid+"Uid:\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\t"+e.uid+"\nGid:\t0\t0\t0\t0\n")
 		}
 		write(filepath.Join(dir, "environ"), e.env)
 		if e.cgroup != "" {

@@ -338,9 +338,12 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 			tm.log.Printf("protected-process map update %d: %v", tgid, err)
 			continue
 		}
-		// The exec and exit hooks of the kernel see only an entry that exists. A
-		// process that exec'd another image or exited after the scan met none,
-		// and the write put its entry back: check it now, after the write.
+		// The exec, exit and setuid hooks of the kernel see only an entry that
+		// exists. A process that exec'd another image, exited or gave up root
+		// after the scan met none, and the write put its entry back: check it
+		// now. commit_creds changes the credentials before sys_exit of set*uid
+		// runs, so either that hook sees the entry and drops it, or this read
+		// sees the new UIDs.
 		if !protectedStillRuns(tm.proc(), scanned[tgid]) {
 			derr := tm.protectedMap.Delete(tgid)
 			if derr == nil || errors.Is(derr, ebpf.ErrKeyNotExist) {
