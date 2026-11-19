@@ -363,6 +363,10 @@ type procIdentity struct {
 	// untrusted: the file or directory an account other than root can write
 	// while the process runs that file (hostExeCheck); hostExe is triNo then.
 	untrusted string
+
+	// exeFile is the running image hostExeCheck judged, nil when it could not be
+	// read.
+	exeFile os.FileInfo
 }
 
 // pfKthread is PF_KTHREAD (include/linux/sched.h), field 9 of /proc/<pid>/stat.
@@ -529,7 +533,7 @@ func (s *ProtectedProcessSet) readProcIdentity(procRoot string, pid uint32) proc
 	}
 	exe, _ := protectedExeCandidate(id.exe)
 	id.hostMntNS = sameHostMountNS(procRoot, dir)
-	id.hostExe, id.untrusted = hostExeCheck(procRoot, dir, link, s.walkOf(exe))
+	id.hostExe, id.untrusted, id.exeFile = hostExeCheck(procRoot, dir, link, s.walkOf(exe))
 	id.rootUIDs = rootUIDs(filepath.Join(dir, "status"))
 	id.preload = loaderInjection(filepath.Join(dir, "environ"))
 	if s.units[exe] != "" {
@@ -663,14 +667,22 @@ func sameHostMountNS(procRoot, dir string) tri {
 // process matched by name. A configured path is judged by that walk and by
 // nothing else (configuredExeCheck), and the string then names what stopped the
 // walk: a directory above the last one that an account other than root can write
-// could show the agent a view of the path that root never made. A variable so
-// tests can substitute it.
-var hostExeCheck = func(procRoot, dir, link string, walk *exeWalk) (tri, string) {
-	exe, deleted := protectedExeCandidate(link)
+// could show the agent a view of the path that root never made. The file is the
+// running image that was judged, nil when it cannot be read: a later read of the
+// image is the same file only if the process did not exec in between. A variable
+// so tests can substitute it.
+var hostExeCheck = func(procRoot, dir, link string, walk *exeWalk) (tri, string, os.FileInfo) {
 	running, err := os.Stat(filepath.Join(dir, "exe"))
 	if err != nil {
-		return triUnknown, ""
+		return triUnknown, "", nil
 	}
+	ok, path := runningIsHostExe(procRoot, running, link, walk)
+	return ok, path, running
+}
+
+// runningIsHostExe is hostExeCheck for the running image, once it is read.
+func runningIsHostExe(procRoot string, running os.FileInfo, link string, walk *exeWalk) (tri, string) {
+	exe, deleted := protectedExeCandidate(link)
 	if walk != nil {
 		return configuredExeCheck(running, link, deleted, walk)
 	}
@@ -785,6 +797,10 @@ type protectedTGID struct {
 	// name: the basename of the executable of a process matched by name; ""
 	// for one matched by a configured path.
 	name string
+	// file is the image the process ran when the scan verified it. The PID and
+	// the start time stay the same across an exec, so a later read of the image
+	// counts only if it is this file (kernelImages).
+	file os.FileInfo
 }
 
 // image is the trace_protected_images value for the file the process runs: the
@@ -847,7 +863,7 @@ func (s *ProtectedProcessSet) scanProtectedTGIDs(procRoot string, selfPID int) (
 		}
 		exe, _ := protectedExeCandidate(id.exe)
 		_, configured := s.exes[exe]
-		p := protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe]}
+		p := protectedTGID{tgid: uint32(pid), startTicks: ticks, configured: configured, unit: s.units[exe], file: id.exeFile}
 		if !configured {
 			p.name = filepath.Base(exe)
 		}

@@ -178,8 +178,9 @@ never by name. The trusted files are the protected names (built-in and from
 `/usr/bin`, `/usr/lib/openssh`, `/usr/lib/systemd` and the like), which keep the
 mark only for root; the paths in `WAFIO_PROTECTED_EXE_PATHS`, which keep it for
 any user; the WAF agent and systemd-networkd paths above, which keep it only
-inside their unit; the programs of processes the agent has already verified;
-and the `systemd-executor` file that PID 1 holds open. The agent rewrites the
+inside their unit; the programs of processes the agent has already verified,
+while they still run the file it verified; and the `systemd-executor` file that
+PID 1 holds open. The agent rewrites the
 list every 5 s and again when a file with one of those names changes in one of
 those directories. The first change applies at once and later changes within a
 second wait up to a second, so a restart inside that second of the last rename

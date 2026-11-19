@@ -84,12 +84,22 @@ func TestHostExeCheckRefusesWhatOthersCanWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	check := func(link string) (tri, string) { return hostExeCheck(proc, pidDir, link, nil) }
+	var judged os.FileInfo
+	check := func(link string) (tri, string) {
+		ok, path, file := hostExeCheck(proc, pidDir, link, nil)
+		judged = file
+		return ok, path
+	}
 	run(file)
 
 	trustedUID = uint32(os.Getuid())
 	if got, path := check(exe); got != triYes || path != "" {
 		t.Fatalf("a file and a directory only their owner can write: %v %q, want yes", got, path)
+	}
+	// The check hands back the image it judged, which a later read of the
+	// process's image is compared with.
+	if want, err := os.Stat(file); err != nil || !os.SameFile(judged, want) {
+		t.Errorf("the image the check judged is not the running file: %v", judged)
 	}
 	for _, mode := range []os.FileMode{0o775, 0o757, 0o777} {
 		set(file, mode)
@@ -131,8 +141,8 @@ func TestHostExeCheckRefusesWhatOthersCanWrite(t *testing.T) {
 	if got, _ := check("/opt/acme/missing"); got != triNo {
 		t.Errorf("no file at the path: %v, want no", got)
 	}
-	if got, _ := hostExeCheck(proc, filepath.Join(proc, "11"), exe, nil); got != triUnknown {
-		t.Errorf("no running image: %v, want unknown", got)
+	if got, _, image := hostExeCheck(proc, filepath.Join(proc, "11"), exe, nil); got != triUnknown || image != nil {
+		t.Errorf("no running image: %v %v, want unknown and no file", got, image)
 	}
 
 	// A replaced image has no file at the path to compare with: it is the

@@ -287,12 +287,12 @@ func fakeProc(t *testing.T, entries map[uint32]fakeProcEntry) string {
 		}
 	}
 	orig := hostExeCheck
-	hostExeCheck = func(_, dir, _ string, _ *exeWalk) (tri, string) {
+	hostExeCheck = func(_, dir, _ string, _ *exeWalk) (tri, string, os.FileInfo) {
 		if path, err := os.ReadFile(filepath.Join(dir, "fake_untrusted")); err == nil {
-			return triNo, string(path)
+			return triNo, string(path), nil
 		}
 		_, err := os.Stat(filepath.Join(dir, "fake_host_exe"))
-		return triOf(err == nil), ""
+		return triOf(err == nil), "", nil
 	}
 	t.Cleanup(func() { hostExeCheck = orig })
 	return root

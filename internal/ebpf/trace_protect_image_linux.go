@@ -412,11 +412,12 @@ func systemDirOnly(img protectedImage) bool {
 	return img.Flags&^protectedImageKeepOnSetuid == protectedImageRoot
 }
 
-// closeInfo reads the file info of the O_PATH descriptor fd and closes it. It
-// returns nil when the descriptor cannot be read.
+// closeInfo reads the file info of the descriptor fd, an O_PATH one or one open
+// for reading, and closes it. It returns nil when the descriptor cannot be
+// read.
 func closeInfo(fd int) os.FileInfo {
 	f := os.NewFile(uintptr(fd), "")
-	defer func() { _ = f.Close() }() // an O_PATH descriptor holds no data to flush
+	defer func() { _ = f.Close() }() // not open for writing: no data to flush
 	fi, err := f.Stat()
 	if err != nil {
 		return nil
@@ -496,9 +497,10 @@ func (s *ProtectedProcessSet) refreshExeLeads(procRoot string) {
 //     their own mount namespace or run a binary that was replaced on disk (the
 //     inode stays referenced while the process runs, so it cannot be reused).
 //     A process is used only while its start time still equals the one the scan
-//     recorded, before and after its image is read: the list may be seconds old
-//     on a refresh started by a file change, and a PID that was reused since
-//     would name another process's file;
+//     recorded, before and after its image is read, and its image is the file
+//     the scan verified: the list may be seconds old on a refresh started by a
+//     file change, a PID that was reused since would name another process's
+//     file, and a process that ran exec since keeps its PID and start time;
 //   - the files PID 1 holds open at a trusted path: systemd 255 and later keeps
 //     systemd-executor open and runs it as /proc/self/fd/<n>, also after a
 //     package upgrade replaced it and before daemon-reexec.
@@ -552,11 +554,11 @@ func (s *ProtectedProcessSet) kernelImages(procRoot string, verified []protected
 		}
 		mounts, mountsOK := mountsOf(dir)
 		key, keyOK := fileImage(fd, mounts)
-		_ = unix.Close(fd) // read-only descriptor
+		now := closeInfo(fd)
 		if afterImageRead != nil {
 			afterImageRead(dir)
 		}
-		if ticks, ok := startTicksAt(dir); !mountsOK || !keyOK || !ok || ticks != p.startTicks {
+		if ticks, ok := startTicksAt(dir); !mountsOK || !keyOK || !ok || ticks != p.startTicks || !os.SameFile(now, p.file) {
 			continue
 		}
 		add(key, img)
