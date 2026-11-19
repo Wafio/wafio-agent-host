@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -33,10 +34,12 @@ type imageWatch struct {
 	root    int // O_PATH descriptor of PID 1's root
 	changed chan struct{}
 	exited  chan struct{}
-	dirs    []string // every directory of the trusted paths
+	dirs    []string             // every directory of the trusted paths
+	set     *ProtectedProcessSet // its leads name the files configured symlinks lead to
 
 	mu    sync.Mutex
 	armed map[string]armedDir
+	names map[string]struct{} // basenames a change of which signals
 }
 
 // armedDir is the watch behind a directory name and the directory (device and
@@ -50,8 +53,8 @@ type armedDir struct {
 
 // watchProtectedImages watches the directories of every path in imagePaths,
 // inside the root of the process procRoot/1, and signals for the basenames of
-// those paths only. A directory that does not exist is skipped until rearm finds
-// it. It fails only when it cannot start watching at all, which includes PID 1's
+// those paths only (rearm adds the files that configured symlinks lead to). A
+// directory that does not exist is skipped until rearm finds it. It fails only when it cannot start watching at all, which includes PID 1's
 // root being unreadable (the agent lacks CAP_SYS_PTRACE: no image could be
 // identified either). Close the result when done.
 func watchProtectedImages(s *ProtectedProcessSet, procRoot string) (*imageWatch, error) {
@@ -76,30 +79,53 @@ func watchProtectedImages(s *ProtectedProcessSet, procRoot string) (*imageWatch,
 		root:    root,
 		changed: make(chan struct{}, 1),
 		exited:  make(chan struct{}),
+		set:     s,
 		armed:   make(map[string]armedDir),
+		names:   names,
 	}
 	for d := range dirs {
 		w.dirs = append(w.dirs, d)
 	}
 	w.rearm()
-	go w.read(names)
+	go w.read()
 	return w, nil
 }
 
 // rearm watches the directories that are not watched: one that did not exist
 // when the watch started, that was moved or removed since, or whose name leads
-// to another directory now (a symlink pointed at a new release). A directory is
-// found by the same walk as the image set (trustedWalk), so one that only root
-// can write in, behind symlinks of such directories, is watched and any other is
-// not: no trusted image can be in it. It returns how many it armed. Call it before each refresh: a file that appeared in a
-// directory before it was armed is then seen by the refresh itself.
+// to another directory now (a symlink pointed at a new release). It also
+// watches the directory that holds the file a configured path leads to, when
+// the last part of the path is a symlink: a file replaced there is a new image
+// too. A directory is watched when the image set can read a trusted file from
+// it, by either of its two ways: one that only root can write in, with no
+// symlink in its path (the system directories of a protected name), or one
+// reached by the walk of a configured path (trustedWalk), which also asks it of
+// every directory above and follows symlinks out of such directories. Any other
+// is not watched: no trusted image can be in it. It returns how many it armed.
+// Call it before each refresh: a file that appeared in a directory before it was
+// armed is then seen by the refresh itself.
 func (w *imageWatch) rearm() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	dirs := w.dirs
+	if w.set != nil {
+		if leads := w.set.leads.Load(); leads != nil {
+			dirs = slices.Clone(dirs)
+			for _, walk := range leads.walked {
+				if walk.lead != "" {
+					dirs = append(dirs, filepath.Dir(walk.lead))
+					w.names[filepath.Base(walk.lead)] = struct{}{}
+				}
+			}
+		}
+	}
 	n := 0
-	for _, dir := range w.dirs {
-		fd, _, err := trustedWalk(w.root, dir)
-		if err != nil {
+	for _, dir := range dirs {
+		fd, ok := trustedDir(w.root, dir, false)
+		if !ok {
+			fd, ok = trustedDir(w.root, dir, true)
+		}
+		if !ok {
 			continue // not there (yet), not a directory, or not root's alone
 		}
 		var st unix.Stat_t
@@ -161,7 +187,15 @@ func (w *imageWatch) unarm(wd int, remove bool) {
 	}
 }
 
-func (w *imageWatch) read(names map[string]struct{}) {
+// wanted reports whether a change of the file called name signals.
+func (w *imageWatch) wanted(name string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.names[name]
+	return ok
+}
+
+func (w *imageWatch) read() {
 	defer close(w.exited)
 	buf := make([]byte, 4096)
 	for {
@@ -184,7 +218,7 @@ func (w *imageWatch) read(names map[string]struct{}) {
 			if self {
 				w.unarm(wd, mask&unix.IN_MOVE_SELF != 0)
 			}
-			if _, ok := names[name]; ok || self || mask&unix.IN_Q_OVERFLOW != 0 {
+			if self || mask&unix.IN_Q_OVERFLOW != 0 || w.wanted(name) {
 				select {
 				case w.changed <- struct{}{}:
 				default:

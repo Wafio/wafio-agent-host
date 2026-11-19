@@ -1098,6 +1098,103 @@ func TestWatchRetargetKeepsSharedWatch(t *testing.T) {
 	signalAfterWriting(t, w, filepath.Join(rel2, "agentd"))
 }
 
+// The image set reads a protected name from a directory only root can write in,
+// whatever the directories above it allow, as long as no symlink is on its path
+// (a 755 /usr/local/bin under a group-writable /usr/local). The watch follows
+// the same rule, or a file renamed into place there is seen only at the next
+// refresh.
+func TestWatchArmsADirectoryBehindAGroupWritableParent(t *testing.T) {
+	asTrustedOwner(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(base, "local")
+	dir := filepath.Join(parent, "bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	root := rootFD(t, "/")
+	if fd, _, err := trustedWalk(root, dir); err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("the walk of a configured path trusts a directory below a group-writable one")
+	}
+	if fd, ok := trustedDir(root, dir, false); !ok {
+		t.Fatal("a directory only root can write in is not trusted without symlinks")
+	} else {
+		_ = unix.Close(fd)
+	}
+
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ReplaceDefaults: true})
+	w, err := watchProtectedImages(s, selfProc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.mu.Lock()
+	w.dirs = append(w.dirs, dir)
+	w.names["sshd"] = struct{}{}
+	w.mu.Unlock()
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories, want 1", n)
+	}
+	signalAfterWriting(t, w, filepath.Join(dir, "sshd"))
+}
+
+// A configured path whose last part is a symlink has its file in another
+// directory: that directory is watched, for the name of the file, and a file
+// replaced there is a new image.
+func TestWatchFollowsTheFileASymlinkLeadsTo(t *testing.T) {
+	asTrustedOwner(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, release := filepath.Join(base, "bin"), filepath.Join(base, "release")
+	target := writeFile(t, filepath.Join(release, "agentd-1.2"), "agent", 0o755)
+	writeFile(t, filepath.Join(bin, "placeholder"), "x", 0o755)
+	if err := os.Symlink(target, filepath.Join(bin, "agentd")); err != nil {
+		t.Fatal(err)
+	}
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{filepath.Join(bin, "agentd")}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	w, err := watchProtectedImages(s, proc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if n := w.armedDirs(); n != 1 {
+		t.Fatalf("%d directories armed, want the one of the path", n)
+	}
+	// Nothing is known of the lead before the first walk of the path.
+	if n := w.rearm(); n != 0 {
+		t.Fatalf("rearm armed %d directories before the path was walked, want 0", n)
+	}
+	s.refreshExeLeads(proc)
+	if n := w.rearm(); n != 1 {
+		t.Fatalf("rearm armed %d directories after the walk, want the one of the file", n)
+	}
+	signalAfterWriting(t, w, target)
+
+	// Another file in that directory is none of the watch's business.
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-w.changed:
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(release, "other"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.changed:
+		t.Error("an unrelated file in the directory of the target signalled")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 // TestTraceProtectedImagesMapMatchesAgent reads the compiled object, not the
 // kernel: the key and the value the agent writes are the layouts the exec
 // program looks up and reads, the budget array has the slots the agent writes,
