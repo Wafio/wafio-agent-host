@@ -432,6 +432,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	// first kernel-map sync as a self-check line deploy verification greps
 	// for. Runs before protectedRefreshLoop starts (it owns that state).
 	tm.log.Printf("protected-process set: %s", tm.protected.Summary())
+	tm.protected.refreshExeLeads(tm.proc()) // the warning below names a symlink by the file it leads to
 	if w := tm.protected.RiskyWarning(); w != "" {
 		tm.log.Print(w)
 	}

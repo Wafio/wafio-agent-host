@@ -264,8 +264,11 @@ refused.
 Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
 `WAFIO_PROTECTED_EXE_PATHS` (absolute paths); `WAFIO_PROTECTED_REPLACE_DEFAULTS=true`
 replaces the built-in names and the built-in unit-bound paths (WAF agent, systemd-networkd) instead of extending them. A
-shell or interpreter in the list is accepted with a warning, because every root
-process running it would become unkillable.
+shell or interpreter in the list is accepted with a warning, because every
+process running it would become unkillable: any user for a path, root for a name.
+A path whose own name is harmless counts too when it is a symlink to one, such as
+busybox or `python3`; the warning and the self-check line show it as
+`<path>-><file>`.
 
 Check a running agent:
 

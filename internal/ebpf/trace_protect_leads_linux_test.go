@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -98,5 +100,51 @@ func relink(t *testing.T, target, link string) {
 	}
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A configured path whose own name is harmless is warned about when the file it
+// leads to is a shell, an interpreter or busybox: a process running that file
+// counts as the daemon, whoever it runs as. A path behind a writable directory
+// has no lead and protects nothing, so it is not listed.
+func TestRiskyEntriesNameTheFileASymlinkLeadsTo(t *testing.T) {
+	asTrustedOwner(t)
+	root := filepath.Join(t.TempDir(), "root")
+	for _, bin := range []string{"/usr/bin/busybox", "/usr/bin/python3.12", "/usr/bin/perl5.36", "/opt/app/server"} {
+		writeFile(t, filepath.Join(root, bin), "x", 0o755)
+	}
+	symlinkAt(t, "../../bin/busybox", filepath.Join(root, "usr/local/bin/tool"))
+	symlinkAt(t, "/usr/bin/python3.12", filepath.Join(root, "usr/local/bin/runner"))
+	symlinkAt(t, "/usr/bin/perl5.36", filepath.Join(root, "usr/local/bin/perl"))
+	symlinkAt(t, "/opt/app/server", filepath.Join(root, "usr/local/bin/daemon"))
+	mkdirExact(t, filepath.Join(root, "loose"), 0o777)
+	symlinkAt(t, "/usr/bin/busybox", filepath.Join(root, "loose", "app"))
+	proc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proc, "1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(root, filepath.Join(proc, "1", "root")); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{
+		ExePaths:        []string{"/usr/local/bin/tool", "/usr/local/bin/runner", "/usr/local/bin/perl", "/usr/local/bin/daemon", "/loose/app"},
+		ReplaceDefaults: true,
+	})
+	// A path that is a symlink to busybox is nobody's name for it until the walk has run.
+	if got := s.RiskyEntries(); !slices.Equal(got, []string{"/usr/local/bin/perl"}) {
+		t.Fatalf("before the walk: %v, want only the path that is named perl", got)
+	}
+	s.refreshExeLeads(proc)
+	want := []string{"/usr/local/bin/perl", "/usr/local/bin/runner->/usr/bin/python3.12", "/usr/local/bin/tool->/usr/bin/busybox"}
+	if got := s.RiskyEntries(); !slices.Equal(got, want) {
+		t.Fatalf("RiskyEntries() = %v, want %v", got, want)
+	}
+	if w := s.RiskyWarning(); !strings.Contains(w, "WARNING") || !strings.Contains(w, "/usr/local/bin/tool->/usr/bin/busybox") || !strings.Contains(w, "/usr/local/bin/runner->/usr/bin/python3.12") {
+		t.Fatalf("RiskyWarning() = %q", w)
+	}
+	line := protectedSelfCheck{kernelSet: true, valueSize: 8, risky: s.RiskyEntries()}.String()
+	if !strings.Contains(line, " warning=risky_protected:"+strings.Join(want, ",")) {
+		t.Fatalf("the self-check line lacks the symlinked paths: %q", line)
 	}
 }

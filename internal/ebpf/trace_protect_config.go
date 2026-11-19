@@ -277,7 +277,10 @@ func isRiskyProtectedName(basename string) bool {
 }
 
 // RiskyEntries returns the protected names and exe paths that name a shell,
-// interpreter or multi-call binary, sorted. The built-in names never do.
+// interpreter or multi-call binary, sorted. The built-in names never do. A path
+// whose own name is harmless counts when the file it leads to now is not, as a
+// symlink to busybox is: it is listed as "<path>-><file>" (refreshExeLeads must
+// have run).
 func (s *ProtectedProcessSet) RiskyEntries() []string {
 	if s == nil {
 		return nil
@@ -293,6 +296,13 @@ func (s *ProtectedProcessSet) RiskyEntries() []string {
 			out = append(out, p)
 		}
 	}
+	if leads := s.leads.Load(); leads != nil {
+		for target, p := range leads.byTarget {
+			if isRiskyProtectedName(filepath.Base(target)) && !isRiskyProtectedName(filepath.Base(p)) {
+				out = append(out, p+"->"+target)
+			}
+		}
+	}
 	slices.Sort(out)
 	return out
 }
@@ -303,7 +313,7 @@ func (s *ProtectedProcessSet) RiskyWarning() string {
 	if len(risky) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("WARNING protected-process set includes shells/interpreters [%s]: every root process running them is exempt from Kill enforcement; protect the daemon's own binary path instead",
+	return fmt.Sprintf("WARNING protected-process set includes shells/interpreters [%s]: every process running them is exempt from Kill enforcement (any user for a path, root for a name); protect the daemon's own binary path instead",
 		strings.Join(risky, ","))
 }
 
