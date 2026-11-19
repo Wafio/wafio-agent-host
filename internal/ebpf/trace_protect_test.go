@@ -107,6 +107,11 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 	// The WAF agent runs as a service account, so it is never root.
 	const wafExe, wafUnit = "/usr/local/bin/wafio-waf-agent", "/system.slice/wafio-waf-agent.service"
 	const wafBundleExe = "/opt/wafio/wafio-waf-agent" // where the WAF agent bundle installer puts it
+	// systemd-networkd runs as its own user, in its own unit, from /usr/lib/systemd or /lib/systemd.
+	const netExe, netLibExe, netUnit = "/usr/lib/systemd/systemd-networkd", "/lib/systemd/systemd-networkd", "/system.slice/systemd-networkd.service"
+	networkd := func(exe, cgroup string) procIdentity {
+		return with(hostRoot(exe, "systemd-network"), func(i *procIdentity) { i.rootUIDs = triNo; i.cgroup = cgroup })
+	}
 	waf := func(exe, cgroup string) procIdentity {
 		// The shipped unit gives the agent its own mount namespace.
 		return with(hostRoot(exe, "wafio-waf-agent"), func(i *procIdentity) { i.rootUIDs = triNo; i.hostMntNS = triNo; i.cgroup = cgroup })
@@ -177,6 +182,26 @@ func TestProtectedSetMatchIdentity(t *testing.T) {
 		// systemd 255 and later: the helper between PID 1 and the service, as root.
 		{"systemd-executor", hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), true},
 		{"systemd-executor non-root", with(hostRoot("/usr/lib/systemd/systemd-executor", "systemd-executo"), func(i *procIdentity) { i.rootUIDs = triNo }), false},
+		// nginx: the master runs as root, a worker as the configured user.
+		{"nginx master", hostRoot("/usr/sbin/nginx", "nginx"), true},
+		{"nginx worker", with(hostRoot("/usr/sbin/nginx", "nginx"), func(i *procIdentity) { i.rootUIDs = triNo }), false},
+		{"nginx copy in tmp", hostRoot("/tmp/nginx", "nginx"), false},
+		{"nginx container image", with(hostRoot("/usr/sbin/nginx", "nginx"), func(i *procIdentity) { i.hostExe = triNo; i.hostMntNS = triNo }), false},
+		{"nginx preloaded", with(hostRoot("/usr/sbin/nginx", "nginx"), func(i *procIdentity) { i.preload = true }), false},
+		{"python as nginx", hostRoot("/usr/bin/python3", "nginx"), false},
+		// systemd-networkd counts only in its own unit, at either install path, as its own user.
+		{"networkd in its unit", networkd(netExe, netUnit), true},
+		{"networkd in its unit, unmerged /usr", networkd(netLibExe, netUnit), true},
+		{"networkd deleted image in its unit", networkd(netExe+" (deleted)", netUnit), true},
+		{"networkd in a session scope", networkd(netExe, "/user.slice/user-1000.slice/session-3.scope"), false},
+		{"networkd in a user unit of the same name", networkd(netExe, "/user.slice/user-1000.slice/user@1000.service/app.slice/systemd-networkd.service"), false},
+		{"networkd in a sub-cgroup", networkd(netExe, netUnit+"/sub"), false},
+		{"networkd cgroup unreadable", networkd(netExe, ""), false},
+		{"networkd deleted image in a session scope", networkd(netExe+" (deleted)", "/user.slice/user-1000.slice/session-3.scope"), false},
+		{"networkd preloaded", with(networkd(netExe, netUnit), func(i *procIdentity) { i.preload = true }), false},
+		{"networkd copy in tmp", networkd("/tmp/systemd-networkd", netUnit), false},
+		{"networkd other image", with(networkd(netExe, netUnit), func(i *procIdentity) { i.hostExe = triNo }), false},
+		{"other systemd binary in its unit", networkd("/usr/lib/systemd/systemd-resolved", netUnit), false},
 		// Rejected configuration entries never match.
 		{"bad name", hostRoot("/usr/bin/bad/name", "name"), false},
 		{"relative exe", hostRoot("relative/exe", "exe"), false},

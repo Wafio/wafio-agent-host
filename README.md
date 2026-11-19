@@ -126,14 +126,19 @@ daemons to protect them; without it only PID 1 and the agent are protected.
 
 Kill policies never terminate a protected process. The built-in set is `sshd`
 (including `sshd-session` and `sshd-auth`), `systemd`, `systemd-executor`,
-`systemd-journald`, `containerd`, `dockerd` and `kubelet`, each counted only when
-it runs the host binary as root, and the WAF agent. The WAF agent is matched by
+`systemd-journald`, `containerd`, `dockerd`, `kubelet` and `nginx`, each counted
+only when it runs the host binary as root, the WAF agent and systemd-networkd.
+For `nginx` that is the master process: its workers run as the configured user
+and do not count. The WAF agent is matched by
 the exact path `/usr/local/bin/wafio-waf-agent` (the unit installer) or
 `/opt/wafio/wafio-waf-agent` (the installer in the WAF agent bundle) and counts
 only inside its own unit, the cgroup `/system.slice/wafio-waf-agent.service`: it
 runs as a service account and reads key and library paths from its own
 configuration, so the path alone would let any local user run the binary and be
-trusted. A copy elsewhere, a session scope, a user unit of the same name and a
+trusted. systemd-networkd is matched the same way, by
+`/usr/lib/systemd/systemd-networkd` or `/lib/systemd/systemd-networkd`, and
+counts only in the cgroup `/system.slice/systemd-networkd.service`; it runs as
+its own user (`systemd-network`). A copy elsewhere, a session scope, a user unit of the same name and a
 process with no readable cgroup do not count. The unit check follows the path,
 also when `WAFIO_PROTECTED_EXE_PATHS` lists it again. The unit gives the agent
 its own mount namespace, so a binary replaced on disk still counts until the
@@ -141,9 +146,9 @@ next restart if the process is in that cgroup. `systemd-executor` is the helper
 systemd 255 and later run between PID 1 and each service.
 
 A protected process also gets `exe_verified` on its own trace events, so the
-control plane can tell the WAF agent reading its TLS key from another process
-reading it. The mark says only that the kernel saw the process in the protected
-set. A child forked by a protected process keeps it until the child execs or the
+control plane can tell the WAF agent reading its TLS key, or the nginx master
+loading its own, from another process reading it. The mark says only that the
+kernel saw the process in the protected set. A child forked by a protected process keeps it until the child execs or the
 next refresh (5 s) drops it, and a thread can rename itself with
 `prctl(PR_SET_NAME)`. A rule that trusts the mark should therefore also match
 the process name and the user. The same set makes the WAF agent immune to Kill
@@ -151,7 +156,7 @@ policies, so a policy cannot take down the sites it fronts.
 
 Add daemons with `WAFIO_PROTECTED_PROCESSES` (basenames) and
 `WAFIO_PROTECTED_EXE_PATHS` (absolute paths); `WAFIO_PROTECTED_REPLACE_DEFAULTS=true`
-replaces the built-in names and both WAF agent paths instead of extending them. A
+replaces the built-in names and the built-in unit-bound paths (WAF agent, systemd-networkd) instead of extending them. A
 shell or interpreter in the list is accepted with a warning, because every root
 process running it would become unkillable.
 

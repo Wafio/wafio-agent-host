@@ -26,10 +26,13 @@ import (
 // and trace_config.agent_pid in the kernel), not by name. OpenSSH >= 9.8 runs
 // each connection as sshd-session and (10.0+) the pre-auth phase as
 // sshd-auth. systemd-executor is the helper that systemd 255 and later runs
-// as root between PID 1 and the service binary.
+// as root between PID 1 and the service binary. nginx is the master process,
+// which runs as root: its workers run as the configured user and a protected
+// name needs root UIDs, so only the master counts, and the control plane can
+// tell it loading its TLS key from a worker or another process reading it.
 var DefaultProtectedProcessNames = []string{
 	"sshd", "sshd-session", "sshd-auth", "systemd", "systemd-journald", "containerd", "dockerd", "kubelet",
-	"systemd-executor",
+	"systemd-executor", "nginx",
 }
 
 // DefaultProtectedUnitExes maps a built-in protected executable path to the
@@ -39,9 +42,15 @@ var DefaultProtectedProcessNames = []string{
 // and be trusted. Only root can put a process into a system.slice cgroup.
 // The unit installer puts the binary in /usr/local/bin; the installer in the
 // WAF agent bundle puts it in /opt/wafio and points the unit there.
+// systemd-networkd runs as its own user (systemd-network) from the same unit
+// on every distribution that ships it; the distributions install the binary in
+// /usr/lib/systemd or, without a merged /usr, in /lib/systemd. As for the WAF
+// agent, the path alone would let any user who can run the binary be trusted.
 var DefaultProtectedUnitExes = map[string]string{
-	"/usr/local/bin/wafio-waf-agent": "wafio-waf-agent.service",
-	"/opt/wafio/wafio-waf-agent":     "wafio-waf-agent.service",
+	"/usr/local/bin/wafio-waf-agent":    "wafio-waf-agent.service",
+	"/opt/wafio/wafio-waf-agent":        "wafio-waf-agent.service",
+	"/usr/lib/systemd/systemd-networkd": "systemd-networkd.service",
+	"/lib/systemd/systemd-networkd":     "systemd-networkd.service",
 }
 
 // trustedExeDirs: a protected NAME only counts when the executable lives in a

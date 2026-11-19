@@ -51,6 +51,8 @@ func TestProtectedKernelComms(t *testing.T) {
 		"containerd":      protectedCommRootOnly,
 		"dockerd":         protectedCommRootOnly,
 		"kubelet":         protectedCommRootOnly,
+		"nginx":           protectedCommRootOnly, // the master; a worker is not root
+		"systemd-network": 0,                     // runs as its own user, in its own unit; the comm is cut at 15 bytes
 		"my-daemon":       protectedCommRootOnly,
 		"agentd":          0,
 	}

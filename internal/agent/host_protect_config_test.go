@@ -15,14 +15,14 @@ func envMap(m map[string]string) func(string) string {
 func TestLoadProtectedProcessesFromEnv(t *testing.T) {
 	cfg := DefaultHostConfig()
 	err := cfg.LoadProtectedProcesses(envMap(map[string]string{
-		EnvProtectedProcesses:       " nginx, haproxy ",
+		EnvProtectedProcesses:       " haproxy, envoy ",
 		EnvProtectedExePaths:        "/opt/acme/bin/agentd,/usr/lib/postgresql/16/bin/postgres",
 		EnvProtectedReplaceDefaults: "false",
 	}), ProtectedFlagsSet{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"nginx", "haproxy"}; !slices.Equal(cfg.ProtectedProcessNames, want) {
+	if want := []string{"haproxy", "envoy"}; !slices.Equal(cfg.ProtectedProcessNames, want) {
 		t.Errorf("names %q, want %q", cfg.ProtectedProcessNames, want)
 	}
 	if want := []string{"/opt/acme/bin/agentd", "/usr/lib/postgresql/16/bin/postgres"}; !slices.Equal(cfg.ProtectedExePaths, want) {
@@ -33,7 +33,7 @@ func TestLoadProtectedProcessesFromEnv(t *testing.T) {
 	}
 	// Configured names extend the built-ins.
 	names := cfg.ProtectedProcessConfig().EffectiveNames()
-	for _, n := range append([]string{"nginx", "haproxy"}, wafebpf.DefaultProtectedProcessNames...) {
+	for _, n := range append([]string{"haproxy", "envoy"}, wafebpf.DefaultProtectedProcessNames...) {
 		if !slices.Contains(names, n) {
 			t.Errorf("effective names %q lack %q", names, n)
 		}
@@ -42,7 +42,7 @@ func TestLoadProtectedProcessesFromEnv(t *testing.T) {
 
 func TestLoadProtectedProcessesFlagsWin(t *testing.T) {
 	cfg := DefaultHostConfig()
-	cfg.ProtectedProcessNames = []string{"nginx", " haproxy"} // pflag keeps the space after a comma
+	cfg.ProtectedProcessNames = []string{"haproxy", " envoy"} // pflag keeps the space after a comma
 	cfg.ProtectedExePaths = nil                               // flag given as --protected-exe-paths=""
 	err := cfg.LoadProtectedProcesses(envMap(map[string]string{
 		EnvProtectedProcesses:       "from-env",
@@ -52,7 +52,7 @@ func TestLoadProtectedProcessesFlagsWin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"nginx", "haproxy"}; !slices.Equal(cfg.ProtectedProcessNames, want) {
+	if want := []string{"haproxy", "envoy"}; !slices.Equal(cfg.ProtectedProcessNames, want) {
 		t.Errorf("names %q, want %q", cfg.ProtectedProcessNames, want)
 	}
 	if len(cfg.ProtectedExePaths) != 0 {
@@ -62,11 +62,11 @@ func TestLoadProtectedProcessesFlagsWin(t *testing.T) {
 
 func TestLoadProtectedProcessesBlankEnvKeepsConfig(t *testing.T) {
 	cfg := DefaultHostConfig()
-	cfg.ProtectedProcessNames = []string{"nginx"}
+	cfg.ProtectedProcessNames = []string{"haproxy"}
 	if err := cfg.LoadProtectedProcesses(envMap(map[string]string{EnvProtectedProcesses: "  "}), ProtectedFlagsSet{}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(cfg.ProtectedProcessNames, []string{"nginx"}) {
+	if !slices.Equal(cfg.ProtectedProcessNames, []string{"haproxy"}) {
 		t.Errorf("blank env cleared configured names: %q", cfg.ProtectedProcessNames)
 	}
 	cfg = DefaultHostConfig()
@@ -81,14 +81,14 @@ func TestLoadProtectedProcessesBlankEnvKeepsConfig(t *testing.T) {
 func TestLoadProtectedProcessesReplaceDefaults(t *testing.T) {
 	cfg := DefaultHostConfig()
 	err := cfg.LoadProtectedProcesses(envMap(map[string]string{
-		EnvProtectedProcesses:       "nginx",
+		EnvProtectedProcesses:       "haproxy",
 		EnvProtectedReplaceDefaults: "true",
 	}), ProtectedFlagsSet{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.ProtectedProcessConfig().EffectiveNames(); !slices.Equal(got, []string{"nginx"}) {
-		t.Errorf("replaced effective names %q, want [nginx]", got)
+	if got := cfg.ProtectedProcessConfig().EffectiveNames(); !slices.Equal(got, []string{"haproxy"}) {
+		t.Errorf("replaced effective names %q, want [haproxy]", got)
 	}
 }
 
