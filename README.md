@@ -228,7 +228,9 @@ does not exist when the agent starts is watched as soon as it appears (at the
 next 5 s refresh), and one that is moved or replaced, or that a symlink in a
 configured path now leads away from, is watched again the same way. When the last
 part of a configured path is a symlink, the directory of the file it leads to is
-watched as well, once a refresh has walked the path. A WAF agent whose binary or directory an account
+watched as well, once a refresh has walked the path (a refresh that follows a
+change in a watched directory walks it again first, so a symlink moved to another
+release is followed at once). A WAF agent whose binary or directory an account
 other than root owns (an installer that hands `/opt/wafio` to the service
 account) is not protected and has no mark: leave both to root. The agent says so
 once in its log for each such path ("can be written by an account other than

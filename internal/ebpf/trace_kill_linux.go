@@ -254,9 +254,11 @@ func (tm *TraceManager) refreshOnTick(watch *imageWatch) {
 }
 
 // refreshOnChange follows a change of a file that could be a trusted image: the
-// image set alone, at once. A directory that was moved or removed is watched
-// again first.
+// image set alone, at once. The leads are walked again first, so the directory
+// a retargeted symlink leads to is watched by the rearm that follows, and a
+// directory that was moved or removed is watched again.
 func (tm *TraceManager) refreshOnChange(watch *imageWatch) {
+	tm.protected.refreshExeLeads(tm.proc())
 	if watch != nil {
 		watch.rearm()
 	}
@@ -347,6 +349,7 @@ func (tm *TraceManager) syncProtectedTGIDs() (int, error) {
 		if !protectedStillRuns(tm.proc(), scanned[tgid]) {
 			derr := tm.protectedMap.Delete(tgid)
 			if derr == nil || errors.Is(derr, ebpf.ErrKeyNotExist) {
+				delete(have, tgid) // when the put replaced another value, have still holds it
 				continue
 			}
 			tm.log.Printf("protected-process map delete %d: %v", tgid, derr)

@@ -156,7 +156,8 @@ func reportRunningImage(t *testing.T) {
 // hooks for exec and exit act only on an entry that exists. A process that
 // exec'd another image, exited or was replaced by a new process under the same
 // PID after the scan must not keep the entry the write put back, for a process
-// matched by a configured path and for one matched by name.
+// matched by a configured path and for one matched by name, and not when the
+// map held an entry for that PID with other start ticks before the write.
 func TestSyncProtectedTGIDsDropsProcessChangedAfterScan(t *testing.T) {
 	asTrustedOwner(t)
 	dir := imageTestDir(t)
@@ -197,47 +198,56 @@ func TestSyncProtectedTGIDsDropsProcessChangedAfterScan(t *testing.T) {
 	}
 	for kind, k := range kinds {
 		for change, apply := range changes {
-			t.Run(kind+"/"+change, func(t *testing.T) {
-				proc := fakeProc(t, map[uint32]fakeProcEntry{
-					700: {exe: svc, comm: "svc", uid: k.uid, mntns: hostNS, hostExe: true, start: 1234},
+			for _, held := range []bool{false, true} {
+				name := kind + "/" + change
+				if held {
+					name += "/map holds other ticks"
+				}
+				t.Run(name, func(t *testing.T) {
+					proc := fakeProc(t, map[uint32]fakeProcEntry{
+						700: {exe: svc, comm: "svc", uid: k.uid, mntns: hostNS, hostExe: true, start: 1234},
+					})
+					reportRunningImage(t)
+					if err := os.Symlink("/proc/self", filepath.Join(proc, "1")); err != nil {
+						t.Fatal(err)
+					}
+					beforeProtectedPut = func(tgid uint32) {
+						if tgid == 700 {
+							apply(t, filepath.Join(proc, "700"))
+						}
+					}
+					t.Cleanup(func() { beforeProtectedPut = nil })
+					var ops []string
+					tm := &TraceManager{
+						log:                log.New(io.Discard, "", 0),
+						protected:          k.set,
+						procRoot:           proc,
+						execKeep:           true,
+						protectedMap:       newFakeKernelMap("tgids", 8, &ops),
+						protectedImagesMap: newFakeKernelMap("images", uint32(len(protectedImage{}.Unit))+8, &ops),
+						protectedBudgetMap: newFakeKernelMap("budget", 8, &ops),
+					}
+					kernel := tm.protectedMap.(*fakeKernelMap).data
+					if held {
+						kernel[uint32(700)] = uint64(1200) // an earlier process with this PID
+					}
+					if matched, err := tm.syncProtectedTGIDs(); err != nil || matched != 1 {
+						t.Fatalf("sync: matched %d, error %v", matched, err)
+					}
+					if change == "unchanged" {
+						if kernel[uint32(700)] != uint64(1234) || tm.protectedTGIDs[700] != 1234 {
+							t.Fatalf("a process that did not change lost its entry: kernel %v, kept %v", kernel, tm.protectedTGIDs)
+						}
+						return
+					}
+					if len(kernel) != 0 || len(tm.protectedTGIDs) != 0 {
+						t.Fatalf("entry left for a process that changed after the scan: kernel %v, kept %v\n%s", kernel, tm.protectedTGIDs, strings.Join(ops, "\n"))
+					}
+					if !slices.Contains(ops, "tgids delete 700") {
+						t.Fatalf("the entry was not deleted after the write; operations:\n%s", strings.Join(ops, "\n"))
+					}
 				})
-				reportRunningImage(t)
-				if err := os.Symlink("/proc/self", filepath.Join(proc, "1")); err != nil {
-					t.Fatal(err)
-				}
-				beforeProtectedPut = func(tgid uint32) {
-					if tgid == 700 {
-						apply(t, filepath.Join(proc, "700"))
-					}
-				}
-				t.Cleanup(func() { beforeProtectedPut = nil })
-				var ops []string
-				tm := &TraceManager{
-					log:                log.New(io.Discard, "", 0),
-					protected:          k.set,
-					procRoot:           proc,
-					execKeep:           true,
-					protectedMap:       newFakeKernelMap("tgids", 8, &ops),
-					protectedImagesMap: newFakeKernelMap("images", uint32(len(protectedImage{}.Unit))+8, &ops),
-					protectedBudgetMap: newFakeKernelMap("budget", 8, &ops),
-				}
-				if matched, err := tm.syncProtectedTGIDs(); err != nil || matched != 1 {
-					t.Fatalf("sync: matched %d, error %v", matched, err)
-				}
-				kernel := tm.protectedMap.(*fakeKernelMap).data
-				if change == "unchanged" {
-					if kernel[uint32(700)] != uint64(1234) || tm.protectedTGIDs[700] != 1234 {
-						t.Fatalf("a process that did not change lost its entry: kernel %v, kept %v", kernel, tm.protectedTGIDs)
-					}
-					return
-				}
-				if len(kernel) != 0 || len(tm.protectedTGIDs) != 0 {
-					t.Fatalf("entry left for a process that changed after the scan: kernel %v, kept %v\n%s", kernel, tm.protectedTGIDs, strings.Join(ops, "\n"))
-				}
-				if !slices.Contains(ops, "tgids delete 700") {
-					t.Fatalf("the entry was not deleted after the write; operations:\n%s", strings.Join(ops, "\n"))
-				}
-			})
+			}
 		}
 	}
 }
@@ -484,6 +494,41 @@ func TestRefreshOnTickRearmsTheWatch(t *testing.T) {
 	if len(images.data) != 1 {
 		t.Fatalf("after the replacement the map holds %d images, want the new one alone", len(images.data))
 	}
+}
+
+// The refresh that follows a change walks the configured paths again before it
+// arms the watch: the symlink at the end of a path that was retargeted leads to
+// a directory that is watched at once, not at the next ticks.
+func TestRefreshOnChangeWatchesWhereARetargetedSymlinkLeads(t *testing.T) {
+	asTrustedOwner(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(base, "bin")
+	first := writeFile(t, filepath.Join(base, "release1", "agentd-1"), "agent 1", 0o755)
+	second := writeFile(t, filepath.Join(base, "release2", "agentd-2"), "agent 2", 0o755)
+	writeFile(t, filepath.Join(bin, "placeholder"), "x", 0o755)
+	link := filepath.Join(bin, "agentd")
+	if err := os.Symlink(first, link); err != nil {
+		t.Fatal(err)
+	}
+	set := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{link}, ReplaceDefaults: true})
+	proc := selfProc(t)
+	w, err := watchProtectedImages(set, proc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	tm := &TraceManager{log: log.New(io.Discard, "", 0), protected: set, procRoot: proc}
+	tm.refreshOnChange(w)
+	if n := w.armedDirs(); n != 2 {
+		t.Fatalf("%d directories armed, want the one of the path and the one of its target", n)
+	}
+
+	retargetLink(t, link, second)
+	tm.refreshOnChange(w)
+	signalAfterWriting(t, w, second)
 }
 
 // A burst of renames of a trusted file refreshes the images a few times, not
