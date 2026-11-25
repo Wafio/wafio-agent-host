@@ -10,7 +10,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/valyala/fasthttp v1.78.0
 	github.com/vishvananda/netlink v1.3.1
-	github.com/wafio/wafio-cp-backend/shared v0.1.0
+	github.com/wafio/wafio-cp-backend/shared v0.3.0
 	golang.org/x/sys v0.50.0
 	google.golang.org/grpc v1.85.0
 )
@@ -18,7 +18,7 @@ require (
 require (
 	github.com/molecule-man/go-brrr v1.3.1 // indirect
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
-	github.com/oschwald/maxminddb-golang v1.13.0 // indirect
+	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
