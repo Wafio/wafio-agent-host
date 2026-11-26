@@ -455,15 +455,24 @@ func TestOpenTrusted(t *testing.T) {
 // can own.
 func sleepBinary(t *testing.T) string {
 	t.Helper()
-	path, err := exec.LookPath("sleep")
-	if err != nil {
-		t.Skip("no sleep binary to copy")
+	// A multicall coreutils (Ubuntu 26.04 links sleep to one) picks its tool by
+	// the name it runs under, so a copy named child exits at once. GNU's
+	// gnusleep comes first, and a candidate counts only if a copy still sleeps.
+	for _, name := range []string{"gnusleep", "sleep"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exec.Command(writeFile(t, filepath.Join(t.TempDir(), "copy"), string(data), 0o755), "0").Run() == nil {
+			return string(data)
+		}
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
+	t.Skip("no sleep binary that still sleeps under another name")
+	return ""
 }
 
 // startTicksOfPID reads the start time of a live process.
@@ -806,14 +815,21 @@ func TestKernelImagesSharesMountTables(t *testing.T) {
 
 // A protected name is searched in the system directories, which stay out of the
 // reach of every symlink and of any non-root writer. This runs on the real
-// system files: /usr/bin/true is root's, in root's directory.
+// system files: a program of root's in /usr/bin that is a file and not a
+// symlink (Ubuntu 26.04 links true to gnutrue, and a symlink is not followed).
 func TestKernelImagesNameDerivedPaths(t *testing.T) {
-	const path = "/usr/bin/true"
-	if _, err := os.Stat(path); err != nil {
-		t.Skipf("no %s on this host", path)
+	name, path := "", ""
+	for _, n := range []string{"true", "gnutrue", "dash", "bash"} {
+		if st, err := os.Lstat("/usr/bin/" + n); err == nil && st.Mode().IsRegular() {
+			name, path = n, "/usr/bin/"+n
+			break
+		}
+	}
+	if path == "" {
+		t.Skip("no program in /usr/bin that is a file and not a symlink")
 	}
 	requireGeneration(t, path)
-	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"true"}, ReplaceDefaults: true})
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{name}, ReplaceDefaults: true})
 	proc := selfProc(t)
 	key, ok := identityOf(path, "/proc/self/mountinfo")
 	if !ok {
