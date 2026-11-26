@@ -33,10 +33,11 @@ const (
 	traceMapEnforce   = "trace_enforce_map"
 	traceMapDeferred  = "trace_deferred_signals"
 	traceMapProtected = traceProtectedMapName // optional: objects built before the protected set lack it
-	// optional: objects built before kernel-side protected-set upkeep lack it
-	// (exec then keeps no inherited protection; the refresh restores verified
-	// processes).
-	traceMapProtectedComms = "trace_protected_comms"
+	// optional: objects built before kernel-side protected-set upkeep lack it.
+	// Without it the kernel cannot tell a trusted image at exec, so the agent
+	// turns fork inheritance off (execKeep) and the refresh alone restores
+	// verified processes.
+	traceMapProtectedImages = "trace_protected_images"
 	// optional: objects built before the fork-insert budget lack it (no fork
 	// inheritance budget; such objects are not shipped with this agent).
 	traceMapProtectedBudget = "trace_protected_budget"
@@ -70,14 +71,34 @@ type TraceManager struct {
 	// when the loaded object provides it. protectedTGIDs and
 	// protectedOverflowLogged are owned by protectedRefreshLoop.
 	protected               *ProtectedProcessSet
-	protectedMap            *ebpf.Map
+	protectedMap            kernelMap
 	protectedTGIDs          map[uint32]uint64 // tgid → value written to protectedMap
 	protectedOverflowLogged bool
 	protectedCount          atomic.Int32 // len(protectedTGIDs), readable by Status
+	// protectedUntrusted: the paths the last scan found an account other than
+	// root can write under a process that would be protected otherwise.
+	protectedUntrusted map[string]struct{}
+	// protectedImagesMap is trace_protected_images: the file identities an exec
+	// may keep an entry for, each with the condition (root, a unit) the exec must
+	// meet. protectedImages is what was last written to it and
+	// protectedVerified the processes of the last scan, which feed it;
+	// protectedImagesErr is the last failure logged. All four are owned like
+	// protectedTGIDs.
+	protectedImagesMap kernelMap
+	protectedImages    map[protectedImageKey]protectedImage
+	protectedVerified  []protectedTGID
+	protectedImagesErr string
+	// execKeep: the kernel can keep an entry across exec by image (the object
+	// has the images map and sched_process_exec is attached). When it cannot,
+	// fork inheritance is off: an inherited entry would follow whatever the
+	// child execs. Cleared by Start before the fork probe attaches.
+	execKeep bool
 	// protectedBudgetMap bounds the kernel's fork inserts; refused
 	// inserts since load, readable by Status.
-	protectedBudgetMap *ebpf.Map
+	protectedBudgetMap kernelMap
 	protectedRefused   atomic.Uint64
+	// procRoot is where /proc is mounted; tests point it at a fake tree.
+	procRoot string
 	// pidfdOK: pidfd_open + pidfd_send_signal usable → immediate verified kill.
 	pidfdOK bool
 
@@ -85,8 +106,8 @@ type TraceManager struct {
 	links         []link.Link
 	linkNames     []string
 	probeFailures map[string]string
-	// probesAbsent: mayBeAbsent probes whose tracepoint this kernel lacks
-	// (not expected, not failures).
+	// probesAbsent: mayBeAbsent probes whose tracepoint this kernel lacks, and
+	// maintenance probes the object lacks (not expected, not failures).
 	probesAbsent int
 
 	// ringbuf reader
@@ -240,16 +261,23 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	tm.enforceMap = coll.Maps[traceMapEnforce]
 	tm.deferredMap = coll.Maps[traceMapDeferred]
 	tm.deferredEvents = make(map[uint32]TraceEvent)
-	tm.protectedMap = coll.Maps[traceMapProtected]
+	tm.protectedMap = kernelMapOf(coll.Maps[traceMapProtected])
 	tm.protectedTGIDs = make(map[uint32]uint64)
+	tm.protectedUntrusted = nil
 	tm.protectedCount.Store(0)
-	tm.protectedBudgetMap = coll.Maps[traceMapProtectedBudget]
+	tm.protectedBudgetMap = kernelMapOf(coll.Maps[traceMapProtectedBudget])
 	tm.protectedRefused.Store(0)
-	// Before any probe attaches: exec consults this set for inherited entries.
-	if commsMap := coll.Maps[traceMapProtectedComms]; commsMap != nil {
-		if n, err := writeProtectedComms(commsMap, tm.protected.kernelComms()); err != nil {
-			tm.log.Printf("protected comm map: wrote %d names: %v", n, err)
-		}
+	tm.protectedImagesMap = kernelMapOf(coll.Maps[traceMapProtectedImages])
+	if m := tm.protectedImagesMap; m != nil && int(m.ValueSize()) != binary.Size(protectedImage{}) {
+		tm.log.Printf("%s has %d-byte values and this agent writes %d: the object is not from this release, so it is not used", traceMapProtectedImages, m.ValueSize(), binary.Size(protectedImage{}))
+		tm.protectedImagesMap = nil
+	}
+	tm.protectedImages = nil
+	tm.protectedVerified = nil
+	tm.protectedImagesErr = ""
+	tm.execKeep = tm.protectedImagesMap != nil
+	if !tm.execKeep {
+		tm.log.Printf("trace object has no %s: the kernel keeps no protected entry across exec and children of protected processes are not inherited", traceMapProtectedImages)
 	}
 	// Also before any probe attaches: the protected processes already running
 	// (sshd, sshd-session, systemd, ...), so the first events after attach — a
@@ -258,8 +286,9 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	// set here too, so a child a protected process forks right after attach (a
 	// new SSH session) is inserted; sched_process_exec and _exit attach before
 	// _fork (traceProbes), so no inherited entry outlives an exec into another
-	// image. The sync after attach (runProtectedSelfCheck) adds the processes
-	// that started in between.
+	// image. The sync also fills trace_protected_images, which the exec program
+	// reads, before any probe attaches. The sync after attach
+	// (runProtectedSelfCheck) adds the processes that started in between.
 	if tm.protectedMap != nil {
 		if _, err := tm.syncProtectedTGIDs(); err != nil {
 			tm.log.Printf("protected-process scan before attach failed: %v (the scan after attach still runs)", err)
@@ -298,6 +327,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	tm.probesAbsent = 0
 	tm.kprobeNames = nil
 	for _, probe := range traceProbes {
+		tm.disableInheritWithoutExec(probe.name)
 		if sym, ok := kprobeSyms[probe.name]; ok {
 			if kl, ok := tm.attachKprobeTwin(coll, probe, sym, droppedReason); ok {
 				tm.links = append(tm.links, kl)
@@ -308,12 +338,7 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 		}
 		prog := coll.Programs[probe.funcName]
 		if prog == nil {
-			reason := "program missing from BPF object"
-			if r, ok := droppedReason[probe.funcName]; ok {
-				reason = r
-			}
-			tm.probeFailures[probe.name] = reason
-			tm.log.Printf("trace program %q not available (%s), skipping", probe.funcName, reason)
+			tm.noteMissingProgram(probe, droppedReason)
 			continue
 		}
 
@@ -407,13 +432,19 @@ func (tm *TraceManager) Start(ctx context.Context) error {
 	// first kernel-map sync as a self-check line deploy verification greps
 	// for. Runs before protectedRefreshLoop starts (it owns that state).
 	tm.log.Printf("protected-process set: %s", tm.protected.Summary())
+	tm.protected.refreshExeLeads(tm.proc()) // the warning below names a symlink by the file it leads to
 	if w := tm.protected.RiskyWarning(); w != "" {
 		tm.log.Print(w)
 	}
 	selfCheck := tm.runProtectedSelfCheck()
 	tm.log.Print(selfCheck.String())
-	if w := selfCheck.Warning(); w != "" {
-		tm.log.Print(w)
+	if tm.execKeep {
+		tm.log.Printf("protected-process images: %d trusted files known to the kernel", len(tm.protectedImages))
+	}
+	for _, line := range strings.Split(selfCheck.Warning(), "\n") {
+		if line != "" {
+			tm.log.Print(line)
+		}
 	}
 
 	childCtx, cancel := context.WithCancel(ctx)
@@ -747,6 +778,24 @@ func (tm *TraceManager) DrainEnforcementLog(limit int) []EnforcementLogEntry {
 
 func (tm *TraceManager) ClearEnforcementLog() {
 	tm.policyEngine.ClearEnforcementLog()
+}
+
+// noteMissingProgram records a probe whose program the loaded object does not
+// have. It is a failed probe, except for a maintenance program that an object of
+// an earlier release lacks: that loses no event, so it is neither expected nor
+// failed. A program the verifier rejected is always a failure.
+func (tm *TraceManager) noteMissingProgram(probe traceProbe, droppedReason map[string]string) {
+	reason, rejected := droppedReason[probe.funcName]
+	if probe.maintenance && !rejected {
+		tm.probesAbsent++
+		tm.log.Printf("trace program %q is not in the BPF object, skipping", probe.funcName)
+		return
+	}
+	if !rejected {
+		reason = "program missing from BPF object"
+	}
+	tm.probeFailures[probe.name] = reason
+	tm.log.Printf("trace program %q not available (%s), skipping", probe.funcName, reason)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

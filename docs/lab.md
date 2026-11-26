@@ -27,7 +27,8 @@ reusing old pinned maps is not supported.
 | Verifier and budgets | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectsPassVerifier\|TestBPFFirewallVerifierBudget\|TestBPFTraceVerifierBudget' ./internal/ebpf/` | root, objects from `scripts/build-ebpf.sh` |
 | Integration fixtures | see `internal/ebpf/integration/README.md` | root, `WAFIO_EBPF_INTEGRATION=1`, an authorized lab |
 | Lockout and Kill scenarios | `.github/workflows/ebpf-vm.yml` (dispatch) | a VM per kernel: 5.10, 5.15, 6.1 and 6.12 |
-| Full maps | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectMapSizes\|TestKernelMapFull' ./internal/ebpf/` | root, objects |
+| Full maps | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestBPFObjectMapSizes\|TestTraceProtectedImagesMapMatchesAgent\|TestKernelMapFull' ./internal/ebpf/` | root, objects |
+| Protected set in the kernel | `WAFIO_TEST_BPF_DIR=build/ebpf go test -count=1 -run 'TestKernelProtected\|TestKernelBTFHasUnitCheckFields' ./internal/ebpf/` | root, objects, cgroup v2 with `/sys/fs/cgroup/system.slice` (a systemd host), a root-owned `sleep` and `setpriv` (util-linux) and room to copy the test binary, on ext4, XFS or btrfs; attaches the fork, exec, exit and the exit programs of `setuid`, `setreuid` and `setresuid` for a few seconds and makes cgroups named `wafio-itest-*`, which it removes |
 | Restart, kill and load at the smallest sizes | `WAFIO_EBPF_VM_SCENARIOS=1 WAFIO_EBPF_FLOOR_LOAD=1 go test ./internal/ebpf/integration -run 'TestVMScenarioMapScale\|TestVMScenarioKilledAgent\|TestVMScenarioLastGood\|TestMapFloorLoad'` | root, objects, veth, a disposable VM |
 
 `scripts/ci-local.sh` runs the first three rows (the third only as root). The
@@ -57,6 +58,21 @@ Use a named lab unit if you run it under systemd, and stop only that unit
 afterwards. Never stop sshd, the interface or other services on the machine to
 clean up. The private-network tests create their own veth pair, namespace and
 pin directory and remove only those.
+
+To see which processes the kernel protects, read the `protected-process
+self-check` line in the agent's log first (see "Protected processes" in the
+README). It names the map as `trace_protected_tgids`, but `bpftool` cuts map names
+to 15 characters, so that name finds nothing: all three protected-set maps show as
+`trace_protected` and `bpftool map dump name trace_protected_tgids` fails with
+"can't parse name". List them and dump by id:
+
+```sh
+sudo bpftool map list | grep -A1 'name trace_protected'
+sudo bpftool map dump id <id>
+```
+
+The process map is the `hash` with `key 4B value 8B`: keys are process IDs, values
+start times in clock ticks.
 
 ## Upgrade order
 

@@ -81,29 +81,36 @@ func TestProtectedProcessConfigEffective(t *testing.T) {
 		slices.Sort(out)
 		return slices.Compact(out)
 	}
+	// The WAF agent's two install paths and systemd-networkd's two are built in, so they are in every list that keeps the defaults.
+	const waf, wafBundle = "/usr/local/bin/wafio-waf-agent", "/opt/wafio/wafio-waf-agent"
+	const networkd, networkdLib = "/usr/lib/systemd/systemd-networkd", "/lib/systemd/systemd-networkd"
+	builtinExes := []string{networkdLib, wafBundle, networkd, waf}
 	for _, tc := range []struct {
 		name      string
 		cfg       ProtectedProcessConfig
 		wantNames []string
 		wantExes  []string
 	}{
-		{"no config keeps built-ins", ProtectedProcessConfig{}, withDefaults(), nil},
+		{"no config keeps built-ins", ProtectedProcessConfig{}, withDefaults(), builtinExes},
 		{"names merged and de-duplicated",
-			ProtectedProcessConfig{Names: []string{"nginx", " sshd ", "nginx"}},
-			withDefaults("nginx"), nil},
+			ProtectedProcessConfig{Names: []string{"envoy", " sshd ", "envoy"}},
+			withDefaults("envoy"), builtinExes},
 		{"invalid entries dropped",
 			ProtectedProcessConfig{Names: []string{"bad/name", "", "haproxy"}, ExePaths: []string{"rel/x", "/opt/b", "/opt/a", "/opt/b", "/opt/../x"}},
-			withDefaults("haproxy"), []string{"/opt/a", "/opt/b"}},
+			withDefaults("haproxy"), []string{networkdLib, "/opt/a", "/opt/b", wafBundle, networkd, waf}},
+		{"configured copy of a built-in path is not doubled",
+			ProtectedProcessConfig{ExePaths: []string{waf, wafBundle}},
+			withDefaults(), builtinExes},
 		{"replace drops built-ins",
-			ProtectedProcessConfig{Names: []string{"nginx"}, ReplaceDefaults: true},
-			[]string{"nginx"}, nil},
+			ProtectedProcessConfig{Names: []string{"haproxy"}, ReplaceDefaults: true},
+			[]string{"haproxy"}, nil},
 		{"replace with exe paths only",
 			ProtectedProcessConfig{ExePaths: []string{"/opt/acme/bin/agentd"}, ReplaceDefaults: true},
 			nil, []string{"/opt/acme/bin/agentd"}},
 		// A configuration whose every entry is invalid never empties the set.
 		{"replace with only invalid entries keeps built-ins",
 			ProtectedProcessConfig{Names: []string{"a/b"}, ExePaths: []string{"rel"}, ReplaceDefaults: true},
-			withDefaults(), nil},
+			withDefaults(), builtinExes},
 	} {
 		if got := tc.cfg.EffectiveNames(); !slices.Equal(got, tc.wantNames) {
 			t.Errorf("%s: EffectiveNames() = %q, want %q", tc.name, got, tc.wantNames)
@@ -128,18 +135,31 @@ func TestProtectedProcessConfigEffective(t *testing.T) {
 }
 
 func TestProtectedSetFromConfigMatching(t *testing.T) {
-	merged := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ExePaths: []string{"/opt/acme/bin/agentd"}})
-	replaced := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ReplaceDefaults: true})
+	merged := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"haproxy"}, ExePaths: []string{"/opt/acme/bin/agentd"}})
+	replaced := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"haproxy"}, ReplaceDefaults: true})
+	wafInUnit := hostRoot("/usr/local/bin/wafio-waf-agent", "wafio-waf-agent")
+	wafInUnit.rootUIDs = triNo
+	wafInUnit.cgroup = "/system.slice/wafio-waf-agent.service"
+	wafInSession := wafInUnit
+	wafInSession.cgroup = "/user.slice/user-1000.slice/session-3.scope"
+	bundleWafInUnit := wafInUnit
+	bundleWafInUnit.exe = "/opt/wafio/wafio-waf-agent"
 	for _, tc := range []struct {
 		name             string
 		id               procIdentity
 		merged, replaced bool
 	}{
 		{"built-in sshd", hostRoot("/usr/sbin/sshd", "sshd"), true, false},
-		{"configured name", hostRoot("/usr/sbin/nginx", "nginx"), true, true},
+		// The built-in WAF agent entry carries its unit; replacing the defaults drops both.
+		{"built-in waf agent in its unit", wafInUnit, true, false},
+		{"built-in waf agent outside its unit", wafInSession, false, false},
+		{"built-in bundle waf agent in its unit", bundleWafInUnit, true, false},
+		{"built-in nginx", hostRoot("/usr/sbin/nginx", "nginx"), true, false},
+		{"configured name", hostRoot("/usr/sbin/haproxy", "haproxy"), true, true},
 		{"configured exe", hostRoot("/opt/acme/bin/agentd", "agentd"), true, false},
 		// Configured names get the same trust rules as the built-ins.
-		{"configured name outside system dir", hostRoot("/tmp/nginx", "nginx"), false, false},
+		{"configured name outside system dir", hostRoot("/tmp/haproxy", "haproxy"), false, false},
+		{"built-in name outside system dir", hostRoot("/tmp/nginx", "nginx"), false, false},
 		{"unrelated", hostRoot("/usr/bin/bash", "bash"), false, false},
 	} {
 		if got, _ := merged.matchIdentity(tc.id); got != tc.merged {
@@ -151,9 +171,26 @@ func TestProtectedSetFromConfigMatching(t *testing.T) {
 	}
 }
 
+// Replacing the defaults drops the built-in WAF agent entry, but listing its
+// path again must not skip the unit requirement.
+func TestProtectedSetReplacedDefaultsKeepUnitRequirement(t *testing.T) {
+	const exe = "/usr/local/bin/wafio-waf-agent"
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{ExePaths: []string{exe}, ReplaceDefaults: true})
+	id := hostRoot(exe, "wafio-waf-agent")
+	id.rootUIDs = triNo
+	id.cgroup = "/system.slice/wafio-waf-agent.service"
+	if ok, _ := s.matchIdentity(id); !ok {
+		t.Error("built-in path in its unit not protected")
+	}
+	id.cgroup = "/user.slice/user-1000.slice/session-3.scope"
+	if ok, _ := s.matchIdentity(id); ok {
+		t.Error("built-in path in a session scope protected after replacing the defaults")
+	}
+}
+
 func TestTraceManagerConfigProtectedConfig(t *testing.T) {
 	cfg := TraceManagerConfig{
-		ProtectedProcessNames:    []string{"nginx"},
+		ProtectedProcessNames:    []string{"haproxy"},
 		ProtectedExePaths:        []string{"/opt/acme/bin/agentd"},
 		ProtectedReplaceDefaults: true,
 	}
@@ -164,14 +201,14 @@ func TestTraceManagerConfigProtectedConfig(t *testing.T) {
 }
 
 func TestProtectedSetSummary(t *testing.T) {
-	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ExePaths: []string{"/opt/b", "/opt/a"}})
+	s := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"haproxy"}, ExePaths: []string{"/opt/b", "/opt/a"}})
 	got := s.Summary()
-	want := "names=[containerd,dockerd,kubelet,nginx,sshd,sshd-auth,sshd-session,systemd,systemd-journald] exe_paths=[/opt/a,/opt/b] builtin_defaults=merged"
+	want := "names=[containerd,dockerd,haproxy,kubelet,nginx,sshd,sshd-auth,sshd-session,systemd,systemd-executor,systemd-journald] exe_paths=[/lib/systemd/systemd-networkd,/opt/a,/opt/b,/opt/wafio/wafio-waf-agent,/usr/lib/systemd/systemd-networkd,/usr/local/bin/wafio-waf-agent] builtin_defaults=merged"
 	if got != want {
 		t.Errorf("Summary() = %q\nwant        %q", got, want)
 	}
-	r := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}, ReplaceDefaults: true})
-	if got := r.Summary(); got != "names=[nginx] exe_paths=[] builtin_defaults=replaced" {
+	r := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"haproxy"}, ReplaceDefaults: true})
+	if got := r.Summary(); got != "names=[haproxy] exe_paths=[] builtin_defaults=replaced" {
 		t.Errorf("replaced Summary() = %q", got)
 	}
 	var nilSet *ProtectedProcessSet
@@ -191,7 +228,7 @@ func TestProtectedSelfCheckString(t *testing.T) {
 			"present",
 			protectedSelfCheck{kernelSet: true, valueSize: 8, kernelTGIDs: 3, matched: 3},
 			[]string{"protected-process self-check: kernel_set=present map=trace_protected_tgids value=start_ticks protected_tgids=3 matched_processes=3 userspace_guard=on"},
-			[]string{"kernel_missing", "scan_error", "note=", "proc_access", "hint="},
+			[]string{"kernel_missing", "scan_error", "note=", "proc_access", "hint=", "untrusted_owner", "unit_check"},
 		},
 		{
 			"identity links denied (no CAP_SYS_PTRACE)",
@@ -216,6 +253,18 @@ func TestProtectedSelfCheckString(t *testing.T) {
 			protectedSelfCheck{matched: 4},
 			[]string{"protected-process self-check: kernel_set=absent map=trace_protected_tgids protected_tgids=0 matched_processes=4", "note="},
 			[]string{"kernel_missing"},
+		},
+		{
+			"untrusted owner",
+			protectedSelfCheck{kernelSet: true, valueSize: 8, kernelTGIDs: 3, matched: 3, untrusted: []string{"/usr/local/bin", "/usr/local/bin/kubelet"}},
+			[]string{" untrusted_owner=/usr/local/bin,/usr/local/bin/kubelet"},
+			nil,
+		},
+		{
+			"unit check unavailable",
+			protectedSelfCheck{kernelSet: true, valueSize: 8, kernelTGIDs: 3, matched: 3, unitUnavailable: []string{"/usr/local/bin/wafio-waf-agent"}},
+			[]string{" unit_check=unavailable hint=", "cgroup namespace"},
+			[]string{"untrusted_owner"},
 		},
 		{
 			"scan error",
@@ -252,6 +301,26 @@ func TestProtectedSelfCheckWarning(t *testing.T) {
 	if !strings.HasPrefix(w, "WARNING: ") || !strings.Contains(w, "CAP_SYS_PTRACE") || strings.Contains(w, "\n") {
 		t.Fatalf("denied self-check warning = %q", w)
 	}
+	// A file others can write leaves a protected process unprotected: the
+	// warning names the path and the fix, on a line of its own.
+	w = protectedSelfCheck{kernelSet: true, valueSize: 8, matched: 3, kernelTGIDs: 3, untrusted: []string{"/usr/local/bin/kubelet"}}.Warning()
+	if !strings.HasPrefix(w, "WARNING: ") || !strings.Contains(w, "/usr/local/bin/kubelet") || !strings.Contains(w, "make root the owner") || strings.Contains(w, "\n") {
+		t.Fatalf("untrusted owner warning = %q", w)
+	}
+	w = protectedSelfCheck{kernelSet: true, valueSize: 8, unitUnavailable: []string{"/usr/local/bin/wafio-waf-agent", "/usr/lib/systemd/systemd-networkd"}}.Warning()
+	if !strings.HasPrefix(w, "WARNING: ") || !strings.Contains(w, "/usr/local/bin/wafio-waf-agent, /usr/lib/systemd/systemd-networkd") || strings.Contains(w, "\n") {
+		t.Fatalf("unit check warning = %q", w)
+	}
+	// A replaced file cannot be chowned: its line says to restart after the fix.
+	w = protectedSelfCheck{kernelSet: true, valueSize: 8, untrusted: []string{"/usr/sbin/sshd (deleted)", "/usr/local/bin/kubelet"}}.Warning()
+	if lines := strings.Split(w, "\n"); len(lines) != 2 || !strings.Contains(lines[0], "/usr/local/bin/kubelet") || !strings.Contains(lines[0], "make root the owner") ||
+		!strings.Contains(lines[1], "/usr/sbin/sshd (deleted)") || !strings.Contains(lines[1], "restart the process") || strings.Contains(lines[1], "make root the owner") {
+		t.Fatalf("replaced image warning = %q", w)
+	}
+	both := protectedSelfCheck{kernelSet: true, valueSize: 8, procDenied: true, untrusted: []string{"/usr/local/bin/kubelet"}}.Warning()
+	if lines := strings.Split(both, "\n"); len(lines) != 2 || !strings.Contains(lines[0], "CAP_SYS_PTRACE") || !strings.Contains(lines[1], "/usr/local/bin/kubelet") {
+		t.Fatalf("two causes did not give two lines: %q", both)
+	}
 }
 
 func TestProtectedRiskyEntries(t *testing.T) {
@@ -271,7 +340,7 @@ func TestProtectedRiskyEntries(t *testing.T) {
 	}
 
 	set := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{
-		Names:    []string{"nginx", "bash"},
+		Names:    []string{"haproxy", "bash"},
 		ExePaths: []string{"/usr/bin/python3", "/opt/app/bin/server"},
 	})
 	if got := strings.Join(set.RiskyEntries(), ","); got != "/usr/bin/python3,bash" {
@@ -285,7 +354,7 @@ func TestProtectedRiskyEntries(t *testing.T) {
 		t.Fatalf("self-check line lacks the warning token: %q", line)
 	}
 
-	safe := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"nginx"}})
+	safe := NewProtectedProcessSetFromConfig(ProtectedProcessConfig{Names: []string{"haproxy"}})
 	if safe.RiskyWarning() != "" || len(safe.RiskyEntries()) != 0 {
 		t.Fatal("a daemon-only set must not warn")
 	}

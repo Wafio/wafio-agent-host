@@ -20,6 +20,10 @@ type traceProbe struct {
 	// (open/creat/unlink/rename/chmod on arm64, renameat on riscv,
 	// fchmodat2 before 6.6); a missing tracepoint is not a probe failure.
 	mayBeAbsent bool
+	// maintenance: the program emits no event and only keeps the protected set
+	// current, and an object of an earlier release may lack it. A program that is
+	// missing from the object is not a capture gap.
+	maintenance bool
 	// kprobeTwin: a syscall with a user-string argument (path, name, module
 	// parameters). The object also has trace_ksys_<syscall>, the same hook
 	// as a kprobe on the syscall's arch wrapper, used where the kernel's
@@ -37,13 +41,18 @@ var traceProbes = []traceProbe{
 	{funcName: "trace_sys_enter_bpf", group: "syscalls", name: "sys_enter_bpf"},
 	{funcName: "trace_sys_enter_execve", group: "syscalls", name: "sys_enter_execve", kprobeTwin: true},
 	{funcName: "trace_sys_enter_execveat", group: "syscalls", name: "sys_enter_execveat", kprobeTwin: true},
-	// Protected-set maintenance: exec (emits no event) and exit attach
-	// before fork, so once fork starts inserting children of protected
-	// processes, an exec into an unprotected image already drops the entry
-	// and an exit already removes it (the protected set and
-	// the fork budget are filled before any probe attaches).
+	// Protected-set maintenance: exec (emits no event), exit and the exit of the
+	// UID calls attach before fork, so once fork starts inserting children of
+	// protected processes, an exec into an unprotected image already drops the
+	// entry, an exit already removes it and a child that gives up root already
+	// loses it (the protected set and the fork budget are filled before any
+	// probe attaches). The UID calls are optional: a kernel that rejects one
+	// leaves the refresh to drop the entry of a child that changed its user.
 	{funcName: "trace_sched_process_exec", group: "sched", name: "sched_process_exec"},
 	{funcName: "trace_sched_process_exit", group: "sched", name: "sched_process_exit"},
+	{funcName: "trace_sys_exit_setuid", group: "syscalls", name: "sys_exit_setuid", optional: true, maintenance: true},
+	{funcName: "trace_sys_exit_setreuid", group: "syscalls", name: "sys_exit_setreuid", optional: true, maintenance: true},
+	{funcName: "trace_sys_exit_setresuid", group: "syscalls", name: "sys_exit_setresuid", optional: true, maintenance: true},
 	{funcName: "trace_sched_process_fork", group: "sched", name: "sched_process_fork", raw: true},
 	{funcName: "trace_sys_enter_kill", group: "syscalls", name: "sys_enter_kill"},
 	{funcName: "trace_sys_enter_prctl", group: "syscalls", name: "sys_enter_prctl"},

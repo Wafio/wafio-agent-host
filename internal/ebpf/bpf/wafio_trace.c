@@ -93,8 +93,12 @@ struct {
  *
  * The kernel maintains the map between refreshes too. A process forked
  * by a protected process (or by PID 1) is inserted at sched_process_fork,
- * before it first runs; exec keeps an entry only for a protected image
- * (trace_protected_comms); the leader's exit removes it. The refresh
+ * before it first runs; exec keeps an entry only when the new image is a file
+ * listed in trace_protected_images (identified by device, inode and
+ * generation, never by name) and the task meets that file's condition; the
+ * leader's exit removes it; so does the exit of setuid, setreuid or setresuid
+ * that leaves a task without root, unless its image keeps the entry for that
+ * task (protect_on_setuid). The refresh
  * reconciles against the map's content and drops what it cannot verify. */
 #define TRACE_MAX_PROTECTED 1024
 #define TRACE_NSEC_PER_USER_HZ_TICK 10000000ULL
@@ -105,36 +109,67 @@ struct {
     __uint(max_entries, TRACE_MAX_PROTECTED);
 } trace_protected_tgids SEC(".maps");
 
-/* Protected comm names, written once by the TraceManager from its
- * protected set: the executable basenames truncated to TASK_COMM_LEN-1.
- * Bit TRACE_PROTECTED_COMM_ROOT: the name protects only a root process (the
- * built-in and configured names; configured exe paths do not require root).
- * max_entries must match maxProtectedComms in trace_protect.go. */
-#define TRACE_MAX_PROTECTED_COMMS 1024
-#define TRACE_PROTECTED_COMM_ROOT 1
-struct protected_comm_key {
-    char comm[TRACE_COMM_LEN];
+/* Trusted program images: the files an exec may keep a protected entry for.
+ * Written by the TraceManager at every refresh and when a candidate file
+ * changes on disk: the files at the trusted paths, the images of the processes
+ * it verified, and the systemd-executor file PID 1 holds open. A file is
+ * identified as the kernel sees it: the device of its superblock (s_dev), its
+ * inode number and its inode generation. A comm or a path never counts, and a
+ * copy or a replaced file has another identity.
+ * The value says when the entry survives the exec. The flags are alternatives
+ * and a value with none of them keeps nothing: ANY (a configured executable
+ * path), ROOT (the real UID is 0: the built-in names) and UNIT (the task runs
+ * in the systemd unit named in unit, see task_in_unit: the WAF agent and
+ * systemd-networkd, which run as service accounts). KEEP_ON_SETUID is not an
+ * alternative for exec: only protect_on_setuid reads it (the OpenSSH images).
+ * unit is a NUL padded name of at most TRACE_UNIT_NAME_LEN - 2 characters, so
+ * a longer name read back from the kernel, which is cut to
+ * TRACE_UNIT_NAME_LEN - 1, never equals it.
+ * max_entries must match maxProtectedImages, the value layout protectedImage
+ * and the flags protectedImage* in trace_protect.go. */
+#define TRACE_MAX_PROTECTED_IMAGES 1024
+#define TRACE_PROTECTED_IMAGE_ANY 1
+#define TRACE_PROTECTED_IMAGE_ROOT 2
+#define TRACE_PROTECTED_IMAGE_UNIT 4
+#define TRACE_PROTECTED_IMAGE_KEEP_ON_SETUID 8
+#define TRACE_UNIT_NAME_LEN 48
+struct protected_image_key {
+    __u64 ino;
+    __u32 dev;
+    __u32 gen;
+};
+struct protected_image {
+    __u64 flags;
+    char unit[TRACE_UNIT_NAME_LEN];
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct protected_comm_key);
-    __type(value, __u8);
-    __uint(max_entries, TRACE_MAX_PROTECTED_COMMS);
-} trace_protected_comms SEC(".maps");
+    __type(key, struct protected_image_key);
+    __type(value, struct protected_image);
+    __uint(max_entries, TRACE_MAX_PROTECTED_IMAGES);
+} trace_protected_images SEC(".maps");
 
-/* Budget for kernel fork inserts. Slot 0: inserts left, written
- * by userspace at every refresh so inherited entries never take the map above
- * 3/4 of TRACE_MAX_PROTECTED and the refresh's own inserts still fit (0 until
- * the first refresh, and with an agent that predates it: no inheritance).
- * Slot 1: inserts refused (budget spent or map full), read by userspace.
- * Must match protectedBudgetSlot / protectedRefusedSlot in trace_protect.go. */
+/* Budget for kernel fork inserts. Slot 0: inserts left. Slot 2: the most it
+ * may hold. Userspace writes both at every refresh: slot 0 so inherited
+ * entries never take the map above 3/4 of TRACE_MAX_PROTECTED and the
+ * refresh's own inserts still fit, slot 2 to the same number. The kernel takes
+ * a unit at each fork insert and gives one back when it deletes an entry at
+ * exec or exit, up to slot 2, so the budget measures entries now in the map
+ * and not forks since the refresh. Both are 0 until the first refresh, with an
+ * agent that predates it, and when the exec program is not attached or
+ * trace_protected_images is missing: no inheritance, and no unit comes back to
+ * raise it. Slot 1: inserts refused (budget spent or map full), read by
+ * userspace.
+ * Must match protectedBudgetSlot / protectedRefusedSlot / protectedLimitSlot
+ * in trace_protect.go. */
 #define TRACE_PROTECTED_BUDGET_SLOT 0
 #define TRACE_PROTECTED_REFUSED_SLOT 1
+#define TRACE_PROTECTED_LIMIT_SLOT 2
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, __s64);
-    __uint(max_entries, 2);
+    __uint(max_entries, 3);
 } trace_protected_budget SEC(".maps");
 
 static __always_inline int is_protected_tgid(__u32 tgid, __u64 start_ns)
@@ -169,9 +204,30 @@ protected_inherit_take(void)
     return 1;
 }
 
+/* Gives one insert back when the kernel deletes an entry (exec drop, exit) or
+ * fails to write one it took, up to the limit userspace wrote. The budget then
+ * counts entries in the map, not forks since the refresh: a client that opens
+ * and closes connections as fast as sshd forks cannot spend it. The limit
+ * keeps the budget at 0 where userspace set 0 (no exec program, no image map),
+ * and a deleted entry that userspace counted at the refresh cannot lift it
+ * above what the refresh allows. Read, then an atomic add whose result is
+ * unused, like protected_inherit_take: CPUs racing at the limit can overshoot
+ * by one each, which the 1/4 headroom absorbs. */
+static __always_inline void
+protected_inherit_give(void)
+{
+    __u32 slot = TRACE_PROTECTED_BUDGET_SLOT, limit_slot = TRACE_PROTECTED_LIMIT_SLOT;
+    __s64 *budget = bpf_map_lookup_elem(&trace_protected_budget, &slot);
+    __s64 *limit = bpf_map_lookup_elem(&trace_protected_budget, &limit_slot);
+    if (!budget || !limit || *budget >= *limit)
+        return;
+    __sync_fetch_and_add(budget, 1);
+}
+
 /* A child forked by a protected process runs that process's verified
- * image until it execs, so it is protected from its first instruction instead
- * of after the next 5 s refresh (sshd's per-connection child, sshd-session's
+ * image until it execs or gives up root (the OpenSSH images keep the entry
+ * through that), so it is protected from its first instruction instead of
+ * after the next 5 s refresh (sshd's per-connection child, sshd-session's
  * pre-auth child). PID 1 is guarded by number, so its children count too.
  * A new thread shares the parent's TGID and needs no entry. Inserts are
  * bounded by trace_protected_budget; a refused insert only delays the child's
@@ -195,39 +251,178 @@ protect_forked_child(struct task_struct *parent, struct task_struct *child)
         return;
     }
     __u64 ticks = BPF_CORE_READ(child, start_boottime) / TRACE_NSEC_PER_USER_HZ_TICK;
-    if (bpf_map_update_elem(&trace_protected_tgids, &child_tgid, &ticks, BPF_ANY))
+    if (bpf_map_update_elem(&trace_protected_tgids, &child_tgid, &ticks, BPF_ANY)) {
+        protected_inherit_give();
         protected_inherit_refused();
+    }
 }
 
-/* exec replaces the image the protection was granted for. The entry is
- * kept only when the new comm is a protected name (as root, when the name
- * requires it); the next refresh verifies the binary by inode. Anything else
- * (the user's shell after sshd-session, a service binary after PID 1) loses
- * the protection it inherited at fork. Called at sched_process_exec, after
- * the kernel set the new comm. */
+/* The identity of the file the task now runs: mm->exe_file, which
+ * /proc/<pid>/exe shows (the interpreter for a script). The kernel sets it
+ * before sched_process_exec fires. One hop at a time, so a failed read leaves
+ * zeros and nothing in trace_protected_images matches. */
+static __always_inline void
+exec_image_key(struct task_struct *task, struct protected_image_key *key)
+{
+    struct mm_struct *mm = BPF_CORE_READ(task, mm);
+    struct file *exe = BPF_CORE_READ(mm, exe_file);
+    struct inode *inode = BPF_CORE_READ(exe, f_inode);
+    struct super_block *sb = BPF_CORE_READ(inode, i_sb);
+    key->ino = BPF_CORE_READ(inode, i_ino);
+    key->dev = BPF_CORE_READ(sb, s_dev);
+    key->gen = BPF_CORE_READ(inode, i_generation);
+}
+
+/* The name of a cgroup directory (its kernfs node) in buf, zero padded to
+ * TRACE_UNIT_NAME_LEN bytes; a longer name is cut to TRACE_UNIT_NAME_LEN - 1
+ * bytes. -1 when a read fails. Newer kernels read kernfs_node.name under RCU
+ * (the field keeps its name; the 6.17 BTF still types it const char *), and a
+ * BPF program runs inside an RCU read-side section, so the same read works. */
+static __always_inline int
+cgroup_dir_name(struct cgroup *cgrp, __u64 *buf)
+{
+    if (!cgrp)
+        return -1;
+    struct kernfs_node *kn = BPF_CORE_READ(cgrp, kn);
+    if (!kn || !bpf_core_field_exists(kn->name))
+        return -1;
+    const char *name = BPF_CORE_READ(kn, name);
+    if (!name)
+        return -1;
+    buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0; buf[4] = 0; buf[5] = 0;
+    if (bpf_probe_read_kernel_str(buf, TRACE_UNIT_NAME_LEN, name) <= 0)
+        return -1;
+    return 0;
+}
+
+/* Whether the task runs in /system.slice/<unit>: its cgroup of the default
+ * hierarchy is at level 2, named unit, under a cgroup named system.slice.
+ * systemd gives each start of a unit a new cgroup, so the cgroup ID is not
+ * known before the first exec, but only root can create a directory in
+ * system.slice, and the names are the ones the userspace check compares in
+ * /proc/<pid>/cgroup. A host without the unified hierarchy (cgroup v1 only)
+ * has its default hierarchy empty: level 0, no match. Every read is one hop,
+ * and a field this kernel lacks, a failed read or a name that is too long
+ * reads as no match, so the entry is dropped. The parent comes from
+ * cgroup->self.parent: kernfs_node.parent is named __parent from Linux 6.15. */
+static __always_inline int
+task_in_unit(struct task_struct *task, const char *unit)
+{
+    struct css_set *cset;
+    struct cgroup *cgrp, *parent;
+    struct cgroup_subsys_state *css;
+    __u64 name[TRACE_UNIT_NAME_LEN / 8];
+    const __u64 *want = (const __u64 *)unit;
+    const char *slice = (const char *)name;
+
+    if (!unit[0] || !bpf_core_field_exists(task->cgroups))
+        return 0;
+    cset = BPF_CORE_READ(task, cgroups);
+    if (!cset || !bpf_core_field_exists(cset->dfl_cgrp))
+        return 0;
+    cgrp = BPF_CORE_READ(cset, dfl_cgrp);
+    if (!cgrp || !bpf_core_field_exists(cgrp->level) || !bpf_core_field_exists(cgrp->kn) ||
+        !bpf_core_field_exists(cgrp->self.parent))
+        return 0;
+    if (BPF_CORE_READ(cgrp, level) != 2 || cgroup_dir_name(cgrp, name))
+        return 0;
+    if (name[0] != want[0] || name[1] != want[1] || name[2] != want[2] ||
+        name[3] != want[3] || name[4] != want[4] || name[5] != want[5])
+        return 0;
+    css = BPF_CORE_READ(cgrp, self.parent);
+    if (!css || !bpf_core_field_exists(css->cgroup))
+        return 0;
+    parent = BPF_CORE_READ(css, cgroup);
+    if (cgroup_dir_name(parent, name))
+        return 0;
+    return slice[0] == 's' && slice[1] == 'y' && slice[2] == 's' && slice[3] == 't' &&
+           slice[4] == 'e' && slice[5] == 'm' && slice[6] == '.' && slice[7] == 's' &&
+           slice[8] == 'l' && slice[9] == 'i' && slice[10] == 'c' && slice[11] == 'e' &&
+           slice[12] == 0;
+}
+
+/* Whether an exec of this image keeps the entry: any of the alternatives the
+ * value lists holds. A value without a flag keeps nothing. */
+static __always_inline int
+protected_image_keeps(const struct protected_image *image, struct task_struct *task)
+{
+    __u64 flags = image->flags;
+    if (flags & TRACE_PROTECTED_IMAGE_ANY)
+        return 1;
+    if ((flags & TRACE_PROTECTED_IMAGE_ROOT) && (__u32)bpf_get_current_uid_gid() == 0)
+        return 1;
+    if ((flags & TRACE_PROTECTED_IMAGE_UNIT) && task_in_unit(task, image->unit))
+        return 1;
+    return 0;
+}
+
+/* exec replaces the image the protection was granted for. The entry is kept
+ * only when the new image is listed in trace_protected_images and the task
+ * meets the condition of that value (root, or the unit of the WAF agent and
+ * systemd-networkd). Anything else loses the protection it inherited at
+ * fork: the user's shell after sshd-session, a service binary after PID 1,
+ * a fake that only carries a protected name, the genuine binary run outside
+ * its unit. The listed images include the systemd-executor file PID 1's child
+ * runs as /proc/self/fd/<n> (systemd 255 and later), so the exec of the
+ * service binary decides next. An empty map drops every entry. A deleted entry
+ * gives its budget unit back. Called at sched_process_exec, after the kernel
+ * set the new image and before it returns to user space. */
 static __always_inline void
 protect_on_exec(void)
 {
     __u32 tgid = bpf_get_current_pid_tgid() >> 32;
     if (!bpf_map_lookup_elem(&trace_protected_tgids, &tgid))
         return;
-    struct protected_comm_key key = {};
-    bpf_get_current_comm(&key.comm, sizeof(key.comm));
-    __u8 *flags = bpf_map_lookup_elem(&trace_protected_comms, &key);
-    if (flags && (!(*flags & TRACE_PROTECTED_COMM_ROOT) ||
-                  (__u32)bpf_get_current_uid_gid() == 0))
+    struct task_struct *task = (void *)bpf_get_current_task();
+    struct protected_image_key key = {};
+    exec_image_key(task, &key);
+    struct protected_image *image = bpf_map_lookup_elem(&trace_protected_images, &key);
+    if (image && protected_image_keeps(image, task))
         return;
-    bpf_map_delete_elem(&trace_protected_tgids, &tgid);
+    if (bpf_map_delete_elem(&trace_protected_tgids, &tgid) == 0)
+        protected_inherit_give();
+}
+
+/* A task that gives up root without an exec still runs the image its entry
+ * was granted for. At the exit of setuid, setreuid and setresuid the entry
+ * stays only when that image keeps it for this task, as exec decides (a
+ * configured path, the unit of the WAF agent), or lists KEEP_ON_SETUID: the
+ * OpenSSH images call setgid(0) and setuid(0) right after their own switch to
+ * check that root cannot come back, and the rules that downgrade those two
+ * events need the mark. A root-only image loses it, as an nginx worker does,
+ * and the budget unit comes back. A child of PID 1 is left to its exec:
+ * systemd switches to User= right before it. A real UID that is still 0
+ * changes nothing. */
+static __always_inline void
+protect_on_setuid(void)
+{
+    if ((__u32)bpf_get_current_uid_gid() == 0)
+        return;
+    __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    if (!bpf_map_lookup_elem(&trace_protected_tgids, &tgid))
+        return;
+    struct task_struct *task = (void *)bpf_get_current_task();
+    struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+    if (BPF_CORE_READ(parent, tgid) == 1)
+        return;
+    struct protected_image_key key = {};
+    exec_image_key(task, &key);
+    struct protected_image *image = bpf_map_lookup_elem(&trace_protected_images, &key);
+    if (image && ((image->flags & TRACE_PROTECTED_IMAGE_KEEP_ON_SETUID) ||
+                  protected_image_keeps(image, task)))
+        return;
+    if (bpf_map_delete_elem(&trace_protected_tgids, &tgid) == 0)
+        protected_inherit_give();
 }
 
 /* The process is gone; drop its entry so a burst of short-lived
  * protected children (one per SSH connection) cannot fill the map between
- * refreshes. Only the exit of the whole thread group ends the entry — not the
- * leader's own exit (pthread_exit from main, or the old leader reaped by a
- * non-leader thread's exec) — and only an entry written for this very
- * process (leader start time). do_exit decrements signal->live before
- * trace_sched_process_exit, so 0 here means no thread of the group is left.
- * Called at sched_process_exit. */
+ * refreshes, and give its budget unit back. Only the exit of the whole thread
+ * group ends the entry, not the leader's own exit (pthread_exit from main, or
+ * the old leader reaped by a non-leader thread's exec), and only an entry
+ * written for this very process (leader start time). do_exit decrements
+ * signal->live before trace_sched_process_exit, so 0 here means no thread of
+ * the group is left. Called at sched_process_exit. */
 static __always_inline void
 protect_on_exit(void)
 {
@@ -237,8 +432,9 @@ protect_on_exit(void)
         return;
     __u32 tgid = bpf_get_current_pid_tgid() >> 32;
     struct task_struct *leader = BPF_CORE_READ(task, group_leader);
-    if (is_protected_tgid(tgid, BPF_CORE_READ(leader, start_boottime)))
-        bpf_map_delete_elem(&trace_protected_tgids, &tgid);
+    if (is_protected_tgid(tgid, BPF_CORE_READ(leader, start_boottime)) &&
+        bpf_map_delete_elem(&trace_protected_tgids, &tgid) == 0)
+        protected_inherit_give();
 }
 
 /* Per-event-type counters for statistics */
@@ -1105,6 +1301,29 @@ SEC("tracepoint/sched/sched_process_exec")
 int trace_sched_process_exec(void *ctx)
 {
     protect_on_exec();
+    return 0;
+}
+
+/* ── set*uid exits: protected-set maintenance only ───────────────────────── */
+/* No event: sys_enter_setuid reports the request, before the credentials change. */
+SEC("tracepoint/syscalls/sys_exit_setuid")
+int trace_sys_exit_setuid(void *ctx)
+{
+    protect_on_setuid();
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setreuid")
+int trace_sys_exit_setreuid(void *ctx)
+{
+    protect_on_setuid();
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setresuid")
+int trace_sys_exit_setresuid(void *ctx)
+{
+    protect_on_setuid();
     return 0;
 }
 
